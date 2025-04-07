@@ -52,6 +52,12 @@ Contributing
 
 Contributions are welcome, and step-by-step instructions can be found in our
 documentation (`docs/submittingpatches.rst
+
+
+Screenshots
+------------
+### ![alt text](https://github.com/Ksawlii-Android-Repos/mesa-ps4patched/mesa.png)
+
 <https://docs.mesa3d.org/submittingpatches.html>`_).
 
 Note that Mesa uses gitlab for patches submission, review and discussions.
