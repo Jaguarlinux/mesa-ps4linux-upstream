@@ -56,7 +56,7 @@ documentation (`docs/submittingpatches.rst
 
 Screenshots
 ------------
-### ![alt text](https://github.com/Ksawlii-Android-Repos/mesa-ps4patched/blob/mesa.png)
+### ![alt text](https://github.com/Ksawlii-Android-Repos/mesa-ps4patched/blob/test/mesa.png)
 
 <https://docs.mesa3d.org/submittingpatches.html>`_).
 
