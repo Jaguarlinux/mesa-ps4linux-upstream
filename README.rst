@@ -58,6 +58,10 @@ Screenshots
 ------------
 ### ![alt text](https://github.com/Ksawlii-Android-Repos/mesa-ps4patched/blob/test/mesa.png)
 
+TESTED ON
+- Nobara (works)
+- Debian Trixie (works) https://www.youtube.com/watch?v=U56LAP_ZhNM
+
 <https://docs.mesa3d.org/submittingpatches.html>`_).
 
 Note that Mesa uses gitlab for patches submission, review and discussions.
