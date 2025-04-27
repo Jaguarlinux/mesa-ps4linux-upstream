@@ -3,6 +3,8 @@
 
 use crate::from_nir::*;
 use crate::ir::{ShaderInfo, ShaderIoInfo, ShaderModel, ShaderStageInfo};
+use crate::sm20::ShaderModel20;
+use crate::sm32::ShaderModel32;
 use crate::sm50::ShaderModel50;
 use crate::sm70::ShaderModel70;
 use crate::sph;
@@ -154,6 +156,9 @@ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
         | nir_lower_shift64
         | nir_lower_imul_2x32_64
         | nir_lower_conv64);
+    if dev.sm < 32 {
+        op.lower_int64_options |= nir_lower_shift64;
+    }
     op.lower_ldexp = true;
     op.lower_fmod = true;
     op.lower_ffract = true;
@@ -421,6 +426,10 @@ fn nak_compile_shader_internal(
         Box::new(ShaderModel70::new(nak.sm))
     } else if nak.sm >= 50 {
         Box::new(ShaderModel50::new(nak.sm))
+    } else if nak.sm >= 32 {
+        Box::new(ShaderModel32::new(nak.sm))
+    } else if nak.sm >= 20 {
+        Box::new(ShaderModel20::new(nak.sm))
     } else {
         panic!("Unsupported shader model");
     };

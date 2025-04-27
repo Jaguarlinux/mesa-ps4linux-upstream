@@ -10,7 +10,11 @@ uncollapsed_section_start piglit "Building piglit"
 # DEBIAN_TEST_VK_TAG
 # KERNEL_ROOTFS_TAG
 
-REV="ebdf60e0d4b0dc23e79373cb923fdee023eb3b2b"
+# Do a very early check to make sure the tag is correct without the need of
+# setting up the environment variables locally
+ci_tag_build_time_check "PIGLIT_TAG"
+
+REV="c50d9aa54f85e0af9d72fab86c73f89356d96399"
 
 git clone https://gitlab.freedesktop.org/mesa/piglit.git --single-branch --no-checkout /piglit
 pushd /piglit

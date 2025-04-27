@@ -84,11 +84,61 @@ agx_translate_layout(enum ail_tiling tiling)
    switch (tiling) {
    case AIL_TILING_GPU:
       return AGX_LAYOUT_GPU;
+   case AIL_TILING_TWIDDLED:
+      return AGX_LAYOUT_TWIDDLED;
    case AIL_TILING_LINEAR:
       return AGX_LAYOUT_LINEAR;
    }
 
    unreachable("Invalid tiling");
+}
+
+static inline enum agx_zls_tiling
+agx_translate_zls_tiling(enum ail_tiling tiling)
+{
+   switch (tiling) {
+   case AIL_TILING_GPU:
+      return AGX_ZLS_TILING_GPU;
+   case AIL_TILING_TWIDDLED:
+      return AGX_ZLS_TILING_TWIDDLED;
+   default:
+      unreachable("Invalid ZLS tiling");
+   }
+}
+
+struct agx_zls {
+   bool z_load, z_store;
+   bool s_load, s_store;
+};
+
+static inline void
+agx_pack_zls_control(struct agx_zls_control_packed *packed,
+                     const struct ail_layout *z, const struct ail_layout *s,
+                     struct agx_zls *args)
+{
+   agx_pack(packed, ZLS_CONTROL, cfg) {
+      if (z) {
+         cfg.z_store = args->z_store;
+         cfg.z_load = args->z_load;
+         cfg.z_load_compress = cfg.z_store_compress = z->compressed;
+         cfg.z_load_tiling = cfg.z_store_tiling =
+            agx_translate_zls_tiling(z->tiling);
+
+         if (z->format == PIPE_FORMAT_Z16_UNORM) {
+            cfg.z_format = AGX_ZLS_FORMAT_16;
+         } else {
+            cfg.z_format = AGX_ZLS_FORMAT_32F;
+         }
+      }
+
+      if (s) {
+         cfg.s_load = args->s_load;
+         cfg.s_store = args->s_store;
+         cfg.s_load_compress = cfg.s_store_compress = s->compressed;
+         cfg.s_load_tiling = cfg.s_store_tiling =
+            agx_translate_zls_tiling(s->tiling);
+      }
+   }
 }
 
 static enum agx_sample_count
@@ -168,7 +218,7 @@ agx_pack_line_width(float line_width)
  * the texture descriptor itself.
  */
 static void
-agx_set_null_texture(struct agx_texture_packed *tex, uint64_t valid_address)
+agx_set_null_texture(struct agx_texture_packed *tex)
 {
    agx_pack(tex, TEXTURE, cfg) {
       cfg.layout = AGX_LAYOUT_TWIDDLED;
@@ -178,8 +228,7 @@ agx_set_null_texture(struct agx_texture_packed *tex, uint64_t valid_address)
       cfg.swizzle_g = AGX_CHANNEL_0;
       cfg.swizzle_b = AGX_CHANNEL_0;
       cfg.swizzle_a = AGX_CHANNEL_0;
-      cfg.address = valid_address;
-      cfg.mode = AGX_IMAGE_MODE_NULL;
+      cfg.address = AGX_ZERO_PAGE_ADDRESS;
    }
 }
 

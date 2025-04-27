@@ -314,6 +314,7 @@ gather_intrinsic_info(const nir_shader *nir, const nir_intrinsic_instr *instr, s
       gather_intrinsic_store_output_info(nir, instr, info, consider_force_vrs);
       break;
    case nir_intrinsic_bvh64_intersect_ray_amd:
+   case nir_intrinsic_bvh8_intersect_ray_amd:
       info->cs.uses_rt = true;
       break;
    case nir_intrinsic_load_poly_line_smooth_enabled:
@@ -634,7 +635,7 @@ gather_shader_info_tcs(struct radv_device *device, const nir_shader *nir,
 
    info->tcs.tcs_outputs_read = nir->info.outputs_read;
    info->tcs.tcs_outputs_written = nir->info.outputs_written;
-   info->tcs.tcs_patch_outputs_read = nir->info.patch_inputs_read;
+   info->tcs.tcs_patch_outputs_read = nir->info.patch_outputs_read;
    info->tcs.tcs_patch_outputs_written = nir->info.patch_outputs_written;
    info->tcs.tcs_vertices_out = nir->info.tess.tcs_vertices_out;
    info->tcs.tes_inputs_read = ~0ULL;

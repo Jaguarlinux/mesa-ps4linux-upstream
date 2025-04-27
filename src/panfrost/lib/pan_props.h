@@ -138,10 +138,22 @@ pan_arch(unsigned gpu_id)
 static inline unsigned
 panfrost_max_effective_tile_size(unsigned arch)
 {
+   if (arch >= 12)
+      return 64 * 64;
+
    if (arch >= 10)
       return 32 * 32;
 
    return 16 * 16;
+}
+
+static inline unsigned
+panfrost_meta_tile_size(unsigned arch)
+{
+   if (arch >= 12)
+      return 64;
+
+   return 32;
 }
 
 /* Returns the maximum usable color tilebuffer-size. This is *usually* twice

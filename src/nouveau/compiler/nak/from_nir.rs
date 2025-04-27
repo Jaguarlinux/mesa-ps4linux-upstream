@@ -1959,6 +1959,13 @@ impl<'a> ShaderFromNir<'a> {
                 di += 1;
             }
         }
+
+        if self.sm.sm() < 50 {
+            // TODO: texbar should be created by calc_instr_deps() and
+            // should be less conservative than textures_left=0.
+            // See the old pass: NVC0LegalizePostRA::insertTextureBarriers
+            b.push_op(OpTexDepBar { textures_left: 0 });
+        }
         self.set_ssa(tex.def.as_def(), nir_dst);
     }
 
@@ -2286,31 +2293,48 @@ impl<'a> ShaderFromNir<'a> {
 
                 assert!(intrin.def.bit_size() == 32);
                 let ftype = FloatType::F32;
-                let scratch = b.alloc_ssa(RegFile::GPR, 1);
-
-                b.push_op(OpShfl {
-                    dst: scratch[0].into(),
-                    in_bounds: Dst::None,
-                    src: self.get_src(&srcs[0]),
-                    lane: 1_u32.into(),
-                    c: (0x3_u32 | 0x1c_u32 << 8).into(),
-                    op: ShflOp::Bfly,
-                });
 
                 let dst = b.alloc_ssa(RegFile::GPR, 1);
 
-                b.push_op(OpFSwzAdd {
-                    dst: dst[0].into(),
-                    srcs: [scratch[0].into(), self.get_src(&srcs[0])],
-                    ops: [
-                        FSwzAddOp::SubLeft,
-                        FSwzAddOp::SubRight,
-                        FSwzAddOp::SubLeft,
-                        FSwzAddOp::SubRight,
-                    ],
-                    rnd_mode: self.float_ctl[ftype].rnd_mode,
-                    ftz: self.float_ctl[ftype].ftz,
-                });
+                if self.sm.sm() >= 50 {
+                    let scratch = b.alloc_ssa(RegFile::GPR, 1);
+
+                    b.push_op(OpShfl {
+                        dst: scratch[0].into(),
+                        in_bounds: Dst::None,
+                        src: self.get_src(&srcs[0]),
+                        lane: 1_u32.into(),
+                        c: (0x3_u32 | 0x1c_u32 << 8).into(),
+                        op: ShflOp::Bfly,
+                    });
+
+                    b.push_op(OpFSwzAdd {
+                        dst: dst[0].into(),
+                        srcs: [scratch[0].into(), self.get_src(&srcs[0])],
+                        ops: [
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                        ],
+                        rnd_mode: self.float_ctl[ftype].rnd_mode,
+                        ftz: self.float_ctl[ftype].ftz,
+                    });
+                } else {
+                    b.push_op(OpFSwz {
+                        dst: dst[0].into(),
+                        srcs: [self.get_src(&srcs[0]), self.get_src(&srcs[0])],
+                        ops: [
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                        ],
+                        rnd_mode: self.float_ctl[ftype].rnd_mode,
+                        ftz: self.float_ctl[ftype].ftz,
+                        shuffle: FSwzShuffle::SwapHorizontal,
+                    });
+                }
 
                 self.set_dst(&intrin.def, dst);
             }
@@ -2321,31 +2345,47 @@ impl<'a> ShaderFromNir<'a> {
 
                 assert!(intrin.def.bit_size() == 32);
                 let ftype = FloatType::F32;
-                let scratch = b.alloc_ssa(RegFile::GPR, 1);
-
-                b.push_op(OpShfl {
-                    dst: scratch[0].into(),
-                    in_bounds: Dst::None,
-                    src: self.get_src(&srcs[0]),
-                    lane: 2_u32.into(),
-                    c: (0x3_u32 | 0x1c_u32 << 8).into(),
-                    op: ShflOp::Bfly,
-                });
-
                 let dst = b.alloc_ssa(RegFile::GPR, 1);
 
-                b.push_op(OpFSwzAdd {
-                    dst: dst[0].into(),
-                    srcs: [scratch[0].into(), self.get_src(&srcs[0])],
-                    ops: [
-                        FSwzAddOp::SubLeft,
-                        FSwzAddOp::SubLeft,
-                        FSwzAddOp::SubRight,
-                        FSwzAddOp::SubRight,
-                    ],
-                    rnd_mode: self.float_ctl[ftype].rnd_mode,
-                    ftz: self.float_ctl[ftype].ftz,
-                });
+                if self.sm.sm() >= 50 {
+                    let scratch = b.alloc_ssa(RegFile::GPR, 1);
+
+                    b.push_op(OpShfl {
+                        dst: scratch[0].into(),
+                        in_bounds: Dst::None,
+                        src: self.get_src(&srcs[0]),
+                        lane: 2_u32.into(),
+                        c: (0x3_u32 | 0x1c_u32 << 8).into(),
+                        op: ShflOp::Bfly,
+                    });
+
+                    b.push_op(OpFSwzAdd {
+                        dst: dst[0].into(),
+                        srcs: [scratch[0].into(), self.get_src(&srcs[0])],
+                        ops: [
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                            FSwzAddOp::SubRight,
+                        ],
+                        rnd_mode: self.float_ctl[ftype].rnd_mode,
+                        ftz: self.float_ctl[ftype].ftz,
+                    });
+                } else {
+                    b.push_op(OpFSwz {
+                        dst: dst[0].into(),
+                        srcs: [self.get_src(&srcs[0]), self.get_src(&srcs[0])],
+                        ops: [
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubLeft,
+                            FSwzAddOp::SubRight,
+                            FSwzAddOp::SubRight,
+                        ],
+                        rnd_mode: self.float_ctl[ftype].rnd_mode,
+                        ftz: self.float_ctl[ftype].ftz,
+                        shuffle: FSwzShuffle::SwapVertical,
+                    });
+                }
 
                 self.set_dst(&intrin.def, dst);
             }
@@ -2942,7 +2982,9 @@ impl<'a> ShaderFromNir<'a> {
                 );
                 let comps = intrin.def.bit_size / 32;
                 let dst = b.alloc_ssa(RegFile::GPR, comps);
-                if idx == NAK_SV_CLOCK || idx == NAK_SV_CLOCK + 1 {
+                if self.sm.sm() >= 50
+                    && (idx == NAK_SV_CLOCK || idx == NAK_SV_CLOCK + 1)
+                {
                     debug_assert!(idx + comps <= NAK_SV_CLOCK + 2);
                     b.push_op(OpCS2R {
                         dst: dst.into(),

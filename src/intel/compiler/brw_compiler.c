@@ -103,11 +103,8 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
    compiler->indirect_ubos_use_sampler = devinfo->ver < 12;
 
-   compiler->lower_dpas = devinfo->verx10 < 125 ||
-      intel_device_info_is_mtl(devinfo) ||
-      (intel_device_info_is_arl(devinfo) &&
-       devinfo->platform != INTEL_PLATFORM_ARL_H) ||
-      debug_get_bool_option("INTEL_LOWER_DPAS", false);
+   compiler->lower_dpas = !devinfo->has_systolic ||
+                          debug_get_bool_option("INTEL_LOWER_DPAS", false);
 
    nir_lower_int64_options int64_options =
       nir_lower_imul64 |
@@ -224,13 +221,21 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
    insert_u64_bit(&config, compiler->mesh.mue_compaction);
    bits++;
 
-   uint64_t mask = DEBUG_DISK_CACHE_MASK;
-   bits += util_bitcount64(mask);
+   enum intel_debug_flag debug_bits[] = {
+      DEBUG_NO_DUAL_OBJECT_GS,
+      DEBUG_SPILL_FS,
+      DEBUG_SPILL_VEC4,
+      DEBUG_NO_COMPACTION,
+      DEBUG_DO32,
+      DEBUG_SOFT64,
+      DEBUG_NO_SEND_GATHER,
+   };
+   for (uint32_t i = 0; i < ARRAY_SIZE(debug_bits); i++) {
+      insert_u64_bit(&config, INTEL_DEBUG(debug_bits[i]));
+      bits++;
+   }
 
-   u_foreach_bit64(bit, mask)
-      insert_u64_bit(&config, INTEL_DEBUG(1ULL << bit));
-
-   mask = SIMD_DISK_CACHE_MASK;
+   uint64_t mask = SIMD_DISK_CACHE_MASK;
    bits += util_bitcount64(mask);
 
    u_foreach_bit64(bit, mask)

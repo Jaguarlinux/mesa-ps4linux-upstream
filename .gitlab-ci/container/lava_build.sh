@@ -402,7 +402,6 @@ rm $ROOTFS/{llvm-snapshot,winehq}.gpg.key
 rm "$ROOTFS/setup-test-env.sh"
 rm "$ROOTFS/setup-rootfs.sh"
 rm "$ROOTFS/strip-rootfs.sh"
-cp /etc/wgetrc $ROOTFS/etc/.
 
 # Copy all tags to the rootfs, so test jobs can check if they are using the intended version
 TAG_FILE_DIR="$(get_tag_file)"
@@ -422,7 +421,8 @@ popd
 
 . .gitlab-ci/container/container_post_build.sh
 
-s3_upload /lava-files/"${ROOTFSTAR}" "https://${S3_PATH}/"
+ci-fairy s3cp --token-file "${S3_JWT_FILE}" /lava-files/"${ROOTFSTAR}" \
+      https://${S3_PATH}/"${ROOTFSTAR}"
 
 touch /lava-files/done
-s3_upload /lava-files/done "https://${S3_PATH}/"
+ci-fairy s3cp --token-file "${S3_JWT_FILE}" /lava-files/done https://${S3_PATH}/done

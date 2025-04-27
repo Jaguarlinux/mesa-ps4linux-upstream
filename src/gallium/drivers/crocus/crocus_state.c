@@ -771,7 +771,7 @@ crocus_calculate_urb_fence(struct crocus_batch *batch, unsigned csize,
             exit(1);
          }
 
-         if (INTEL_DEBUG(DEBUG_URB|DEBUG_PERF))
+         if (INTEL_DEBUG(DEBUG_URB) || INTEL_DEBUG(DEBUG_PERF))
             fprintf(stderr, "URB CONSTRAINED\n");
       }
 
@@ -8316,7 +8316,6 @@ crocus_rebind_buffer(struct crocus_context *ice,
                                  PIPE_BIND_BLENDABLE |
                                  PIPE_BIND_DISPLAY_TARGET |
                                  PIPE_BIND_CURSOR |
-                                 PIPE_BIND_COMPUTE_RESOURCE |
                                  PIPE_BIND_GLOBAL)));
 
    if (res->bind_history & PIPE_BIND_VERTEX_BUFFER) {

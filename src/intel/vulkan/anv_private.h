@@ -2363,7 +2363,7 @@ anv_queue_post_submit(struct anv_queue *queue, VkResult submit_result)
 
 #if ANV_SUPPORT_RT && !ANV_SUPPORT_RT_GRL
    /* The recorded bvh is dumped to files upon command buffer completion */
-   if (INTEL_DEBUG(DEBUG_BVH_ANY))
+   if (INTEL_DEBUG_BVH_ANY)
       anv_dump_bvh_to_files(queue->device);
 #endif
 
@@ -5627,9 +5627,12 @@ anv_image_is_externally_shared(const struct anv_image *image)
 static inline bool
 anv_image_has_private_binding(const struct anv_image *image)
 {
-   const struct anv_image_binding private_binding =
-      image->bindings[ANV_IMAGE_MEMORY_BINDING_PRIVATE];
-   return private_binding.memory_range.size != 0;
+   if (image->bindings[ANV_IMAGE_MEMORY_BINDING_PRIVATE].memory_range.size > 0) {
+      assert(anv_image_is_externally_shared(image));
+      return true;
+   } else {
+      return false;
+   }
 }
 
 static inline bool

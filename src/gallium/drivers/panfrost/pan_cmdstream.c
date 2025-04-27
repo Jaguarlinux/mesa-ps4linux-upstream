@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2025 Arm Ltd.
  * Copyright (C) 2023 Amazon.com, Inc. or its affiliates.
  * Copyright (C) 2018 Alyssa Rosenzweig
  * Copyright (C) 2020 Collabora Ltd.
@@ -35,6 +36,7 @@
 #include "util/u_sample_positions.h"
 #include "util/u_vbuf.h"
 #include "util/u_viewport.h"
+#include "util/perf/cpu_trace.h"
 
 #include "decode.h"
 
@@ -63,7 +65,7 @@
  * functions. */
 #if PAN_ARCH <= 9
 #define JOBX(__suffix) GENX(jm_##__suffix)
-#elif PAN_ARCH <= 10
+#elif PAN_ARCH <= 13
 #define JOBX(__suffix) GENX(csf_##__suffix)
 #else
 #error "Unsupported arch"
@@ -508,7 +510,8 @@ panfrost_prepare_fs_state(struct panfrost_context *ctx, uint64_t *blend_shaders,
          struct pan_earlyzs_state earlyzs = pan_earlyzs_get(
             fs->earlyzs, ctx->depth_stencil->writes_zs || has_oq,
             ctx->blend->base.alpha_to_coverage,
-            ctx->depth_stencil->zs_always_passes, false);
+            ctx->depth_stencil->zs_always_passes,
+            PAN_EARLYZS_ZS_TILEBUF_NOT_READ);
 
          cfg.properties.pixel_kill_operation = earlyzs.kill;
          cfg.properties.zs_update_operation = earlyzs.update;
@@ -705,6 +708,71 @@ panfrost_emit_frag_shader_meta(struct panfrost_batch *batch)
 }
 #endif
 
+#if PAN_ARCH >= 12
+static uint64_t
+panfrost_emit_viewport(struct panfrost_batch *batch)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   const struct pipe_viewport_state *vp = &ctx->pipe_viewport;
+   const struct pipe_scissor_state *ss = &ctx->scissor;
+   const struct pipe_rasterizer_state *rast = &ctx->rasterizer->base;
+
+   /* Derive min/max from translate/scale. Note since |x| >= 0 by
+    * definition, we have that -|x| <= |x| hence translate - |scale| <=
+    * translate + |scale|, so the ordering is correct here. */
+   float vp_minx = vp->translate[0] - fabsf(vp->scale[0]);
+   float vp_maxx = vp->translate[0] + fabsf(vp->scale[0]);
+   float vp_miny = vp->translate[1] - fabsf(vp->scale[1]);
+   float vp_maxy = vp->translate[1] + fabsf(vp->scale[1]);
+
+   float minz, maxz;
+   util_viewport_zmin_zmax(vp, rast->clip_halfz, &minz, &maxz);
+
+   /* Viewport clamped to the framebuffer */
+   unsigned minx = MIN2(batch->key.width, MAX2((int)vp_minx, 0));
+   unsigned maxx = MIN2(batch->key.width, MAX2((int)vp_maxx, 0));
+   unsigned miny = MIN2(batch->key.height, MAX2((int)vp_miny, 0));
+   unsigned maxy = MIN2(batch->key.height, MAX2((int)vp_maxy, 0));
+
+   if (ss && rast->scissor) {
+      minx = MAX2(ss->minx, minx);
+      miny = MAX2(ss->miny, miny);
+      maxx = MIN2(ss->maxx, maxx);
+      maxy = MIN2(ss->maxy, maxy);
+   }
+
+   /* Set the range to [1, 1) so max values don't wrap round */
+   if (maxx == 0 || maxy == 0)
+      maxx = maxy = minx = miny = 1;
+
+   panfrost_batch_union_scissor(batch, minx, miny, maxx, maxy);
+   batch->scissor_culls_everything = (minx >= maxx || miny >= maxy);
+
+   pan_cast_and_pack(&batch->avalon_viewport, VIEWPORT, cfg) {
+      /* Clamp viewport to valid range */
+      cfg.min_x = CLAMP(minx, 0, UINT16_MAX);
+      cfg.min_y = CLAMP(miny, 0, UINT16_MAX);
+      cfg.max_x = CLAMP(maxx, 0, UINT16_MAX);
+      cfg.max_y = CLAMP(maxy, 0, UINT16_MAX);
+
+      cfg.min_depth = CLAMP(minz, 0.0f, 1.0f);
+      cfg.max_depth = CLAMP(maxz, 0.0f, 1.0f);
+   }
+
+   /* [minx, maxx) and [miny, maxy) are exclusive ranges for scissors in the hardware */
+   maxx--;
+   maxy--;
+
+   pan_cast_and_pack(&batch->scissor, SCISSOR, cfg) {
+      cfg.scissor_minimum_x = minx;
+      cfg.scissor_minimum_y = miny;
+      cfg.scissor_maximum_x = maxx;
+      cfg.scissor_maximum_y = maxy;
+   }
+
+   return 0;
+}
+#else
 static uint64_t
 panfrost_emit_viewport(struct panfrost_batch *batch)
 {
@@ -781,6 +849,7 @@ panfrost_emit_viewport(struct panfrost_batch *batch)
    return 0;
 #endif
 }
+#endif
 
 #if PAN_ARCH >= 9
 /**
@@ -2807,6 +2876,57 @@ panfrost_update_streamout_offsets(struct panfrost_context *ctx)
    (PAN_DIRTY_ZS | PAN_DIRTY_BLEND | PAN_DIRTY_MSAA | PAN_DIRTY_RASTERIZER |   \
     PAN_DIRTY_OQ)
 
+#if PAN_ARCH >= 9
+static uint64_t
+panfrost_emit_varying_descriptors(struct panfrost_batch *batch)
+{
+   struct panfrost_compiled_shader *vs =
+      batch->ctx->prog[PIPE_SHADER_VERTEX];
+   struct panfrost_compiled_shader *fs =
+      batch->ctx->prog[PIPE_SHADER_FRAGMENT];
+
+   const uint32_t vs_out_mask = vs->info.varyings.fixed_varyings;
+   const uint32_t fs_in_mask = fs->info.varyings.fixed_varyings;
+   const uint32_t fs_in_slots = fs->info.varyings.input_count +
+                                util_bitcount(fs_in_mask);
+
+   struct panfrost_ptr bufs =
+      pan_pool_alloc_desc_array(&batch->pool.base, fs_in_slots, ATTRIBUTE);
+   struct mali_attribute_packed *descs = bufs.cpu;
+
+   batch->nr_varying_attribs[PIPE_SHADER_FRAGMENT] = fs_in_slots;
+
+   const uint32_t varying_size = panfrost_vertex_attribute_stride(vs, fs);
+
+   for (uint32_t i = 0; i < fs_in_slots; i++) {
+      const struct pan_shader_varying *var = &fs->info.varyings.input[i];
+
+      uint32_t index = 0;
+      if (var->location >= VARYING_SLOT_VAR0) {
+         unsigned nr_special = util_bitcount(vs_out_mask);
+         unsigned general_index = (var->location - VARYING_SLOT_VAR0);
+         index = nr_special + general_index;
+      } else {
+         index = util_bitcount(vs_out_mask & BITFIELD_MASK(var->location));
+      }
+
+      pan_pack(&descs[i], ATTRIBUTE, cfg) {
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_VERTEX_PACKET;
+         cfg.offset_enable = false;
+         cfg.format = GENX(panfrost_format_from_pipe_format)(var->format)->hw;
+         cfg.table = 61;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
+         cfg.offset = 1024 + (index * 16);
+         cfg.buffer_index = 0;
+         cfg.attribute_stride = varying_size;
+         cfg.packet_stride = varying_size + 16;
+      }
+   }
+
+   return bufs.gpu;
+}
+#endif
+
 static inline void
 panfrost_update_shader_state(struct panfrost_batch *batch,
                              enum pipe_shader_type st)
@@ -2836,6 +2956,9 @@ panfrost_update_shader_state(struct panfrost_batch *batch,
    }
 
 #if PAN_ARCH >= 9
+   if ((dirty & PAN_DIRTY_STAGE_SHADER) && frag)
+      batch->attribs[st] = panfrost_emit_varying_descriptors(batch);
+
    if (dirty & PAN_DIRTY_STAGE_IMAGE) {
       batch->images[st] =
          ctx->image_mask[st] ? panfrost_emit_images(batch, st) : 0;
@@ -3290,6 +3413,8 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                   const struct pipe_draw_start_count_bias *draws,
                   unsigned num_draws)
 {
+   MESA_TRACE_FUNC();
+
    struct panfrost_context *ctx = pan_context(pipe);
 
    if (!panfrost_render_condition_check(ctx))
@@ -3430,6 +3555,8 @@ panfrost_afbc_size(struct panfrost_batch *batch, struct panfrost_resource *src,
                    struct panfrost_bo *metadata, unsigned offset,
                    unsigned level)
 {
+   MESA_TRACE_FUNC();
+
    struct pan_image_slice_layout *slice = &src->image.layout.slices[level];
    struct panfrost_afbc_size_info consts = {
       .src =
@@ -3450,6 +3577,8 @@ panfrost_afbc_pack(struct panfrost_batch *batch, struct panfrost_resource *src,
                    struct panfrost_bo *metadata, unsigned metadata_offset,
                    unsigned level)
 {
+   MESA_TRACE_FUNC();
+
    struct pan_image_slice_layout *src_slice = &src->image.layout.slices[level];
    struct panfrost_afbc_pack_info consts = {
       .src = src->image.data.base + src->image.data.offset +
@@ -3471,6 +3600,8 @@ panfrost_afbc_pack(struct panfrost_batch *batch, struct panfrost_resource *src,
 static void
 panfrost_mtk_detile_compute(struct panfrost_context *ctx, struct pipe_blit_info *info)
 {
+   MESA_TRACE_FUNC();
+
    struct pipe_context *pipe = &ctx->base;
    struct pipe_resource *y_src = info->src.resource;
    struct pipe_resource *uv_src = y_src->next;
@@ -3992,9 +4123,14 @@ prepare_shader(struct panfrost_compiled_shader *state,
       return;
 
    bool vs = (state->info.stage == MESA_SHADER_VERTEX);
-   bool secondary_enable = (vs && state->info.vs.secondary_enable);
 
+#if PAN_ARCH >= 12
+   unsigned nr_variants = vs ? 2 : 1;
+#else
+   bool secondary_enable = (vs && state->info.vs.secondary_enable);
    unsigned nr_variants = secondary_enable ? 3 : vs ? 2 : 1;
+#endif
+
    struct panfrost_ptr ptr =
       pan_pool_alloc_desc_array(&pool->base, nr_variants, SHADER_PROGRAM);
 
@@ -4008,8 +4144,10 @@ prepare_shader(struct panfrost_compiled_shader *state,
 
       if (cfg.stage == MALI_SHADER_STAGE_FRAGMENT)
          cfg.fragment_coverage_bitmask_type = MALI_COVERAGE_BITMASK_TYPE_GL;
+#if PAN_ARCH < 12
       else if (vs)
          cfg.vertex_warp_limit = MALI_WARP_LIMIT_HALF;
+#endif
 
       cfg.register_allocation =
          pan_register_allocation(state->info.work_reg_count);
@@ -4027,7 +4165,9 @@ prepare_shader(struct panfrost_compiled_shader *state,
    /* IDVS/triangles */
    pan_pack(&programs[1], SHADER_PROGRAM, cfg) {
       cfg.stage = pan_shader_stage(&state->info);
+#if PAN_ARCH < 12
       cfg.vertex_warp_limit = MALI_WARP_LIMIT_HALF;
+#endif
       cfg.register_allocation =
          pan_register_allocation(state->info.work_reg_count);
       cfg.binary = state->bin.gpu + state->info.vs.no_psiz_offset;
@@ -4035,6 +4175,7 @@ prepare_shader(struct panfrost_compiled_shader *state,
       cfg.flush_to_zero_mode = panfrost_ftz_mode(&state->info);
    }
 
+#if PAN_ARCH < 12
    if (!secondary_enable)
       return;
 
@@ -4048,6 +4189,7 @@ prepare_shader(struct panfrost_compiled_shader *state,
       cfg.preload.r48_r63 = (state->info.vs.secondary_preload >> 48);
       cfg.flush_to_zero_mode = panfrost_ftz_mode(&state->info);
    }
+#endif
 #endif
 }
 

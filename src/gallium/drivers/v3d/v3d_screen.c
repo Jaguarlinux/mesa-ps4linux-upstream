@@ -194,8 +194,6 @@ v3d_init_compute_caps(struct v3d_screen *screen)
 
         caps->address_bits = 32;
 
-        snprintf(caps->ir_target, sizeof(caps->ir_target), "v3d");
-
         caps->grid_dimension = 3;
 
         /* GL_MAX_COMPUTE_SHADER_WORK_GROUP_COUNT: The CSD has a
@@ -340,6 +338,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->max_render_targets = V3D_MAX_RENDER_TARGETS(screen->devinfo.ver);
         caps->fbfetch = caps->max_render_targets;
         caps->fbfetch_coherent = true;
+        caps->max_dual_source_render_targets = 1;
 
         caps->vendor_id = 0x14E4;
 

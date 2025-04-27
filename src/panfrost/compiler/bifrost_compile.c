@@ -29,6 +29,7 @@
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir_builder.h"
 #include "panfrost/util/pan_ir.h"
+#include "util/perf/cpu_trace.h"
 #include "util/u_debug.h"
 
 #include "bifrost/disassemble.h"
@@ -1345,7 +1346,7 @@ bi_emit_load_ubo(bi_builder *b, nir_intrinsic_instr *instr)
 static void
 bi_emit_load_push_constant(bi_builder *b, nir_intrinsic_instr *instr)
 {
-   assert(!b->shader->inputs->push_uniforms && "can't mix push constant forms");
+   assert(!b->shader->inputs->pushable_ubos && "can't mix push constant forms");
 
    nir_src *offset = &instr->src[0];
    assert(!nir_intrinsic_base(instr) && "base must be zero");
@@ -5684,6 +5685,8 @@ bi_lower_ldexp16(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
 void
 bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
 {
+   MESA_TRACE_FUNC();
+
    /* Ensure that halt are translated to returns and get ride of them */
    NIR_PASS(_, nir, nir_shader_instructions_pass, bi_lower_halt_to_return,
             nir_metadata_all, NULL);
@@ -5960,7 +5963,7 @@ bi_compile_variant_nir(nir_shader *nir,
    bi_validate(ctx, "Early lowering");
 
    /* Runs before copy prop */
-   if (optimize && ctx->inputs->push_uniforms) {
+   if (optimize && ctx->inputs->pushable_ubos) {
       bi_opt_push_ubo(ctx);
    }
 
@@ -5985,7 +5988,7 @@ bi_compile_variant_nir(nir_shader *nir,
       bi_opt_dce(ctx, false);
       bi_opt_cse(ctx);
       bi_opt_dce(ctx, false);
-      if (ctx->inputs->push_uniforms)
+      if (ctx->inputs->pushable_ubos)
          bi_opt_reorder_push(ctx);
       bi_validate(ctx, "Optimization passes");
    }
@@ -6197,7 +6200,8 @@ bi_compile_variant(nir_shader *nir,
       }
    }
 
-   if (idvs == BI_IDVS_POSITION && !nir->info.internal &&
+   if ((idvs == BI_IDVS_POSITION || idvs == BI_IDVS_ALL) &&
+       !nir->info.internal &&
        nir->info.outputs_written & BITFIELD_BIT(VARYING_SLOT_PSIZ)) {
       /* Find the psiz write */
       bi_instr *write = NULL;
@@ -6254,6 +6258,8 @@ bifrost_compile_shader_nir(nir_shader *nir,
                            struct util_dynarray *binary,
                            struct pan_shader_info *info)
 {
+   MESA_TRACE_FUNC();
+
    bifrost_debug = debug_get_option_bifrost_debug();
 
    /* Combine stores late, to give the driver a chance to lower dual-source

@@ -649,11 +649,18 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
       cfg.flags_1.sample_mask = 0xFFFF;
       cfg.flags_0.multisample_enable = key->samples > 1;
       cfg.flags_0.evaluate_per_sample = key->samples > 1;
-      cfg.maximum_z = 1.0;
       cfg.flags_0.clean_fragment_write = true;
+
+#if PAN_ARCH >= 12
+      cfg.fragment_resources = res_table.gpu | 1;
+      cfg.fragment_shader = panvk_priv_mem_dev_addr(shader->spd);
+      cfg.thread_storage = cmdbuf->state.gfx.tsd;
+#else
+      cfg.maximum_z = 1.0;
       cfg.shader.resources = res_table.gpu | 1;
       cfg.shader.shader = panvk_priv_mem_dev_addr(shader->spd);
       cfg.shader.thread_storage = cmdbuf->state.gfx.tsd;
+#endif
       cfg.flags_2.write_mask = rt_written;
    }
 
@@ -668,9 +675,17 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
        * Thing's haven't been benchmarked to determine what's
        * preferable (saving bandwidth vs having ZS preloaded
        * earlier), so let's leave it like that for now.
+       *
+       * On v13+, we don't have EARLY_ZS_ALWAYS instead we use
+       * PREPASS_ALWAYS.
        */
+#if PAN_ARCH >= 13
+      fbinfo->bifrost.pre_post.modes[dcd_idx] =
+         MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
+#else
       fbinfo->bifrost.pre_post.modes[dcd_idx] =
          MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+#endif
    }
 
    return VK_SUCCESS;

@@ -147,6 +147,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_create_renderpass2                = true,
       .KHR_dedicated_allocation              = true,
       .KHR_deferred_host_operations          = true,
+      .KHR_depth_clamp_zero_one              = true,
       .KHR_depth_stencil_resolve             = true,
       .KHR_descriptor_update_template        = true,
       .KHR_device_group                      = true,
@@ -282,6 +283,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_extended_dynamic_state            = true,
       .EXT_extended_dynamic_state2           = true,
       .EXT_extended_dynamic_state3           = true,
+      .EXT_external_memory_acquire_unmodified = true,
       .EXT_external_memory_dma_buf           = true,
       .EXT_external_memory_host              = true,
       .EXT_fragment_shader_interlock         = true,
@@ -580,7 +582,7 @@ get_features(const struct anv_physical_device *pdevice,
       .customBorderColorWithoutFormat =
          pdevice->instance->custom_border_colors_without_format,
 
-      /* VK_EXT_depth_clamp_zero_one */
+      /* VK_KHR_depth_clamp_zero_one */
       .depthClampZeroOne = true,
 
       /* VK_EXT_depth_clip_enable */
@@ -1496,8 +1498,15 @@ get_properties(const struct anv_physical_device *pdevice,
       /* TODO */
       props->shaderGroupHandleSize = 32;
       props->maxRayRecursionDepth = 31;
-      /* MemRay::hitGroupSRStride is 16 bits */
-      props->maxShaderGroupStride = UINT16_MAX;
+      if (pdevice->info.ver >= 30) {
+         /* RTDispatchGlobals::missShaderStride is 13-bit wide. The maximum
+          * here is a 13-bit wide max value.
+          */
+         props->maxShaderGroupStride = (1U << 13) - 1;
+      } else {
+         /* MemRay::hitGroupSRStride is 16 bits */
+         props->maxShaderGroupStride = UINT16_MAX;
+      }
       /* MemRay::hitGroupSRBasePtr requires 16B alignment */
       props->shaderGroupBaseAlignment = 16;
       props->shaderGroupHandleAlignment = 16;

@@ -411,7 +411,12 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
                 panvk_priv_mem_dev_addr(subq->context));
 
    /* Intialize scoreboard slots used for asynchronous operations. */
+#if PAN_ARCH >= 11
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_SEL_ENDPOINT, SB_ITER(0));
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_SEL_OTHER, SB_ID(LS));
+#else
    cs_set_scoreboard_entry(&b, SB_ITER(0), SB_ID(LS));
+#endif
 
    /* We do greater than test on sync objects, and given the reference seqno
     * registers are all zero at init time, we need to initialize all syncobjs
@@ -463,7 +468,8 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
       .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsubmit),
    };
 
-   int ret = drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsubmit);
+   int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT,
+                            &gsubmit);
    if (ret)
       return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                           "Failed to initialized subqueue: %m");
@@ -609,7 +615,7 @@ create_group(struct panvk_queue *queue,
       .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
    };
 
-   int ret = drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc);
+   int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc);
    if (ret)
       return panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                           "Failed to create a scheduling group");
@@ -627,7 +633,7 @@ destroy_group(struct panvk_queue *queue)
    };
 
    ASSERTED int ret =
-      drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd);
+      pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd);
    assert(!ret);
 }
 
@@ -635,6 +641,8 @@ static VkResult
 init_tiler(struct panvk_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
    struct panvk_tiler_heap *tiler_heap = &queue->tiler_heap;
    VkResult result;
 
@@ -653,18 +661,18 @@ init_tiler(struct panvk_queue *queue)
       goto err_free_desc;
    }
 
-   tiler_heap->chunk_size = 2 * 1024 * 1024;
+   tiler_heap->chunk_size = phys_dev->csf.tiler.chunk_size;
 
    struct drm_panthor_tiler_heap_create thc = {
       .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
       .chunk_size = tiler_heap->chunk_size,
-      .initial_chunk_count = 5,
-      .max_chunks = 64,
+      .initial_chunk_count = phys_dev->csf.tiler.initial_chunks,
+      .max_chunks = phys_dev->csf.tiler.max_chunks,
       .target_in_flight = 65535,
    };
 
-   int ret =
-      drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc);
+   int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE,
+                            &thc);
    if (ret) {
       result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                             "Failed to create a tiler heap context");
@@ -698,7 +706,7 @@ cleanup_tiler(struct panvk_queue *queue)
       .handle = tiler_heap->context.handle,
    };
    ASSERTED int ret =
-      drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+      pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
    assert(!ret);
 
    panvk_pool_free_mem(&tiler_heap->desc);
@@ -1056,7 +1064,7 @@ panvk_queue_submit_ioctl(struct panvk_queue_submit *submit)
          DRM_PANTHOR_OBJ_ARRAY(submit->qsubmit_count, submit->qsubmits),
    };
 
-   ret = drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsubmit);
+   ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsubmit);
    if (ret)
       return vk_queue_set_lost(&queue->vk, "GROUP_SUBMIT: %m");
 
@@ -1298,8 +1306,8 @@ panvk_per_arch(queue_check_status)(struct panvk_queue *queue)
       .group_handle = queue->group_handle,
    };
 
-   int ret =
-      drmIoctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &state);
+   int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE,
+                            &state);
    if (!ret && !state.state)
       return VK_SUCCESS;
 

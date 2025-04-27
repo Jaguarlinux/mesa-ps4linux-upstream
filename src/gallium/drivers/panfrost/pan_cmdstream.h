@@ -157,6 +157,7 @@ panfrost_overdraw_alpha(const struct panfrost_context *ctx, bool zero)
 }
 #endif
 
+#if PAN_ARCH < 13
 static inline void
 panfrost_emit_primitive_size(struct panfrost_context *ctx, bool points,
                              uint64_t size_array,
@@ -172,6 +173,7 @@ panfrost_emit_primitive_size(struct panfrost_context *ctx, bool points,
       }
    }
 }
+#endif
 
 static inline uint8_t
 pan_draw_mode(enum mesa_prim mode)
@@ -256,11 +258,13 @@ panfrost_get_position_shader(struct panfrost_batch *batch,
    return vs_ptr;
 }
 
+#if PAN_ARCH < 12
 static inline uint64_t
 panfrost_get_varying_shader(struct panfrost_batch *batch)
 {
    return batch->rsd[PIPE_SHADER_VERTEX] + (2 * pan_size(SHADER_PROGRAM));
 }
+#endif
 
 static inline unsigned
 panfrost_vertex_attribute_stride(struct panfrost_compiled_shader *vs,
@@ -269,7 +273,7 @@ panfrost_vertex_attribute_stride(struct panfrost_compiled_shader *vs,
    unsigned v = vs->info.varyings.output_count;
    unsigned f = fs->info.varyings.input_count;
    unsigned slots = MAX2(v, f);
-   slots += util_bitcount(fs->key.fs.fixed_varying_mask);
+   slots += util_bitcount(vs->info.varyings.fixed_varyings);
 
    /* Assumes 16 byte slots. We could do better. */
    return slots * 16;
@@ -306,7 +310,11 @@ panfrost_emit_resources(struct panfrost_batch *batch,
    panfrost_make_resource_table(T, PAN_TABLE_IMAGE, batch->images[stage],
                                 util_last_bit(ctx->image_mask[stage]));
 
-   if (stage == PIPE_SHADER_VERTEX) {
+   if (stage == PIPE_SHADER_FRAGMENT) {
+      panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
+                                   batch->attribs[stage],
+                                   batch->nr_varying_attribs[PIPE_SHADER_FRAGMENT]);
+   } else if (stage == PIPE_SHADER_VERTEX) {
       panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
                                    batch->attribs[stage],
                                    ctx->vertex->num_elements);

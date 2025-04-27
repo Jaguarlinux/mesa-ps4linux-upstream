@@ -60,6 +60,7 @@
 #include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_tilebuffer.h"
+#include "geometry.h"
 #include "libagx.h"
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -1303,14 +1304,14 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
             cfg.aligned_width_msaa_sw =
                align(u_minify(view->resource->width0, level),
                      tex->layout.tilesize_el[level].width_el);
+
+            cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
          } else {
             cfg.level_offset_sw =
                ail_get_level_offset_B(&tex->layout, cfg.level);
          }
 
-         cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
-
-         if (tex->layout.tiling == AIL_TILING_GPU || emrt) {
+         if (tex->layout.tiling != AIL_TILING_LINEAR || emrt) {
             struct ail_tile tile_size = tex->layout.tilesize_el[level];
             cfg.tile_width_sw = tile_size.width_el;
             cfg.tile_height_sw = tile_size.height_el;
@@ -2777,7 +2778,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       struct agx_sampler_view *tex = ctx->stage[stage].textures[i];
 
       if (tex == NULL) {
-         agx_set_null_texture(&textures[i], T_tex.gpu);
+         agx_set_null_texture(&textures[i]);
          continue;
       }
 
@@ -2793,7 +2794,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
    }
 
    for (unsigned i = nr_active_textures; i < nr_textures; ++i)
-      agx_set_null_texture(&textures[i], T_tex.gpu);
+      agx_set_null_texture(&textures[i]);
 
    for (unsigned i = 0; i < nr_images; ++i) {
       /* Image descriptors come in pairs after the textures */
@@ -2803,7 +2804,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       struct agx_pbe_packed *pbe = (struct agx_pbe_packed *)(texture + 1);
 
       if (!(ctx->stage[stage].image_mask & BITFIELD_BIT(i))) {
-         agx_set_null_texture(texture, T_tex.gpu);
+         agx_set_null_texture(texture);
          agx_set_null_pbe(pbe, agx_pool_alloc_aligned(&batch->pool, 1, 64).gpu);
          continue;
       }
@@ -3907,13 +3908,14 @@ agx_ia_update(struct agx_batch *batch, const struct pipe_draw_info *info,
    uint64_t c_invs = agx_get_query_address(
       batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_INVOCATIONS]);
 
-   /* With a geometry shader, clipper counters are written by the pre-GS kernel
-    * since they depend on the output on the geometry shader. Without a geometry
-    * shader, they are written along with IA.
-    *
-    * TODO: Broken tessellation interaction, but nobody cares.
+   /* With a geometry/tessellation shader, clipper counters are written by the
+    * pre-GS/tess prefix sum kernel since they depend on the output on the
+    * geometry/tessellation shader.  Without a geometry/tessellation shader,
+    * they are written along with IA.
     */
-   if (ctx->stage[PIPE_SHADER_GEOMETRY].shader) {
+   if (ctx->stage[PIPE_SHADER_GEOMETRY].shader ||
+       ctx->stage[PIPE_SHADER_TESS_EVAL].shader) {
+
       c_prims = 0;
       c_invs = 0;
    }
@@ -3936,11 +3938,11 @@ agx_ia_update(struct agx_batch *batch, const struct pipe_draw_info *info,
 }
 
 static uint64_t
-agx_batch_geometry_state(struct agx_batch *batch)
+agx_batch_heap(struct agx_batch *batch)
 {
    struct agx_context *ctx = batch->ctx;
 
-   if (!batch->geometry_state) {
+   if (!batch->heap) {
       uint32_t size = 128 * 1024 * 1024;
 
       if (!ctx->heap) {
@@ -3948,18 +3950,18 @@ agx_batch_geometry_state(struct agx_batch *batch)
                                         PIPE_USAGE_DEFAULT, size);
       }
 
-      struct agx_geometry_state state = {
-         .heap = agx_resource(ctx->heap)->bo->va->addr,
-         .heap_size = size,
+      struct agx_heap heap = {
+         .base = agx_resource(ctx->heap)->bo->va->addr,
+         .size = size,
       };
 
       agx_batch_writes(batch, agx_resource(ctx->heap), 0);
 
-      batch->geometry_state =
-         agx_pool_upload_aligned(&batch->pool, &state, sizeof(state), 8);
+      batch->heap =
+         agx_pool_upload_aligned(&batch->pool, &heap, sizeof(heap), 8);
    }
 
-   return batch->geometry_state;
+   return batch->heap;
 }
 
 static uint64_t
@@ -3979,7 +3981,6 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       agx_pool_upload_aligned(&batch->pool, &ia, sizeof(ia), 8);
 
    struct agx_geometry_params params = {
-      .state = agx_batch_geometry_state(batch),
       .indirect_desc = batch->geom_indirect,
       .flat_outputs =
          batch->ctx->stage[PIPE_SHADER_FRAGMENT].shader->info.inputs_flat_shaded,
@@ -4038,14 +4039,16 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       params.count_buffer = T.gpu;
    }
 
+   /* Workgroup size */
+   params.vs_grid[3] = params.gs_grid[3] = 64;
+   params.vs_grid[4] = params.gs_grid[4] = 1;
+   params.vs_grid[5] = params.gs_grid[5] = 1;
+
    if (indirect) {
       batch->uniforms.vertex_output_buffer_ptr =
          agx_pool_alloc_aligned(&batch->pool, 8, 8).gpu;
 
       params.vs_grid[2] = params.gs_grid[2] = 1;
-
-      batch->geom_index_bo = agx_resource(batch->ctx->heap)->bo;
-      batch->geom_index = batch->geom_index_bo->va->addr;
    } else {
       params.vs_grid[0] = draw->count;
       params.gs_grid[0] =
@@ -4072,14 +4075,16 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
          params.input_buffer = addr;
       }
 
-      unsigned idx_size =
-         params.input_primitives * batch->ctx->gs->gs.max_indices;
+      struct agx_gs_info *gsi = &batch->ctx->gs->gs;
+      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+         unsigned idx_size = params.input_primitives * gsi->max_indices;
 
-      params.output_index_buffer =
-         agx_pool_alloc_aligned_with_bo(&batch->pool, idx_size * 4, 4,
-                                        &batch->geom_index_bo)
-            .gpu;
-      batch->geom_index = params.output_index_buffer;
+         params.output_index_buffer =
+            agx_pool_alloc_aligned_with_bo(&batch->pool, idx_size * 4, 4,
+                                           &batch->geom_index_bo)
+               .gpu;
+         batch->geom_index = params.output_index_buffer;
+      }
    }
 
    return agx_pool_upload_aligned_with_bo(&batch->pool, &params, sizeof(params),
@@ -4130,7 +4135,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
 
    uint64_t gp = batch->uniforms.geometry_params;
    struct agx_grid grid_vs, grid_gs;
-   struct agx_workgroup wg;
+   struct agx_workgroup wg = agx_workgroup(64, 1, 1);
 
    /* Setup grids */
    if (indirect) {
@@ -4149,23 +4154,23 @@ agx_launch_gs_prerast(struct agx_batch *batch,
          .vertex_buffer = batch->uniforms.vertex_output_buffer_ptr,
          .ia = batch->uniforms.input_assembly,
          .p = batch->uniforms.geometry_params,
+         .heap = agx_batch_heap(batch),
          .vs_outputs = batch->uniforms.vertex_outputs,
          .index_size_B = info->index_size,
          .prim = info->mode,
          .is_prefix_summing = gs->gs.prefix_sum,
-         .indices_per_in_prim = gs->gs.max_indices,
+         .max_indices = gs->gs.max_indices,
+         .shape = gs->gs.shape,
       };
 
       libagx_gs_setup_indirect_struct(batch, agx_1d(1), AGX_BARRIER_ALL, gsi);
 
-      wg = agx_workgroup(1, 1, 1);
-      grid_vs =
-         agx_grid_indirect(gp + offsetof(struct agx_geometry_params, vs_grid));
+      grid_vs = agx_grid_indirect_local(
+         gp + offsetof(struct agx_geometry_params, vs_grid));
 
-      grid_gs =
-         agx_grid_indirect(gp + offsetof(struct agx_geometry_params, gs_grid));
+      grid_gs = agx_grid_indirect_local(
+         gp + offsetof(struct agx_geometry_params, gs_grid));
    } else {
-      wg = agx_workgroup(64, 1, 1);
       grid_vs = agx_3d(draws->count, info->instance_count, 1);
 
       grid_gs =
@@ -4269,7 +4274,7 @@ agx_draw_without_restart(struct agx_batch *batch,
       &out_draws_rsrc.bo);
 
    struct libagx_unroll_restart_args unroll = {
-      .heap = agx_batch_geometry_state(batch),
+      .heap = agx_batch_heap(batch),
       .index_buffer = ib,
       .out_draw = out_draws.gpu,
       .restart_index = info->restart_index,
@@ -4605,11 +4610,11 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    agx_upload_draw_params(batch, indirect, draws, info);
 
    /* Setup parameters */
-   uint64_t geom_state = agx_batch_geometry_state(batch);
+   uint64_t heap = agx_batch_heap(batch);
    assert((tcs->tess.output_stride & 3) == 0 && "must be aligned");
 
    struct libagx_tess_args args = {
-      .heap = geom_state,
+      .heap = heap,
       .tcs_stride_el = tcs->tess.output_stride / 4,
       .statistic = agx_get_query_address(
          batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_DS_INVOCATIONS]),
@@ -4620,6 +4625,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       .patch_coord_buffer = agx_resource(ctx->heap)->bo->va->addr,
       .partitioning = partitioning,
       .points_mode = point_mode,
+      .isolines = mode == TESS_PRIMITIVE_ISOLINES,
    };
 
    if (!point_mode && tes->tess.primitive != TESS_PRIMITIVE_ISOLINES) {
@@ -4736,10 +4742,24 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
    batch->uniforms.vertex_output_buffer_ptr = 0;
 
+   uint64_t c_prims = agx_get_query_address(
+      batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_PRIMITIVES]);
+   uint64_t c_invs = agx_get_query_address(
+      batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_INVOCATIONS]);
+
+   /* If there's a geometry shader, it will increment the clipper stats.
+    * Otherwise, we do when tessellating.
+    */
+   if (ctx->stage[PIPE_SHADER_GEOMETRY].shader) {
+      c_prims = 0;
+      c_invs = 0;
+   }
+
    /* Generate counts, then prefix sum them, then finally tessellate. */
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
                      LIBAGX_TESS_MODE_COUNT, state);
-   libagx_prefix_sum_tess(batch, agx_1d(1024), AGX_BARRIER_ALL, state);
+   libagx_prefix_sum_tess(batch, agx_1d(1024), AGX_BARRIER_ALL, state, c_prims,
+                          c_invs, c_prims || c_invs);
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
                      LIBAGX_TESS_MODE_WITH_COUNTS, state);
 
@@ -4949,6 +4969,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
         ctx->pipeline_statistics[PIPE_STAT_QUERY_VS_INVOCATIONS] ||
         ((ctx->pipeline_statistics[PIPE_STAT_QUERY_C_PRIMITIVES] ||
           ctx->pipeline_statistics[PIPE_STAT_QUERY_C_INVOCATIONS]) &&
+         !ctx->stage[PIPE_SHADER_TESS_EVAL].shader &&
          !ctx->stage[PIPE_SHADER_GEOMETRY].shader))) {
 
       uint64_t ptr;
@@ -5118,7 +5139,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    /* Wrap the pool allocation in a fake resource for meta-Gallium use */
    struct agx_resource indirect_rsrc = {.bo = batch->geom_indirect_bo};
-   struct agx_resource index_rsrc = {.bo = batch->geom_index_bo};
+   struct agx_resource index_rsrc = {};
 
    if (ctx->gs) {
       /* Launch the pre-rasterization parts of the geometry shader */
@@ -5128,11 +5149,12 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          return;
 
       /* Setup to rasterize the GS results */
+      struct agx_gs_info *gsi = &ctx->gs->gs;
       info_gs = (struct pipe_draw_info){
-         .mode = ctx->gs->gs.mode,
-         .index_size = 4,
-         .primitive_restart = true,
-         .restart_index = ~0,
+         .mode = gsi->mode,
+         .index_size = agx_gs_index_size(gsi->shape),
+         .primitive_restart = agx_gs_indexed(gsi->shape),
+         .restart_index = agx_gs_index_size(gsi->shape) == 1 ? 0xFF : ~0,
          .index.resource = &index_rsrc.base,
          .instance_count = 1,
       };
@@ -5145,26 +5167,38 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          };
 
          indirect = &indirect_gs;
+
+         batch->geom_index_bo = agx_resource(batch->ctx->heap)->bo;
+         batch->geom_index = batch->geom_index_bo->va->addr;
       } else {
-         unsigned unrolled_prims =
-            u_decomposed_prims_for_vertices(info->mode, draws->count) *
-            info->instance_count;
+         unsigned prims =
+            u_decomposed_prims_for_vertices(info->mode, draws->count);
 
          draw_gs = (struct pipe_draw_start_count_bias){
-            .count = ctx->gs->gs.max_indices * unrolled_prims,
+            .count = agx_gs_rast_vertices(gsi->shape, gsi->max_indices, prims,
+                                          info->instance_count),
          };
+
+         info_gs.instance_count = agx_gs_rast_instances(
+            gsi->shape, gsi->max_indices, prims, info->instance_count);
 
          draws = &draw_gs;
       }
 
       info = &info_gs;
+      index_rsrc.bo = batch->geom_index_bo;
 
       /* TODO: Deduplicate? */
       batch->reduced_prim = u_reduced_prim(info->mode);
       ctx->dirty |= AGX_DIRTY_PRIM;
 
-      ib = batch->geom_index;
-      ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
+      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+         ib = batch->geom_index;
+         ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
+      } else if (gsi->shape == AGX_GS_SHAPE_STATIC_INDEXED) {
+         ib = agx_pool_upload(&batch->pool, gsi->topology, gsi->max_indices);
+         ib_extent = gsi->max_indices;
+      }
 
       /* We need to reemit geometry descriptors since the txf sampler may change
        * between the GS prepass and the GS rast program.
@@ -5221,7 +5255,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       draw.restart = info->primitive_restart;
       draw.indexed = true;
    } else {
-      draw.start = draws->start;
+      draw.start = indirect ? 0 : draws->start;
    }
 
    if (indirect) {
@@ -5280,6 +5314,8 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
            unsigned variable_shared_mem)
 {
    struct agx_context *ctx = batch->ctx;
+   if (!linked && agx_is_shader_empty(&cs->b))
+      return;
 
    /* To implement load_num_workgroups, the number of workgroups needs to be
     * available in GPU memory. This is either the indirect buffer, or just a

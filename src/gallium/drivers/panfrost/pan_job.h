@@ -133,6 +133,7 @@ struct panfrost_batch {
 
    unsigned nr_push_uniforms[PIPE_SHADER_TYPES];
    unsigned nr_uniform_buffers[PIPE_SHADER_TYPES];
+   unsigned nr_varying_attribs[PIPE_SHADER_TYPES];
 
    /* Varying related pointers */
    struct {
@@ -150,6 +151,9 @@ struct panfrost_batch {
    /* Valhall: struct mali_scissor_packed */
    unsigned scissor[2];
    float minimum_z, maximum_z;
+
+   /* Avalon: struct mali_viewport_packed */
+   unsigned avalon_viewport[4];
 
    /* Used on Valhall only. Midgard includes attributes in-band with
     * attributes, wildly enough.

@@ -78,17 +78,29 @@
     # should make CI_BUILD_COMPONENTS="angle piglit"
     CI_BUILD_COMPONENTS: "angle"
 
+.container-builds-piglit:
+  variables:
+    PIGLIT_TAG: "${CONDITIONAL_BUILD_PIGLIT_TAG}"
+
 .container-builds-x86_64:
   extends:
     - .container-builds-angle
+    - .container-builds-piglit
   variables:
-    CI_BUILD_COMPONENTS: "angle"
+    CI_BUILD_COMPONENTS: "angle piglit"
+
+.container-builds-arm32:
+  extends:
+    - .container-builds-piglit
+  variables:
+    CI_BUILD_COMPONENTS: "piglit"
 
 .container-builds-arm64:
   extends:
     - .container-builds-angle
+    - .container-builds-piglit
   variables:
-    CI_BUILD_COMPONENTS: "angle"
+    CI_BUILD_COMPONENTS: "angle piglit"
 
 .use-base-image:
   extends:
@@ -203,14 +215,15 @@ debian/s390x_build:
 
 # Android NDK cross-build image
 .android-variables:
-  extends:
-    - .container-builds-android
   variables:
     ANDROID_VERSION: 14
     ANDROID_NDK_VERSION: "r27c"
     ANDROID_SDK_VERSION: 34
     # Space-separated list of interesting CTS modules
-    ANDROID_CTS_MODULES: CtsGraphicsTestCases
+    ANDROID_CTS_MODULES: >-
+      CtsGraphicsTestCases
+      CtsNativeHardwareTestCases
+      CtsSkQPTestCases
     ANDROID_LLVM_VERSION: llvmorg-19.1.7
     ANDROID_LLVM_ARTIFACT_NAME: android-x86_64-llvm-20250324
     # This can be confusing: LLVM_VERSION refers to the host LLVM toolchain
@@ -221,7 +234,6 @@ debian/s390x_build:
 debian/android_build:
   extends:
     - .android-variables
-    - .container-builds-android
     - .use-debian/x86_64_build-base
   variables:
     MESA_IMAGE_TAG: &debian-android_build ${DEBIAN_BUILD_TAG}
@@ -282,10 +294,10 @@ alpine/x86_64_build:
     LLVM_VERSION: &alpine-llvm_version 19
   rules:
     # Note: the next three lines must remain in that order, so that the rules
-    # in `linkcheck-docs` catch nightly pipelines before the rules in `pages`
+    # in `linkcheck-docs` catch nightly pipelines before the rules in `deploy-docs`
     # exclude them.
     - !reference [linkcheck-docs, rules]
-    - !reference [pages, rules]
+    - !reference [deploy-docs, rules]
     - !reference [test-docs, rules]
     - !reference [.container, rules]
 
@@ -314,9 +326,9 @@ fedora/x86_64_build:
     - .fdo.container-build@fedora
     - .container
   variables:
-    FDO_DISTRIBUTION_VERSION: 41
+    FDO_DISTRIBUTION_VERSION: 42
     MESA_IMAGE_TAG: &fedora-x86_64_build ${FEDORA_X86_64_BUILD_TAG}
-    LLVM_VERSION: &fedora-x86_64-llvm 19
+    LLVM_VERSION: &fedora-x86_64-llvm 20
 
 .use-fedora/x86_64_build:
   tags:
@@ -405,7 +417,9 @@ debian/arm64_test-base:
 
 # Debian based x86_64 test image for GL
 debian/x86_64_test-gl:
-  extends: .use-debian/x86_64_test-base
+  extends:
+    - .use-debian/x86_64_test-base
+    - .container-builds-x86_64
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-gl ${DEBIAN_TEST_GL_TAG}
 
@@ -423,7 +437,9 @@ debian/x86_64_test-gl:
 
 # Debian based x86_64 test image for VK
 debian/x86_64_test-vk:
-  extends: .use-debian/x86_64_test-base
+  extends:
+    - .use-debian/x86_64_test-base
+    - .container-builds-x86_64
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-vk ${DEBIAN_TEST_VK_TAG}
 
@@ -444,6 +460,7 @@ debian/x86_64_test-android:
   extends:
     - .android-variables
     - .use-debian/x86_64_test-base
+    - .container-builds-android
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-android ${DEBIAN_TEST_ANDROID_TAG}
 
@@ -484,7 +501,9 @@ debian/x86_64_pyutils:
 debian/arm32_test-gl:
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends: .use-debian/arm32_test-base
+  extends:
+    - .use-debian/arm32_test-base
+    - .container-builds-arm32
   variables:
     MESA_IMAGE_TAG: &debian-arm32_test-gl ${DEBIAN_TEST_GL_TAG}
 
@@ -506,7 +525,9 @@ debian/arm32_test-vk:
     - when: never # There are currently no arm32 VK jobs
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends: .use-debian/arm32_test-base
+  extends:
+    - .use-debian/arm32_test-base
+    - .container-builds-arm32
   variables:
     MESA_IMAGE_TAG: &debian-arm32_test-vk ${DEBIAN_TEST_VK_TAG}
 
@@ -548,7 +569,9 @@ debian/arm64_test-gl:
 debian/arm64_test-vk:
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends: .use-debian/arm64_test-base
+  extends:
+    - .use-debian/arm64_test-base
+    - .container-builds-arm64
   variables:
     MESA_IMAGE_TAG: &debian-arm64_test-vk ${DEBIAN_TEST_VK_TAG}
 

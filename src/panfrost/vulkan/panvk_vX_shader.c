@@ -203,9 +203,7 @@ panvk_lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin,
       PAN_ARCH <= 7 ?
          nir_load_raw_vertex_id_pan(b) :
          nir_load_vertex_id(b),
-      PAN_ARCH >= 9 ?
-         nir_iadd(b, nir_load_instance_id(b), nir_load_base_instance(b)) :
-         nir_load_instance_id(b),
+      nir_load_instance_id(b),
       nir_get_io_offset_src(intrin)->ssa,
       .base = nir_intrinsic_base(intrin),
       .component = nir_intrinsic_component(intrin),
@@ -350,6 +348,7 @@ panvk_get_spirv_options(UNUSED struct vk_physical_device *vk_pdev,
       .ubo_addr_format = panvk_buffer_ubo_addr_format(rs->uniform_buffers),
       .ssbo_addr_format = panvk_buffer_ssbo_addr_format(rs->storage_buffers),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
+      .shared_addr_format = nir_address_format_32bit_offset,
    };
 }
 
@@ -507,10 +506,11 @@ valhall_lower_get_ssbo_size(struct nir_builder *b,
 
    b->cursor = nir_before_instr(&intr->instr);
 
-   nir_def *table_idx =
-      nir_ushr_imm(b, nir_channel(b, intr->src[0].ssa, 0), 24);
+   nir_def *res_handle = nir_channel(b, intr->src[0].ssa, 0);
+   nir_def *table_idx = nir_ushr_imm(b, res_handle, 24);
+   nir_def *res_idx = nir_iand_imm(b, res_handle, BITFIELD_MASK(24));
    nir_def *res_table = nir_ior_imm(b, table_idx, pan_res_handle(62, 0));
-   nir_def *buf_idx = nir_channel(b, intr->src[0].ssa, 1);
+   nir_def *buf_idx = nir_iadd(b, res_idx, nir_channel(b, intr->src[0].ssa, 1));
    nir_def *desc_offset = nir_imul_imm(b, buf_idx, PANVK_DESCRIPTOR_SIZE);
    nir_def *size = nir_load_ubo(
       b, 1, 32, res_table, nir_iadd_imm(b, desc_offset, 4), .range = ~0u,
@@ -791,10 +791,8 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
 #endif
 
    if (gl_shader_stage_uses_workgroup(stage)) {
-      if (!nir->info.shared_memory_explicit_layout) {
-         NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
-                  shared_type_info);
-      }
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+               shared_type_info);
 
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
@@ -1048,8 +1046,10 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
 
          if (cfg.stage == MALI_SHADER_STAGE_FRAGMENT)
             cfg.fragment_coverage_bitmask_type = MALI_COVERAGE_BITMASK_TYPE_GL;
+#if PAN_ARCH < 12
          else if (cfg.stage == MALI_SHADER_STAGE_VERTEX)
             cfg.vertex_warp_limit = MALI_WARP_LIMIT_HALF;
+#endif
 
          cfg.register_allocation =
             pan_register_allocation(shader->info.work_reg_count);
@@ -1061,6 +1061,38 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
             cfg.requires_helper_threads = shader->info.contains_barrier;
       }
    } else {
+#if PAN_ARCH >= 12
+      shader->spds.all_points =
+         panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+      if (!panvk_priv_mem_dev_addr(shader->spds.all_points))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      pan_cast_and_pack(panvk_priv_mem_host_addr(shader->spds.all_points),
+                        SHADER_PROGRAM, cfg) {
+         cfg.stage = pan_shader_stage(&shader->info);
+         cfg.register_allocation =
+            pan_register_allocation(shader->info.work_reg_count);
+         cfg.binary = panvk_shader_get_dev_addr(shader);
+         cfg.preload.r48_r63 = (shader->info.preload >> 48);
+         cfg.flush_to_zero_mode = shader_ftz_mode(shader);
+      }
+
+      shader->spds.all_triangles =
+         panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+      if (!panvk_priv_mem_dev_addr(shader->spds.all_triangles))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      pan_cast_and_pack(panvk_priv_mem_host_addr(shader->spds.all_triangles),
+                        SHADER_PROGRAM, cfg) {
+         cfg.stage = pan_shader_stage(&shader->info);
+         cfg.register_allocation =
+            pan_register_allocation(shader->info.work_reg_count);
+         cfg.binary =
+            panvk_shader_get_dev_addr(shader) + shader->info.vs.no_psiz_offset;
+         cfg.preload.r48_r63 = (shader->info.preload >> 48);
+         cfg.flush_to_zero_mode = shader_ftz_mode(shader);
+      }
+#else
       shader->spds.pos_points =
          panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
       if (!panvk_priv_mem_dev_addr(shader->spds.pos_points))
@@ -1113,6 +1145,7 @@ panvk_shader_upload(struct panvk_device *dev, struct panvk_shader *shader,
             cfg.flush_to_zero_mode = shader_ftz_mode(shader);
          }
       }
+#endif
    }
 #endif
 
@@ -1139,9 +1172,14 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    if (shader->info.stage != MESA_SHADER_VERTEX) {
       panvk_pool_free_mem(&shader->spd);
    } else {
+#if PAN_ARCH >= 12
+      panvk_pool_free_mem(&shader->spds.all_points);
+      panvk_pool_free_mem(&shader->spds.all_triangles);
+#else
       panvk_pool_free_mem(&shader->spds.var);
       panvk_pool_free_mem(&shader->spds.pos_points);
       panvk_pool_free_mem(&shader->spds.pos_triangles);
+#endif
    }
 #endif
 

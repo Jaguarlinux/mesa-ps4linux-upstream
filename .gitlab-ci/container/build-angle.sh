@@ -13,7 +13,7 @@ uncollapsed_section_start angle "Building ANGLE"
 # setting up the environment variables locally
 ci_tag_build_time_check "ANGLE_TAG"
 
-ANGLE_REV="3818d37d5e94317f01810053b8f28c1f1e8b98e6"
+ANGLE_REV="f355e2b37ed43939e2753fc7dacccf75abb4c1a3"
 
 # Set ANGLE_ARCH based on DEBIAN_ARCH if it hasn't been explicitly defined
 if [[ -z "${ANGLE_ARCH:-}" ]]; then
@@ -93,6 +93,7 @@ is_component_build=false
 is_debug=false
 target_cpu="${ANGLE_ARCH}"
 target_os="${ANGLE_TARGET}"
+treat_warnings_as_errors=false
 EOF
 
 case "$ANGLE_TARGET" in

@@ -40,7 +40,6 @@ section_start prepare_rootfs "Preparing root filesystem"
 
 set -ex
 
-section_switch rootfs "Assembling root filesystem"
 ROOTFS_URL="$(get_path_to_artifact lava-rootfs.tar.zst)"
 [ $? != 1 ] || exit 1
 
@@ -52,7 +51,7 @@ cp artifacts/ci-common/init-*.sh results/job-rootfs-overlay/
 cp "$SCRIPTS_DIR"/setup-test-env.sh results/job-rootfs-overlay/
 
 tar zcf job-rootfs-overlay.tar.gz -C results/job-rootfs-overlay/ .
-s3_upload job-rootfs-overlay.tar.gz "https://${JOB_ARTIFACTS_BASE}/"
+ci-fairy s3cp --token-file "${S3_JWT_FILE}" job-rootfs-overlay.tar.gz "https://${JOB_ROOTFS_OVERLAY_PATH}"
 
 # Prepare env vars for upload.
 section_switch variables "Environment variables passed through to device:"

@@ -206,6 +206,14 @@ impl SetFieldU64 for SM50Encoder<'_> {
     }
 }
 
+fn zero_reg() -> RegRef {
+    RegRef::new(RegFile::GPR, 255, 1)
+}
+
+fn true_reg() -> RegRef {
+    RegRef::new(RegFile::Pred, 7, 1)
+}
+
 impl SM50Encoder<'_> {
     fn set_opcode(&mut self, opcode: u16) {
         self.set_field(48..64, opcode);
@@ -224,7 +232,7 @@ impl SM50Encoder<'_> {
         self.set_pred_reg(
             16..19,
             match pred.pred_ref {
-                PredRef::None => RegRef::zero(RegFile::Pred, 1),
+                PredRef::None => true_reg(),
                 PredRef::Reg(reg) => reg,
                 PredRef::SSA(_) => panic!("SSA values must be lowered"),
             },
@@ -251,7 +259,7 @@ impl SM50Encoder<'_> {
 
     fn set_reg_src_ref(&mut self, range: Range<usize>, src_ref: SrcRef) {
         match src_ref {
-            SrcRef::Zero => self.set_reg(range, RegRef::zero(RegFile::GPR, 1)),
+            SrcRef::Zero => self.set_reg(range, zero_reg()),
             SrcRef::Reg(reg) => self.set_reg(range, reg),
             _ => panic!("Not a register"),
         }
@@ -297,7 +305,7 @@ impl SM50Encoder<'_> {
     fn set_pred_dst(&mut self, range: Range<usize>, dst: Dst) {
         match dst {
             Dst::None => {
-                self.set_pred_reg(range, RegRef::zero(RegFile::Pred, 1));
+                self.set_pred_reg(range, true_reg());
             }
             Dst::Reg(reg) => self.set_pred_reg(range, reg),
             _ => panic!("Not a register"),
@@ -305,12 +313,9 @@ impl SM50Encoder<'_> {
     }
 
     fn set_pred_src(&mut self, range: Range<usize>, not_bit: usize, src: Src) {
-        // The default for predicates is true
-        let true_reg = RegRef::new(RegFile::Pred, 7, 1);
-
         let (not, reg) = match src.src_ref {
-            SrcRef::True => (false, true_reg),
-            SrcRef::False => (true, true_reg),
+            SrcRef::True => (false, true_reg()),
+            SrcRef::False => (true, true_reg()),
             SrcRef::Reg(reg) => (false, reg),
             _ => panic!("Not a register"),
         };
@@ -320,7 +325,7 @@ impl SM50Encoder<'_> {
 
     fn set_dst(&mut self, dst: Dst) {
         let reg = match dst {
-            Dst::None => RegRef::zero(RegFile::GPR, 1),
+            Dst::None => zero_reg(),
             Dst::Reg(reg) => reg,
             _ => panic!("invalid dst {dst}"),
         };
@@ -422,38 +427,6 @@ impl SM50Encoder<'_> {
 //
 // Legalization helpers
 //
-
-pub trait SM50LegalizeBuildHelpers: LegalizeBuildHelpers {
-    fn copy_alu_src_if_fabs(&mut self, src: &mut Src, src_type: SrcType) {
-        if src.src_mod.has_fabs() {
-            self.copy_alu_src_and_lower_fmod(src, src_type);
-        }
-    }
-
-    fn copy_alu_src_if_i20_overflow(
-        &mut self,
-        src: &mut Src,
-        reg_file: RegFile,
-        src_type: SrcType,
-    ) {
-        if src.as_imm_not_i20().is_some() {
-            self.copy_alu_src(src, reg_file, src_type);
-        }
-    }
-
-    fn copy_alu_src_if_f20_overflow(
-        &mut self,
-        src: &mut Src,
-        reg_file: RegFile,
-        src_type: SrcType,
-    ) {
-        if src.as_imm_not_f20().is_some() {
-            self.copy_alu_src(src, reg_file, src_type);
-        }
-    }
-}
-
-impl SM50LegalizeBuildHelpers for LegalizeBuilder<'_> {}
 
 /// Helper to legalize extended or external instructions
 ///
@@ -565,9 +538,9 @@ impl SM50Op for OpFFma {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         use RegFile::GPR;
         let [src0, src1, src2] = &mut self.srcs;
-        b.copy_alu_src_if_fabs(src0, SrcType::F32);
-        b.copy_alu_src_if_fabs(src1, SrcType::F32);
-        b.copy_alu_src_if_fabs(src2, SrcType::F32);
+        b.copy_alu_src_if_fabs(src0, GPR, SrcType::F32);
+        b.copy_alu_src_if_fabs(src1, GPR, SrcType::F32);
+        b.copy_alu_src_if_fabs(src2, GPR, SrcType::F32);
         swap_srcs_if_not_reg(src0, src1, GPR);
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F32);
         b.copy_alu_src_if_f20_overflow(src1, GPR, SrcType::F32);
@@ -672,8 +645,8 @@ impl SM50Op for OpFMul {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         use RegFile::GPR;
         let [src0, src1] = &mut self.srcs;
-        b.copy_alu_src_if_fabs(src0, SrcType::F32);
-        b.copy_alu_src_if_fabs(src1, SrcType::F32);
+        b.copy_alu_src_if_fabs(src0, GPR, SrcType::F32);
+        b.copy_alu_src_if_fabs(src1, GPR, SrcType::F32);
         swap_srcs_if_not_reg(src0, src1, GPR);
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F32);
 
@@ -844,6 +817,8 @@ impl SM50Encoder<'_> {
         self.set_field(
             range,
             match op {
+                IntCmpOp::False => 0_u8,
+                IntCmpOp::True => 7_u8,
                 IntCmpOp::Eq => 2_u8,
                 IntCmpOp::Ne => 5_u8,
                 IntCmpOp::Lt => 1_u8,
@@ -1011,9 +986,9 @@ impl SM50Op for OpDFma {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         use RegFile::GPR;
         let [src0, src1, src2] = &mut self.srcs;
-        b.copy_alu_src_if_fabs(src0, SrcType::F64);
-        b.copy_alu_src_if_fabs(src1, SrcType::F64);
-        b.copy_alu_src_if_fabs(src2, SrcType::F64);
+        b.copy_alu_src_if_fabs(src0, GPR, SrcType::F64);
+        b.copy_alu_src_if_fabs(src1, GPR, SrcType::F64);
+        b.copy_alu_src_if_fabs(src2, GPR, SrcType::F64);
         swap_srcs_if_not_reg(src0, src1, GPR);
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F64);
         b.copy_alu_src_if_f20_overflow(src1, GPR, SrcType::F64);
@@ -1110,8 +1085,8 @@ impl SM50Op for OpDMul {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         use RegFile::GPR;
         let [src0, src1] = &mut self.srcs;
-        b.copy_alu_src_if_fabs(src0, SrcType::F64);
-        b.copy_alu_src_if_fabs(src1, SrcType::F64);
+        b.copy_alu_src_if_fabs(src0, GPR, SrcType::F64);
+        b.copy_alu_src_if_fabs(src1, GPR, SrcType::F64);
         swap_srcs_if_not_reg(src0, src1, GPR);
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F64);
         b.copy_alu_src_if_f20_overflow(src1, GPR, SrcType::F64);
@@ -1263,13 +1238,7 @@ impl SM50Op for OpIAdd2 {
         swap_srcs_if_not_reg(src0, src1, GPR);
         if src0.src_mod.is_ineg() && src1.src_mod.is_ineg() {
             assert!(self.carry_out.is_none());
-            let val = b.alloc_ssa(GPR, 1);
-            b.push_op(OpIAdd2 {
-                dst: val.into(),
-                carry_out: Dst::None,
-                srcs: [Src::new_zero(), *src0],
-            });
-            *src0 = val.into();
+            b.copy_alu_src_and_lower_ineg(src0, GPR, SrcType::I32);
         }
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::I32);
         if !self.carry_out.is_none() {

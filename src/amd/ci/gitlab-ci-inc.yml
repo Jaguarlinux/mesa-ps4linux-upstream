@@ -308,10 +308,6 @@
   variables:
     B2C_KERNEL_URL: https://fs.mupuf.org/linux-6.6-b2c-radv-ci # 6.6
 
-.b2c-deqp-test:
-  variables:
-    HWCI_TEST_SCRIPT: ./install/deqp-runner.sh
-
 .tahiti-test-valve:
   variables:
     FDO_CI_CONCURRENT: 24
@@ -463,19 +459,8 @@
 .vkcts-test-valve:
   extends:
     - .b2c-test-radv-vk
-    - .b2c-deqp-test
   variables:
     DEQP_SUITE: radv-valve
-
-############### vkd3d-proton
-.vkd3d-kabini-valve:
-  extends:
-    - .b2c-test-radv-vk
-    - .b2c-vkd3d-proton-test
-    - .kabini-test-valve
-    - .radv-valve-manual-rules
-  variables:
-    GPU_VERSION: radv-kabini
 
 ############### Fluster tests ###############
 .radeonsi-raven-vaapi-fluster:
@@ -484,8 +469,8 @@
   rules:
     - !reference [.radeonsi-vaapi-rules, rules]
     - changes:
-      - .gitlab-ci/fluster/*
-      - src/amd/ci/$GPU_VERSION-fluster-fails.txt
-      - src/amd/ci/$GPU_VERSION-fluster-flakes.txt
-      - src/amd/ci/$GPU_VERSION-fluster-skips.txt
+        - .gitlab-ci/fluster/*
+        - src/amd/ci/$GPU_VERSION-fluster-fails.txt
+        - src/amd/ci/$GPU_VERSION-fluster-flakes.txt
+        - src/amd/ci/$GPU_VERSION-fluster-skips.txt
       when: on_success

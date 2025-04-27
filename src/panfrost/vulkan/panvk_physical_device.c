@@ -210,6 +210,7 @@ get_device_extensions(const struct panvk_physical_device *device,
    const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
 
    bool has_vk1_1 = arch >= 10;
+   bool has_vk1_2 = arch >= 10;
 
    *ext = (struct vk_device_extension_table){
       .KHR_8bit_storage = true,
@@ -231,6 +232,7 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_external_memory_fd = true,
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
+      .KHR_format_feature_flags2 = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
       .KHR_image_format_list = true,
@@ -240,6 +242,8 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
+      .KHR_maintenance4 = has_vk1_1,
+      .KHR_maintenance5 = has_vk1_1,
       .KHR_map_memory2 = true,
       .KHR_multiview = arch >= 10,
       .KHR_pipeline_executable_properties = true,
@@ -256,11 +260,12 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_maximal_reconvergence = has_vk1_1,
       .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = false,
+      .KHR_shader_quad_control = has_vk1_2,
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = has_vk1_1,
       .KHR_shader_subgroup_rotate = true,
       .KHR_shader_subgroup_uniform_control_flow = has_vk1_1,
+      .KHR_spirv_1_4 = arch >= 10,
       .KHR_storage_buffer_storage_class = true,
 #ifdef PANVK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
@@ -279,6 +284,8 @@ get_device_extensions(const struct panvk_physical_device *device,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
+      .EXT_extended_dynamic_state = true,
+      .EXT_extended_dynamic_state2 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -303,6 +310,8 @@ get_device_extensions(const struct panvk_physical_device *device,
       .EXT_shader_module_identifier = true,
       .EXT_subgroup_size_control = has_vk1_1,
       .EXT_tooling_info = true,
+      .EXT_vertex_attribute_divisor = true,
+      .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = arch >= 10,
       .EXT_ycbcr_image_arrays = arch >= 10,
       .GOOGLE_decorate_string = true,
@@ -358,6 +367,7 @@ get_features(const struct panvk_physical_device *device,
       /* Vulkan 1.0 */
       .depthClamp = true,
       .depthBiasClamp = true,
+      .dualSrcBlend = true,
       .robustBufferAccess = true,
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
@@ -374,6 +384,8 @@ get_features(const struct panvk_physical_device *device,
       .fragmentStoresAndAtomics = arch >= 10,
       .shaderImageGatherExtended = true,
       .shaderStorageImageExtendedFormats = true,
+      .shaderStorageImageReadWithoutFormat = true,
+      .shaderStorageImageWriteWithoutFormat = true,
       .shaderUniformBufferArrayDynamicIndexing = true,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
@@ -451,6 +463,10 @@ get_features(const struct panvk_physical_device *device,
       .robustImageAccess = true,
       .inlineUniformBlock = false,
       .descriptorBindingInlineUniformBlockUpdateAfterBind = false,
+      .extendedDynamicState = true,
+      .extendedDynamicState2 = true,
+      .extendedDynamicState2LogicOp = true,
+      .extendedDynamicState2PatchControlPoints = false,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       .shaderDemoteToHelperInvocation = false,
@@ -463,7 +479,8 @@ get_features(const struct panvk_physical_device *device,
       .dynamicRendering = true,
       .dynamicRenderingLocalRead = true,
       .shaderIntegerDotProduct = false,
-      .maintenance4 = false,
+      .maintenance4 = true,
+      .maintenance5 = true,
 
       /* Vulkan 1.4 */
       .shaderSubgroupRotate = true,
@@ -485,6 +502,9 @@ get_features(const struct panvk_physical_device *device,
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
+
+      /* VK_EXT_vertex_input_dynamic_state */
+      .vertexInputDynamicState = true,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -521,7 +541,7 @@ get_features(const struct panvk_physical_device *device,
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_quad_control */
-      .shaderQuadControl = false,
+      .shaderQuadControl = true,
 
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
@@ -543,6 +563,9 @@ get_features(const struct panvk_physical_device *device,
 
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = arch >= 10,
+
+      /* VK_KHR_push_descriptor */
+      .pushDescriptor = true,
    };
 }
 
@@ -554,7 +577,7 @@ get_api_version(unsigned arch)
       return version_override;
 
    if (arch >= 10)
-      return VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION);
+      return VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION);
 
    return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
 }
@@ -607,6 +630,18 @@ get_device_properties(const struct panvk_instance *instance,
 
    /* Ensure that the max threads count per workgroup is valid for Bifrost */
    assert(arch > 8 || device->kmod.props.max_threads_per_wg <= 1024);
+
+   float pointSizeRangeMin;
+   float pointSizeRangeMax;
+
+   /* On v13+, point size handling changed entirely */
+   if (arch >= 13) {
+      pointSizeRangeMin = 1.0;
+      pointSizeRangeMax = 1024.0;
+   } else {
+      pointSizeRangeMin = 0.125;
+      pointSizeRangeMax = 4095.9375;
+   }
 
    *properties = (struct vk_properties){
       .apiVersion = get_api_version(arch),
@@ -745,8 +780,7 @@ get_device_properties(const struct panvk_instance *instance,
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */
       .maxFragmentOutputAttachments = 8,
-      /* We don't support dual source blending yet. */
-      .maxFragmentDualSrcAttachments = 0,
+      .maxFragmentDualSrcAttachments = max_cbuf_atts,
       /* 8 render targets, 2^12 storage buffers and 2^8 storage images (see
        * above).
        */
@@ -821,7 +855,7 @@ get_device_properties(const struct panvk_instance *instance,
       .maxCullDistances = 0,
       .maxCombinedClipAndCullDistances = 0,
       .discreteQueuePriorities = 2,
-      .pointSizeRange = {0.125, 4095.9375},
+      .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
       .lineWidthRange = {0.0, 7.9921875},
       .pointSizeGranularity = (1.0 / 16.0),
       .lineWidthGranularity = (1.0 / 128.0),
@@ -992,7 +1026,7 @@ get_device_properties(const struct panvk_instance *instance,
       /* VK_KHR_vertex_attribute_divisor */
       /* We will have to restrict this a bit for multiview */
       .maxVertexAttribDivisor = UINT32_MAX,
-      .supportsNonZeroFirstInstance = false,
+      .supportsNonZeroFirstInstance = true,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = MAX_PUSH_DESCRIPTORS,
@@ -1090,6 +1124,8 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       break;
 
    case 10:
+   case 12:
+   case 13:
       break;
 
    default:
@@ -1122,7 +1158,15 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       goto fail;
 
-   vk_warn_non_conformant_implementation("panvk");
+   if (arch >= 10) {
+      /* XXX: Make dri options for thoses */
+      device->csf.tiler.chunk_size = 2 * 1024 * 1024;
+      device->csf.tiler.initial_chunks = 5;
+      device->csf.tiler.max_chunks = 64;
+   }
+
+   if (arch != 10)
+      vk_warn_non_conformant_implementation("panvk");
 
    struct vk_device_extension_table supported_extensions;
    get_device_extensions(device, &supported_extensions);
@@ -1263,6 +1307,8 @@ panvk_GetPhysicalDeviceMemoryProperties2(
 DEVICE_PER_ARCH_FUNCS(6);
 DEVICE_PER_ARCH_FUNCS(7);
 DEVICE_PER_ARCH_FUNCS(10);
+DEVICE_PER_ARCH_FUNCS(12);
+DEVICE_PER_ARCH_FUNCS(13);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_CreateDevice(VkPhysicalDevice physicalDevice,
@@ -1335,11 +1381,11 @@ format_is_supported(struct panvk_physical_device *physical_device,
    return true;
 }
 
-static VkFormatFeatureFlags
+static VkFormatFeatureFlags2
 get_image_plane_format_features(struct panvk_physical_device *physical_device,
                                 VkFormat format)
 {
-   VkFormatFeatureFlags features = 0;
+   VkFormatFeatureFlags2 features = 0;
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
    const struct panfrost_format fmt = physical_device->formats.all[pfmt];
    unsigned arch = pan_arch(physical_device->kmod.props.gpu_prod_id);
@@ -1348,24 +1394,22 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
       return 0;
 
    if (fmt.bind & PAN_BIND_SAMPLER_VIEW) {
-      features |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                  VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+      features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
 
       if (arch >= 10)
-         features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+         features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
 
       /* Integer formats only support nearest filtering */
       if (!util_format_is_scaled(pfmt) && !util_format_is_pure_integer(pfmt))
-         features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+         features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 
-      features |= VK_FORMAT_FEATURE_BLIT_SRC_BIT;
-      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+      features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
    }
 
    if (fmt.bind & PAN_BIND_RENDER_TARGET) {
-      features |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
-      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+      features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
 
       /* SNORM rendering isn't working yet (nir_lower_blend bugs), disable for
        * now.
@@ -1373,21 +1417,29 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
        * XXX: Enable once fixed.
        */
       if (!util_format_is_snorm(pfmt)) {
-         features |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
-         features |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+         features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+         features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
       }
    }
 
+   if (fmt.bind & PAN_BIND_STORAGE_IMAGE)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+
    if (pfmt == PIPE_FORMAT_R32_UINT || pfmt == PIPE_FORMAT_R32_SINT)
-      features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
 
    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
-      features |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+   if (vk_format_has_depth(format))
+      features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
 
    return features;
 }
 
-static VkFormatFeatureFlags
+static VkFormatFeatureFlags2
 get_image_format_features(struct panvk_physical_device *physical_device,
                           VkFormat format)
 {
@@ -1408,7 +1460,7 @@ get_image_format_features(struct panvk_physical_device *physical_device,
    /* For multi-plane, we get the feature flags of each plane separately,
     * then take their intersection as the overall format feature flags
     */
-   VkFormatFeatureFlags features = ~0u;
+   VkFormatFeatureFlags2 features = ~0ull;
    bool cosited_chroma = false;
    for (uint8_t plane = 0; plane < ycbcr_info->n_planes; plane++) {
       const struct vk_format_ycbcr_plane *plane_info =
@@ -1423,24 +1475,26 @@ get_image_format_features(struct panvk_physical_device *physical_device,
       return 0;
 
    /* Uh... We really should be able to sample from YCbCr */
-   assert(features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
-   assert(features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+   assert(features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
+   assert(features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
 
    /* Siting is handled in the YCbCr lowering pass. */
-   features |= VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT;
+   features |= VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT;
    if (cosited_chroma)
-      features |= VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
+      features |= VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT;
 
    /* These aren't allowed for YCbCr formats */
-   features &= ~(VK_FORMAT_FEATURE_BLIT_SRC_BIT |
-                 VK_FORMAT_FEATURE_BLIT_DST_BIT |
-                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
-                 VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+   features &= ~(VK_FORMAT_FEATURE_2_BLIT_SRC_BIT |
+                 VK_FORMAT_FEATURE_2_BLIT_DST_BIT |
+                 VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                 VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
 
    /* This is supported on all YCbCr formats */
    features |=
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
 
    if (ycbcr_info->n_planes > 1) {
       /* DISJOINT_BIT implies that each plane has its own separate binding,
@@ -1448,14 +1502,14 @@ get_image_format_features(struct panvk_physical_device *physical_device,
        * each have their own, separate filters, so these two bits make sense
        * for multi-planar formats only.
        */
-      features |= VK_FORMAT_FEATURE_DISJOINT_BIT |
-                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT;
+      features |= VK_FORMAT_FEATURE_2_DISJOINT_BIT |
+                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT;
    }
 
    return features;
 }
 
-static VkFormatFeatureFlags
+static VkFormatFeatureFlags2
 get_image_format_sample_counts(struct panvk_physical_device *physical_device,
                                VkFormat format)
 {
@@ -1469,11 +1523,11 @@ get_image_format_sample_counts(struct panvk_physical_device *physical_device,
    return get_sample_counts(arch, max_tib_size, max_cbuf_atts, format_size);
 }
 
-static VkFormatFeatureFlags
+static VkFormatFeatureFlags2
 get_buffer_format_features(struct panvk_physical_device *physical_device,
                            VkFormat format)
 {
-   VkFormatFeatureFlags features = 0;
+   VkFormatFeatureFlags2 features = 0;
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
    const struct panfrost_format fmt = physical_device->formats.all[pfmt];
 
@@ -1484,18 +1538,19 @@ get_buffer_format_features(struct panvk_physical_device *physical_device,
     * https://github.com/KhronosGroup/Vulkan-Docs/issues/2214).
     */
    if ((fmt.bind & PAN_BIND_VERTEX_BUFFER) && !util_format_is_srgb(pfmt))
-      features |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+      features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
 
    if ((fmt.bind & PAN_BIND_SAMPLER_VIEW) &&
        !util_format_is_depth_or_stencil(pfmt))
-      features |= VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
 
-   if ((fmt.bind & PAN_BIND_RENDER_TARGET) &&
-       !util_format_is_depth_and_stencil(pfmt))
-      features |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+   if (fmt.bind & PAN_BIND_STORAGE_IMAGE)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
 
    if (pfmt == PIPE_FORMAT_R32_UINT || pfmt == PIPE_FORMAT_R32_SINT)
-      features |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+      features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
 
    return features;
 }
@@ -1507,9 +1562,9 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 {
    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
 
-   VkFormatFeatureFlags tex =
+   VkFormatFeatureFlags2 tex =
       get_image_format_features(physical_device, format);
-   VkFormatFeatureFlags buffer =
+   VkFormatFeatureFlags2 buffer =
       get_buffer_format_features(physical_device, format);
 
    pFormatProperties->formatProperties = (VkFormatProperties){
@@ -1517,6 +1572,14 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       .optimalTilingFeatures = tex,
       .bufferFeatures = buffer,
    };
+
+   VkFormatProperties3 *formatProperties3 =
+      vk_find_struct(pFormatProperties->pNext, FORMAT_PROPERTIES_3);
+   if (formatProperties3) {
+      formatProperties3->linearTilingFeatures = tex;
+      formatProperties3->optimalTilingFeatures = tex;
+      formatProperties3->bufferFeatures = buffer;
+   }
 
    VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
       pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
@@ -1542,9 +1605,9 @@ static VkResult
 get_image_format_properties(struct panvk_physical_device *physical_device,
                             const VkPhysicalDeviceImageFormatInfo2 *info,
                             VkImageFormatProperties *pImageFormatProperties,
-                            VkFormatFeatureFlags *p_feature_flags)
+                            VkFormatFeatureFlags2 *p_feature_flags)
 {
-   VkFormatFeatureFlags format_feature_flags;
+   VkFormatFeatureFlags2 format_feature_flags;
    VkExtent3D maxExtent;
    uint32_t maxMipLevels;
    uint32_t maxArraySize;
@@ -1638,8 +1701,8 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    if (info->tiling == VK_IMAGE_TILING_OPTIMAL &&
        info->type == VK_IMAGE_TYPE_2D && ycbcr_info == NULL &&
        (format_feature_flags &
-        (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-         VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+        (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+         VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
        !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
        !(all_usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
       sampleCounts |=
@@ -1659,13 +1722,13 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    */
    if (!(info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) {
       if (all_usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
-         if (!(format_feature_flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+         if (!(format_feature_flags & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
             goto unsupported;
          }
       }
 
       if (all_usage & VK_IMAGE_USAGE_STORAGE_BIT) {
-         if (!(format_feature_flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+         if (!(format_feature_flags & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)) {
             goto unsupported;
          }
       }
@@ -1673,7 +1736,7 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       if (all_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT ||
           ((all_usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
            !vk_format_is_depth_or_stencil(info->format))) {
-         if (!(format_feature_flags & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+         if (!(format_feature_flags & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)) {
             goto unsupported;
          }
       }
@@ -1682,7 +1745,7 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
           ((all_usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
            vk_format_is_depth_or_stencil(info->format))) {
          if (!(format_feature_flags &
-               VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+               VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) {
             goto unsupported;
          }
       }
@@ -1787,7 +1850,7 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageViewImageFormatInfoEXT *image_view_info = NULL;
    VkExternalImageFormatProperties *external_props = NULL;
    VkFilterCubicImageViewImageFormatPropertiesEXT *cubic_props = NULL;
-   VkFormatFeatureFlags format_feature_flags;
+   VkFormatFeatureFlags2 format_feature_flags;
    VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = NULL;
    VkResult result;
 
@@ -1861,7 +1924,7 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
       if ((image_view_info->imageViewType == VK_IMAGE_VIEW_TYPE_2D ||
            image_view_info->imageViewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY) &&
           (format_feature_flags &
-           VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT)) {
+           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT)) {
          cubic_props->filterCubic = true;
          cubic_props->filterCubicMinmax = true;
       } else {
@@ -1881,7 +1944,7 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
     *
     *    "If format is a multi-planar format, and if imageCreateFormatFeatures
     *    (as defined in Image Creation Limits) does not contain
-    *    VK_FORMAT_FEATURE_DISJOINT_BIT, then flags must not contain
+    *    VK_FORMAT_FEATURE_2_DISJOINT_BIT, then flags must not contain
     *    VK_IMAGE_CREATE_DISJOINT_BIT"
     *
     * This is satisfied trivially because we support DISJOINT on all

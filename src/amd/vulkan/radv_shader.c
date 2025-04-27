@@ -519,9 +519,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       /* Lower shared variables early to prevent the over allocation of shared memory in
        * radv_nir_lower_ray_queries.  */
       if (nir->info.stage == MESA_SHADER_COMPUTE) {
-         if (!nir->info.shared_memory_explicit_layout)
-            NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, shared_var_info);
-
+         NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, shared_var_info);
          NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
       }
 
@@ -626,10 +624,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH)
          var_modes |= nir_var_mem_task_payload;
 
-      if (!nir->info.shared_memory_explicit_layout)
-         NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes, shared_var_info);
-      else if (var_modes & ~nir_var_mem_shared)
-         NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes & ~nir_var_mem_shared, shared_var_info);
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes, shared_var_info);
       NIR_PASS(_, nir, nir_lower_explicit_io, var_modes, nir_address_format_32bit_offset);
 
       if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
@@ -2296,9 +2291,11 @@ radv_shader_combine_cfg_vs_tcs(const struct radv_shader *vs, const struct radv_s
 }
 
 void
-radv_shader_combine_cfg_vs_gs(const struct radv_shader *vs, const struct radv_shader *gs, uint32_t *rsrc1_out,
-                              uint32_t *rsrc2_out)
+radv_shader_combine_cfg_vs_gs(const struct radv_device *device, const struct radv_shader *vs,
+                              const struct radv_shader *gs, uint32_t *rsrc1_out, uint32_t *rsrc2_out)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
    assert(G_00B12C_USER_SGPR(vs->config.rsrc2) == G_00B12C_USER_SGPR(gs->config.rsrc2));
 
    if (rsrc1_out) {
@@ -2316,22 +2313,30 @@ radv_shader_combine_cfg_vs_gs(const struct radv_shader *vs, const struct radv_sh
 
    if (rsrc2_out) {
       uint32_t rsrc2 = vs->config.rsrc2;
+      uint32_t lds_size;
 
       if (G_00B22C_ES_VGPR_COMP_CNT(gs->config.rsrc2) > G_00B22C_ES_VGPR_COMP_CNT(rsrc2))
          rsrc2 = (rsrc2 & C_00B22C_ES_VGPR_COMP_CNT) | (gs->config.rsrc2 & ~C_00B22C_ES_VGPR_COMP_CNT);
 
       rsrc2 |= gs->config.rsrc2 & ~(C_00B12C_SCRATCH_EN & C_00B12C_SO_EN & C_00B12C_SO_BASE0_EN & C_00B12C_SO_BASE1_EN &
                                     C_00B12C_SO_BASE2_EN & C_00B12C_SO_BASE3_EN);
+      if (gs->info.is_ngg) {
+         lds_size = DIV_ROUND_UP(gs->info.ngg_info.lds_size, pdev->info.lds_encode_granularity);
+      } else {
+         lds_size = gs->info.gs_ring_info.lds_size;
+      }
+
+      rsrc2 |= S_00B22C_LDS_SIZE(lds_size);
 
       *rsrc2_out = rsrc2;
    }
 }
 
 void
-radv_shader_combine_cfg_tes_gs(const struct radv_shader *tes, const struct radv_shader *gs, uint32_t *rsrc1_out,
-                               uint32_t *rsrc2_out)
+radv_shader_combine_cfg_tes_gs(const struct radv_device *device, const struct radv_shader *tes,
+                               const struct radv_shader *gs, uint32_t *rsrc1_out, uint32_t *rsrc2_out)
 {
-   radv_shader_combine_cfg_vs_gs(tes, gs, rsrc1_out, rsrc2_out);
+   radv_shader_combine_cfg_vs_gs(device, tes, gs, rsrc1_out, rsrc2_out);
 
    if (rsrc2_out) {
       *rsrc2_out |= S_00B22C_OC_LDS_EN(1);
@@ -3599,9 +3604,11 @@ radv_get_tess_wg_info(const struct radv_physical_device *pdev, const struct shad
 {
    const uint32_t lds_input_vertex_size = get_tcs_input_vertex_stride(tcs_num_lds_inputs);
 
-   ac_nir_compute_tess_wg_info(&pdev->info, tcs_info, pdev->ge_wave_size, false, all_invocations_define_tess_levels,
-                               tcs_num_input_vertices, lds_input_vertex_size, tcs_num_vram_outputs,
-                               tcs_num_vram_patch_outputs, num_patches_per_wg, hw_lds_size);
+   ac_nir_compute_tess_wg_info(&pdev->info, tcs_info->outputs_read, tcs_info->outputs_written,
+                               tcs_info->patch_outputs_read, tcs_info->patch_outputs_written,
+                               tcs_info->tess.tcs_vertices_out, pdev->ge_wave_size, false,
+                               all_invocations_define_tess_levels, tcs_num_input_vertices, lds_input_vertex_size,
+                               tcs_num_vram_outputs, tcs_num_vram_patch_outputs, num_patches_per_wg, hw_lds_size);
 }
 
 VkResult

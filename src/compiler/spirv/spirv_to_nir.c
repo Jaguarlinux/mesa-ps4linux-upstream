@@ -3382,11 +3382,13 @@ vtn_handle_texture(struct vtn_builder *b, SpvOp opcode,
    case nir_texop_tex_prefetch:
       vtn_fail("unexpected nir_texop_tex_prefetch");
       break;
+   case nir_texop_lod_bias:
+      vtn_fail("unexpected nir_texop_lod_bias");
+      break;
    case nir_texop_descriptor_amd:
    case nir_texop_sampler_descriptor_amd:
       vtn_fail("unexpected nir_texop_*descriptor_amd");
       break;
-   case nir_texop_lod_bias_agx:
    case nir_texop_image_min_lod_agx:
    case nir_texop_custom_border_color_agx:
    case nir_texop_has_custom_border_color_agx:
@@ -7186,26 +7188,6 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
     * validator a bit of heartburn.  Run dead code to get rid of them.
     */
    nir_opt_dce(b->shader);
-
-   /* Per SPV_KHR_workgroup_storage_explicit_layout, if one shared variable is
-    * a Block, all of them will be and Blocks are explicitly laid out.
-    */
-   nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_shared) {
-      if (glsl_type_is_interface(var->type)) {
-         assert(b->supported_capabilities.WorkgroupMemoryExplicitLayoutKHR);
-         b->shader->info.shared_memory_explicit_layout = true;
-         break;
-      }
-   }
-   if (b->shader->info.shared_memory_explicit_layout) {
-      unsigned size = 0;
-      nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_shared) {
-         assert(glsl_type_is_interface(var->type));
-         const bool align_to_stride = false;
-         size = MAX2(size, glsl_get_explicit_size(var->type, align_to_stride));
-      }
-      b->shader->info.shared_size = size;
-   }
 
    if (stage == MESA_SHADER_FRAGMENT) {
       /* From the Vulkan 1.2.199 spec:

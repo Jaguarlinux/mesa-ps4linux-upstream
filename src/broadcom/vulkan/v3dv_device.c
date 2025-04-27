@@ -258,7 +258,7 @@ get_features(const struct v3dv_physical_device *physical_device,
       .geometryShader = true,
       .tessellationShader = false,
       .sampleRateShading = true,
-      .dualSrcBlend = false,
+      .dualSrcBlend = true,
       .logicOp = true,
       .multiDrawIndirect = false,
       .drawIndirectFirstInstance = true,
@@ -967,7 +967,7 @@ get_device_properties(const struct v3dv_physical_device *device,
       /* Fragment limits */
       .maxFragmentInputComponents               = max_varying_components,
       .maxFragmentOutputAttachments             = 4,
-      .maxFragmentDualSrcAttachments            = 0,
+      .maxFragmentDualSrcAttachments            = 1,
       .maxFragmentCombinedOutputResources       = max_rts +
                                                   MAX_STORAGE_BUFFERS +
                                                   MAX_STORAGE_IMAGES,
@@ -2208,9 +2208,13 @@ v3dv_AllocateMemory(VkDevice _device,
    assert(pAllocateInfo->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
 
    /* We always allocate device memory in multiples of a page, so round up
-    * requested size to that.
+    * requested size to that. We need to add a V3D_TFU_READHAEAD padding to
+    * avoid invalid reads done by the TFU unit after the end of the last page
+    * allocated.
     */
-   const VkDeviceSize alloc_size = align64(pAllocateInfo->allocationSize, 4096);
+
+   const VkDeviceSize alloc_size = align64(pAllocateInfo->allocationSize +
+                                           V3D_TFU_READAHEAD_SIZE, 4096);
 
    if (unlikely(alloc_size > MAX_MEMORY_ALLOCATION_SIZE))
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);

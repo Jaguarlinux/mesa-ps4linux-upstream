@@ -38,6 +38,7 @@
 #include "util/u_screen.h"
 #include "util/u_video.h"
 #include "util/xmlconfig.h"
+#include "util/perf/cpu_trace.h"
 
 #include <fcntl.h>
 
@@ -363,7 +364,7 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       caps->max_tex_indirections = 16384; /* arbitrary */
       caps->max_control_flow_depth = 1024; /* arbitrary */
       /* Used as ABI on Midgard */
-      caps->max_inputs = 16;
+      caps->max_inputs = dev->arch >= 9 ? 32 : 16;
       caps->max_outputs = i == PIPE_SHADER_FRAGMENT ? 8 : PIPE_MAX_ATTRIBS;
       caps->max_temps = 256; /* arbitrary */
       caps->max_const_buffer0_size = 16 * 1024 * sizeof(float);
@@ -400,8 +401,6 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
       (struct pipe_compute_caps *)&screen->base.compute_caps;
 
    caps->address_bits = 64;
-
-   snprintf(caps->ir_target, sizeof(caps->ir_target), "panfrost");
 
    caps->grid_dimension = 3;
 
@@ -496,6 +495,10 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    /* Removed in v9 (Valhall) */
    caps->depth_clip_disable_separate = dev->arch < 9;
+
+   /* On v13+, point size cannot be set in the command stream anymore. */
+   caps->point_size_fixed = dev->arch >= 13 ? PIPE_POINT_SIZE_LOWER_USER_ONLY
+                                            : PIPE_POINT_SIZE_LOWER_NEVER;
 
    caps->max_render_targets =
    caps->fbfetch = has_mrt ? 8 : 1;
@@ -635,7 +638,7 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->shader_buffer_offset_alignment = 4;
 
-   caps->max_varyings = dev->arch >= 9 ? 16 : 32;
+   caps->max_varyings = 32;
 
    /* Removed in v6 (Bifrost) */
    caps->gl_clamp =
@@ -819,6 +822,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    screen->max_afbc_packing_ratio = debug_get_num_option(
       "PAN_MAX_AFBC_PACKING_RATIO", DEFAULT_MAX_AFBC_PACKING_RATIO);
 
+   util_cpu_trace_init();
+
    if (panfrost_open_device(screen, fd, dev)) {
       ralloc_free(screen);
       return NULL;
@@ -935,6 +940,12 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       break;
    case 10:
       panfrost_cmdstream_screen_init_v10(screen);
+      break;
+   case 12:
+      panfrost_cmdstream_screen_init_v12(screen);
+      break;
+   case 13:
+      panfrost_cmdstream_screen_init_v13(screen);
       break;
    default:
       debug_printf("panfrost: Unhandled architecture major %d", dev->arch);

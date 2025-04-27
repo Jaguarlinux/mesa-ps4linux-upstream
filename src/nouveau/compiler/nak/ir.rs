@@ -609,18 +609,6 @@ pub struct RegRef {
 impl RegRef {
     pub const MAX_IDX: u32 = (1 << 26) - 1;
 
-    fn zero_idx(file: RegFile) -> u32 {
-        match file {
-            RegFile::GPR => 255,
-            RegFile::UGPR => 63,
-            RegFile::Pred => 7,
-            RegFile::UPred => 7,
-            RegFile::Carry => panic!("Carry has no zero index"),
-            RegFile::Bar => panic!("Bar has no zero index"),
-            RegFile::Mem => panic!("Mem has no zero index"),
-        }
-    }
-
     pub fn new(file: RegFile, base_idx: u32, comps: u8) -> RegRef {
         assert!(base_idx <= Self::MAX_IDX);
         let mut packed = base_idx;
@@ -629,10 +617,6 @@ impl RegRef {
         assert!(u8::from(file) < 8);
         packed |= u32::from(u8::from(file)) << 29;
         RegRef { packed: packed }
-    }
-
-    pub fn zero(file: RegFile, comps: u8) -> RegRef {
-        RegRef::new(file, RegRef::zero_idx(file), comps)
     }
 
     pub fn base_idx(&self) -> u32 {
@@ -1325,6 +1309,7 @@ impl Src {
 
     pub fn is_fneg_zero(&self, src_type: SrcType) -> bool {
         match self.fold_imm(src_type).src_ref {
+            SrcRef::Zero => self.src_mod == SrcMod::FNeg,
             SrcRef::Imm32(0x00008000) => src_type == SrcType::F16,
             SrcRef::Imm32(0x80000000) => src_type == SrcType::F32,
             SrcRef::Imm32(0x80008000) => src_type == SrcType::F16v2,
@@ -1813,8 +1798,11 @@ impl fmt::Display for FloatCmpOp {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum IntCmpOp {
+    False,
+    True,
     Eq,
     Ne,
     Lt,
@@ -1826,6 +1814,7 @@ pub enum IntCmpOp {
 impl IntCmpOp {
     pub fn flip(self) -> IntCmpOp {
         match self {
+            IntCmpOp::False | IntCmpOp::True => self,
             IntCmpOp::Eq | IntCmpOp::Ne => self,
             IntCmpOp::Lt => IntCmpOp::Gt,
             IntCmpOp::Le => IntCmpOp::Ge,
@@ -1838,6 +1827,8 @@ impl IntCmpOp {
 impl fmt::Display for IntCmpOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            IntCmpOp::False => write!(f, ".f"),
+            IntCmpOp::True => write!(f, ".t"),
             IntCmpOp::Eq => write!(f, ".eq"),
             IntCmpOp::Ne => write!(f, ".ne"),
             IntCmpOp::Lt => write!(f, ".lt"),
@@ -2111,6 +2102,18 @@ pub enum TexLodMode {
     Lod,
     Clamp,
     BiasClamp,
+}
+
+impl TexLodMode {
+    pub fn is_explicit_lod(&self) -> bool {
+        match self {
+            TexLodMode::Auto
+            | TexLodMode::Bias
+            | TexLodMode::Clamp
+            | TexLodMode::BiasClamp => false,
+            TexLodMode::Zero | TexLodMode::Lod => true,
+        }
+    }
 }
 
 impl fmt::Display for TexLodMode {
@@ -2532,6 +2535,15 @@ impl AtomType {
             AtomType::U64 | AtomType::I64 | AtomType::F64 => 64,
         }
     }
+
+    pub fn is_float(&self) -> bool {
+        match self {
+            AtomType::F16x2 | AtomType::F32 | AtomType::F64 => true,
+            AtomType::U32 | AtomType::I32 | AtomType::U64 | AtomType::I64 => {
+                false
+            }
+        }
+    }
 }
 
 impl fmt::Display for AtomType {
@@ -2877,6 +2889,80 @@ impl DisplayOp for OpFSwzAdd {
     }
 }
 impl_display_for_op!(OpFSwzAdd);
+
+/// Describes where the second src is taken before doing the ops
+#[allow(dead_code)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FSwzShuffle {
+    Quad0,
+    Quad1,
+    Quad2,
+    Quad3,
+    // swap [0, 1] and [2, 3]
+    SwapHorizontal,
+    // swap [0, 2] and [1, 3]
+    SwapVertical,
+}
+
+impl fmt::Display for FSwzShuffle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FSwzShuffle::Quad0 => write!(f, ".0000"),
+            FSwzShuffle::Quad1 => write!(f, ".1111"),
+            FSwzShuffle::Quad2 => write!(f, ".2222"),
+            FSwzShuffle::Quad3 => write!(f, ".3333"),
+            FSwzShuffle::SwapHorizontal => write!(f, ".1032"),
+            FSwzShuffle::SwapVertical => write!(f, ".2301"),
+        }
+    }
+}
+
+/// Op only present in Kepler and older
+/// It first does a shuffle on the second src and then applies
+/// src0 op src1, each thread on a quad might do a different operation.
+///
+/// This is used to encode ddx/ddy
+/// ex: ddx
+///   src1 = shuffle swap horizontal src1
+///   ops = [sub, subr, sub, subr]
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpFSwz {
+    #[dst_type(F32)]
+    pub dst: Dst,
+
+    #[src_type(GPR)]
+    pub srcs: [Src; 2],
+
+    pub rnd_mode: FRndMode,
+    pub ftz: bool,
+    pub shuffle: FSwzShuffle,
+
+    pub ops: [FSwzAddOp; 4],
+}
+
+impl DisplayOp for OpFSwz {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fswz{}", self.shuffle)?;
+        if self.rnd_mode != FRndMode::NearestEven {
+            write!(f, "{}", self.rnd_mode)?;
+        }
+        if self.ftz {
+            write!(f, ".ftz")?;
+        }
+        write!(
+            f,
+            " {} {} [{}, {}, {}, {}]",
+            self.srcs[0],
+            self.srcs[1],
+            self.ops[0],
+            self.ops[1],
+            self.ops[2],
+            self.ops[3],
+        )
+    }
+}
+impl_display_for_op!(OpFSwz);
 
 pub enum RroOp {
     SinCos,
@@ -3769,6 +3855,8 @@ impl Foldable for OpISetP {
             let x = x as i32;
             let y = y as i32;
             match &self.cmp_op {
+                IntCmpOp::False => false,
+                IntCmpOp::True => true,
                 IntCmpOp::Eq => x == y,
                 IntCmpOp::Ne => x != y,
                 IntCmpOp::Lt => x < y,
@@ -3778,6 +3866,8 @@ impl Foldable for OpISetP {
             }
         } else {
             match &self.cmp_op {
+                IntCmpOp::False => false,
+                IntCmpOp::True => true,
                 IntCmpOp::Eq => x == y,
                 IntCmpOp::Ne => x != y,
                 IntCmpOp::Lt => x < y,
@@ -3787,7 +3877,9 @@ impl Foldable for OpISetP {
             }
         };
 
-        let cmp = if self.ex && x == y {
+        let cmp_op_is_const =
+            matches!(self.cmp_op, IntCmpOp::False | IntCmpOp::True);
+        let cmp = if self.ex && x == y && !cmp_op_is_const {
             // Pre-Volta, isetp.x takes the accumulator into account.  If we
             // want to support this, we need to take an an accumulator into
             // account.  Disallow it for now.
@@ -5819,6 +5911,25 @@ impl DisplayOp for OpBar {
 }
 impl_display_for_op!(OpBar);
 
+/// Instruction only used on Kepler(A|B).
+/// Kepler has explicit dependency tracking for texture loads.
+/// When a texture load is executed, it is put on some kind of FIFO queue
+/// for later execution.
+/// Before the results of a texture are used we need to wait on the queue,
+/// texdepbar waits until the queue has at most `textures_left` elements.
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTexDepBar {
+    pub textures_left: i8,
+}
+
+impl DisplayOp for OpTexDepBar {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "texdepbar {}", self.textures_left)
+    }
+}
+impl_display_for_op!(OpTexDepBar);
+
 #[repr(C)]
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpCS2R {
@@ -6456,6 +6567,7 @@ pub enum Op {
     FSet(OpFSet),
     FSetP(OpFSetP),
     FSwzAdd(OpFSwzAdd),
+    FSwz(OpFSwz),
     DAdd(OpDAdd),
     DFma(OpDFma),
     DMnMx(OpDMnMx),
@@ -6538,6 +6650,7 @@ pub enum Op {
     Exit(OpExit),
     WarpSync(OpWarpSync),
     Bar(OpBar),
+    TexDepBar(OpTexDepBar),
     CS2R(OpCS2R),
     Isberd(OpIsberd),
     Kill(OpKill),
@@ -6573,6 +6686,24 @@ impl Op {
         }
     }
 
+    pub fn is_fp64(&self) -> bool {
+        match self {
+            Op::MuFu(op) => matches!(op.op, MuFuOp::Rcp64H | MuFuOp::Rsq64H),
+            Op::DAdd(_)
+            | Op::DFma(_)
+            | Op::DMnMx(_)
+            | Op::DMul(_)
+            | Op::DSetP(_) => true,
+            Op::F2F(op) => op.src_type.bits() == 64 || op.dst_type.bits() == 64,
+            Op::F2I(op) => op.src_type.bits() == 64 || op.dst_type.bits() == 64,
+            Op::I2F(op) => op.src_type.bits() == 64 || op.dst_type.bits() == 64,
+            Op::FRnd(op) => {
+                op.src_type.bits() == 64 || op.dst_type.bits() == 64
+            }
+            _ => false,
+        }
+    }
+
     pub fn has_fixed_latency(&self, sm: u8) -> bool {
         match self {
             // Float ALU
@@ -6589,6 +6720,7 @@ impl Op {
             | Op::HSet2(_)
             | Op::HSetP2(_)
             | Op::HMnMx2(_)
+            | Op::FSwz(_)
             | Op::FSwzAdd(_) => true,
 
             // Multi-function unit is variable latency
@@ -6687,6 +6819,7 @@ impl Op {
 
             // Miscellaneous ops
             Op::Bar(_)
+            | Op::TexDepBar(_)
             | Op::CS2R(_)
             | Op::Isberd(_)
             | Op::Kill(_)
@@ -7077,6 +7210,7 @@ impl Instr {
             | Op::Exit(_)
             | Op::WarpSync(_)
             | Op::Bar(_)
+            | Op::TexDepBar(_)
             | Op::RegOut(_)
             | Op::Out(_)
             | Op::OutFinal(_)
@@ -7769,6 +7903,7 @@ impl Shader<'_> {
         let mut num_instrs = 0;
         let mut uses_global_mem = false;
         let mut writes_global_mem = false;
+        let mut uses_fp64 = false;
 
         self.for_each_instr(&mut |instr| {
             num_instrs += 1;
@@ -7780,11 +7915,16 @@ impl Shader<'_> {
             if !writes_global_mem {
                 writes_global_mem = instr.writes_global_mem();
             }
+
+            if !uses_fp64 {
+                uses_fp64 = instr.op.is_fp64();
+            }
         });
 
         self.info.num_instrs = num_instrs;
         self.info.uses_global_mem = uses_global_mem;
         self.info.writes_global_mem = writes_global_mem;
+        self.info.uses_fp64 = uses_fp64;
 
         self.info.max_warps_per_sm = max_warps_per_sm(
             self.info.num_gprs as u32 + self.sm.hw_reserved_gprs(),

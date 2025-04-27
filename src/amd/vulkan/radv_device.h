@@ -100,8 +100,10 @@ struct radv_meta_state {
       VkPipeline update_pipeline;
       VkPipelineLayout copy_p_layout;
       VkPipeline copy_pipeline;
+      VkPipeline copy_blas_addrs_gfx12_pipeline;
 
       struct radix_sort_vk *radix_sort;
+      struct vk_acceleration_structure_build_ops build_ops;
       struct vk_acceleration_structure_build_args build_args;
 
       struct {
@@ -357,8 +359,6 @@ unsigned radv_get_default_max_sample_dist(int log_samples);
 
 void radv_emit_default_sample_locations(const struct radv_physical_device *pdev, struct radeon_cmdbuf *cs,
                                         int nr_samples);
-
-unsigned radv_get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image *image);
 
 struct radv_color_buffer_info {
    struct ac_cb_surface ac;

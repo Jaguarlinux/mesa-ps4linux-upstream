@@ -26,6 +26,8 @@ mod opt_uniform_instrs;
 mod qmd;
 mod reg_tracker;
 mod repair_ssa;
+mod sm20;
+mod sm32;
 mod sm50;
 mod sm70;
 mod sm70_encode;
@@ -41,3 +43,6 @@ mod hw_tests;
 
 #[cfg(test)]
 mod hw_runner;
+
+#[cfg(test)]
+mod nvdisasm_tests;
