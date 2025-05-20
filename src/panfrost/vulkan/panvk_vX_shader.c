@@ -116,9 +116,20 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       assert(b->shader->info.stage == MESA_SHADER_FRAGMENT);
       val = load_sysval(b, graphics, bit_size, layer_id);
       break;
+   case nir_intrinsic_load_view_index:
+      assert(b->shader->info.stage != MESA_SHADER_COMPUTE);
+      if (ctx->state->rp->view_mask == 0)
+         val = nir_imm_zero(b, 1, 32);
+      else
+         val = load_sysval(b, graphics, bit_size, layer_id);
+      break;
 #endif
 
    case nir_intrinsic_load_draw_id:
+      /* Multidraw is supported on v10. */
+      if (PAN_ARCH >= 10)
+         return false;
+
       /* TODO: We only implement single-draw direct and indirect draws, so this
        * is sufficient. We'll revisit this when we get around to implementing
        * multidraw. */
@@ -336,7 +347,8 @@ panvk_get_nir_options(UNUSED struct vk_physical_device *vk_pdev,
                       UNUSED gl_shader_stage stage,
                       UNUSED const struct vk_pipeline_robustness_state *rs)
 {
-   return GENX(pan_shader_get_compiler_options)();
+   struct panvk_physical_device *phys_dev = to_panvk_physical_device(vk_pdev);
+   return pan_shader_get_compiler_options(pan_arch(phys_dev->kmod.props.gpu_prod_id));
 }
 
 static struct spirv_to_nir_options
@@ -880,7 +892,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
 
    struct util_dynarray binary;
    util_dynarray_init(&binary, NULL);
-   GENX(pan_shader_compile)(nir, compile_input, &binary, &shader->info);
+   pan_shader_compile(nir, compile_input, &binary, &shader->info);
 
    void *bin_ptr = util_dynarray_element(&binary, uint8_t, 0);
    unsigned bin_size = util_dynarray_num_elements(&binary, uint8_t);
@@ -1985,7 +1997,7 @@ panvk_per_arch(create_internal_shader)(
    struct util_dynarray binary;
 
    util_dynarray_init(&binary, nir);
-   GENX(pan_shader_compile)(nir, compiler_inputs, &binary, &shader->info);
+   pan_shader_compile(nir, compiler_inputs, &binary, &shader->info);
 
    unsigned bin_size = util_dynarray_num_elements(&binary, uint8_t);
    if (bin_size) {

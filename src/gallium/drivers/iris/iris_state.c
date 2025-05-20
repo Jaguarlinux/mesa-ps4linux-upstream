@@ -4678,30 +4678,39 @@ iris_create_so_decl_list(const struct pipe_stream_output_info *info,
 }
 
 static inline int
-iris_compute_first_urb_slot_required(uint64_t inputs_read,
+iris_compute_first_urb_slot_required(struct iris_compiled_shader *fs_shader,
                                      const struct intel_vue_map *prev_stage_vue_map)
 {
 #if GFX_VER >= 9
-   return brw_compute_first_urb_slot_required(inputs_read, prev_stage_vue_map);
+   uint32_t read_offset, read_length, num_varyings, primid_offset;
+   brw_compute_sbe_per_vertex_urb_read(prev_stage_vue_map,
+                                       false /* mesh*/,
+                                       brw_wm_prog_data(fs_shader->brw_prog_data),
+                                       &read_offset, &read_length, &num_varyings,
+                                       &primid_offset);
+   return 2 * read_offset;
 #else
-   return elk_compute_first_urb_slot_required(inputs_read, prev_stage_vue_map);
+   const struct iris_fs_data *fs_data = iris_fs_data(fs_shader);
+   return elk_compute_first_urb_slot_required(fs_data->inputs, prev_stage_vue_map);
 #endif
 }
 
 static void
-iris_compute_sbe_urb_read_interval(uint64_t fs_input_slots,
+iris_compute_sbe_urb_read_interval(struct iris_compiled_shader *fs_shader,
                                    const struct intel_vue_map *last_vue_map,
                                    bool two_sided_color,
                                    unsigned *out_offset,
                                    unsigned *out_length)
 {
+   const struct iris_fs_data *fs_data = iris_fs_data(fs_shader);
+
    /* The compiler computes the first URB slot without considering COL/BFC
     * swizzling (because it doesn't know whether it's enabled), so we need
     * to do that here too.  This may result in a smaller offset, which
     * should be safe.
     */
    const unsigned first_slot =
-      iris_compute_first_urb_slot_required(fs_input_slots, last_vue_map);
+      iris_compute_first_urb_slot_required(fs_shader, last_vue_map);
 
    /* This becomes the URB read offset (counted in pairs of slots). */
    assert(first_slot % 2 == 0);
@@ -4710,6 +4719,7 @@ iris_compute_sbe_urb_read_interval(uint64_t fs_input_slots,
    /* We need to adjust the inputs read to account for front/back color
     * swizzling, as it can make the URB length longer.
     */
+   uint64_t fs_input_slots = fs_data->inputs;
    for (int c = 0; c <= 1; c++) {
       if (fs_input_slots & (VARYING_BIT_COL0 << c)) {
          /* If two sided color is enabled, the fragment shader's gl_Color
@@ -4898,7 +4908,7 @@ iris_emit_sbe(struct iris_batch *batch, const struct iris_context *ice)
       &iris_vue_data(ice->shaders.last_vue_shader)->vue_map;
 
    unsigned urb_read_offset, urb_read_length;
-   iris_compute_sbe_urb_read_interval(fs_data->inputs,
+   iris_compute_sbe_urb_read_interval(ice->shaders.prog[MESA_SHADER_FRAGMENT],
                                       last_vue_map,
                                       cso_rast->light_twoside,
                                       &urb_read_offset, &urb_read_length);
@@ -7190,7 +7200,7 @@ iris_upload_dirty_render_state(struct iris_context *ice,
     * Testing shows that all the 3DSTATE_CONSTANT_XS need to be emitted if
     * any stage has a dirty binding table.
     */
-   const bool emit_const_wa = GFX_VER >= 11 &&
+   const bool emit_const_wa = INTEL_NEEDS_WA_1604061319 &&
       ((dirty & IRIS_DIRTY_RENDER_BUFFER) ||
        (stage_dirty & IRIS_ALL_STAGE_DIRTY_BINDINGS_FOR_RENDER));
 
@@ -9107,14 +9117,16 @@ iris_upload_compute_walker(struct iris_context *ice,
       }
    }
 
+   uint32_t total_shared = shader->total_shared + grid->variable_shared_mem;
    struct GENX(INTERFACE_DESCRIPTOR_DATA) idd = {};
-   idd.KernelStartPointer = KSP(shader);
+   idd.KernelStartPointer =
+      KSP(shader) + iris_cs_data_prog_offset(cs_data, dispatch.simd_size);
    idd.NumberofThreadsinGPGPUThreadGroup = dispatch.threads;
    idd.SharedLocalMemorySize =
-      intel_compute_slm_encode_size(GFX_VER, shader->total_shared);
+      intel_compute_slm_encode_size(GFX_VER, total_shared);
    idd.PreferredSLMAllocationSize =
       intel_compute_preferred_slm_calc_encode_size(devinfo,
-                                                   shader->total_shared,
+                                                   total_shared,
                                                    dispatch.group_size,
                                                    dispatch.simd_size);
    idd.SamplerStatePointer = shs->sampler_table.offset;
@@ -9263,15 +9275,6 @@ iris_upload_gpgpu_walker(struct iris_context *ice,
       }
    }
 
-   for (unsigned i = 0; i < IRIS_MAX_GLOBAL_BINDINGS; i++) {
-      struct pipe_resource *res = ice->state.global_bindings[i];
-      if (!res)
-         break;
-
-      iris_use_pinned_bo(batch, iris_resource_bo(res),
-                         true, IRIS_DOMAIN_NONE);
-   }
-
    if (stage_dirty & (IRIS_STAGE_DIRTY_SAMPLER_STATES_CS |
                       IRIS_STAGE_DIRTY_BINDINGS_CS |
                       IRIS_STAGE_DIRTY_CONSTANTS_CS |
@@ -9327,6 +9330,20 @@ iris_upload_gpgpu_walker(struct iris_context *ice,
 #endif /* #if GFX_VERx10 >= 125 */
 
 static void
+iris_use_global_bindings(struct iris_context *ice,
+                         struct iris_batch *batch)
+{
+   for (unsigned i = 0; i < IRIS_MAX_GLOBAL_BINDINGS; i++) {
+      struct pipe_resource *res = ice->state.global_bindings[i];
+      if (!res)
+         break;
+
+      iris_use_pinned_bo(batch, iris_resource_bo(res),
+                        true, IRIS_DOMAIN_NONE);
+   }
+}
+
+static void
 iris_upload_compute_state(struct iris_context *ice,
                           struct iris_batch *batch,
                           const struct pipe_grid_info *grid)
@@ -9366,6 +9383,8 @@ iris_upload_compute_state(struct iris_context *ice,
    if (ice->state.need_border_colors)
       iris_use_pinned_bo(batch, border_color_pool->bo, false,
                          IRIS_DOMAIN_NONE);
+
+   iris_use_global_bindings(ice, batch);
 
 #if GFX_VER >= 12
    genX(invalidate_aux_map_state)(batch);

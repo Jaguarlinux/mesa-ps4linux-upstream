@@ -8,7 +8,7 @@
       when: on_success
 
 .venus-manual-rules:
-  stage: layered-backends-postmerge
+  stage: layered-backends-nightly
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -20,6 +20,7 @@
 .venus-lavapipe-test:
   extends:
     - .test-vk
+    - .test-crosvm
     - .venus-rules
   timeout: 15m
   variables:

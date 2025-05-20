@@ -95,10 +95,9 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    if (shader->info.tls_size) {
       cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
       cs_load64_to(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
-      cs_wait_slot(b, SB_ID(LS), false);
       cs_move64_to(b, cs_scratch_reg64(b, 0), tsd);
       cs_store64(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
-      cs_wait_slot(b, SB_ID(LS), false);
+      cs_flush_stores(b);
    }
 
    cs_update_compute_ctx(b) {
@@ -140,15 +139,13 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
 
    panvk_per_arch(cs_pick_iter_sb)(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
 
-   cs_req_res(b, CS_COMPUTE_RES);
    unsigned task_axis = MALI_TASK_AXIS_X;
    unsigned task_increment = 0;
    panvk_per_arch(calculate_task_axis_and_increment)(
       shader, phys_dev, &task_axis, &task_increment);
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
-                        task_increment, task_axis, false,
+                        task_increment, task_axis,
                         cs_shader_res_sel(0, 0, 0, 0));
-   cs_req_res(b, 0);
 
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
@@ -158,7 +155,6 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    cs_load_to(b, cs_scratch_reg_tuple(b, 0, 3), cs_subqueue_ctx_reg(b),
               BITFIELD_MASK(3),
               offsetof(struct panvk_cs_subqueue_context, syncobjs));
-   cs_wait_slot(b, SB_ID(LS), false);
 
    cs_add64(b, sync_addr, sync_addr,
             PANVK_SUBQUEUE_COMPUTE * sizeof(struct panvk_cs_sync64));
@@ -182,7 +178,7 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
 
    cs_store32(b, iter_sb, cs_subqueue_ctx_reg(b),
               offsetof(struct panvk_cs_subqueue_context, iter_sb));
-   cs_wait_slot(b, SB_ID(LS), false);
+   cs_flush_stores(b);
 
    ++cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].relative_sync_point;
 

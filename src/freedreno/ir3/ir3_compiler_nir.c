@@ -5770,24 +5770,7 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    ir3_debug_print(ir, "AFTER: ir3_sched");
 
-   /* Pre-assign VS inputs on a6xx+ binning pass shader, to align
-    * with draw pass VS, so binning and draw pass can both use the
-    * same VBO state.
-    *
-    * Note that VS inputs are expected to be full precision.
-    */
-   bool pre_assign_inputs = (ir->compiler->gen >= 6) &&
-                            (ir->type == MESA_SHADER_VERTEX) &&
-                            so->binning_pass;
-
-   if (pre_assign_inputs) {
-      foreach_input (in, ir) {
-         assert(in->opc == OPC_META_INPUT);
-         unsigned inidx = in->input.inidx;
-
-         in->dsts[0]->num = so->nonbinning->inputs[inidx].regid;
-      }
-   } else if (ctx->tcs_header) {
+   if (ctx->tcs_header) {
       /* We need to have these values in the same registers between VS and TCS
        * since the VS chains to TCS and doesn't get the sysvals redelivered.
        */
@@ -5869,20 +5852,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    foreach_input (in, ir) {
       assert(in->opc == OPC_META_INPUT);
       unsigned inidx = in->input.inidx;
-
-      if (pre_assign_inputs && !so->inputs[inidx].sysval) {
-         if (VALIDREG(so->nonbinning->inputs[inidx].regid)) {
-            compile_assert(
-               ctx, in->dsts[0]->num == so->nonbinning->inputs[inidx].regid);
-            compile_assert(ctx, !!(in->dsts[0]->flags & IR3_REG_HALF) ==
-                                   so->nonbinning->inputs[inidx].half);
-         }
-         so->inputs[inidx].regid = so->nonbinning->inputs[inidx].regid;
-         so->inputs[inidx].half = so->nonbinning->inputs[inidx].half;
-      } else {
-         so->inputs[inidx].regid = in->dsts[0]->num;
-         so->inputs[inidx].half = !!(in->dsts[0]->flags & IR3_REG_HALF);
-      }
+      so->inputs[inidx].regid = in->dsts[0]->num;
+      so->inputs[inidx].half = !!(in->dsts[0]->flags & IR3_REG_HALF);
    }
 
    uint8_t clip_cull_mask = ctx->so->clip_mask | ctx->so->cull_mask;
@@ -5916,9 +5887,11 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
     */
    if (so->type == MESA_SHADER_TESS_CTRL || so->type == MESA_SHADER_GEOMETRY) {
       struct ir3_block *first_block = ir3_start_block(ir);
-      struct ir3_instruction *first_instr = list_first_entry(
-         &first_block->instr_list, struct ir3_instruction, node);
-      first_instr->flags |= IR3_INSTR_SS | IR3_INSTR_SY;
+      if (!list_is_empty(&first_block->instr_list)) {
+         struct ir3_instruction *first_instr = list_first_entry(
+            &first_block->instr_list, struct ir3_instruction, node);
+         first_instr->flags |= IR3_INSTR_SS | IR3_INSTR_SY;
+      }
    }
 
    if (ctx->compiler->gen >= 7 && so->type == MESA_SHADER_COMPUTE) {
@@ -5949,6 +5922,10 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    if ((ctx->so->type == MESA_SHADER_FRAGMENT) &&
        ctx->s->info.fs.post_depth_coverage)
       so->post_depth_coverage = true;
+
+   if (ctx->so->type == MESA_SHADER_FRAGMENT) {
+      so->fs.depth_layout = ctx->s->info.fs.depth_layout;
+   }
 
    ctx->so->per_samp = ctx->s->info.fs.uses_sample_shading;
 

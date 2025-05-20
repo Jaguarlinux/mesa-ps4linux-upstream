@@ -40,6 +40,7 @@
 #include "util/u_debug.h"
 #include "util/u_printf.h"
 #include "util/mesa-blake3.h"
+#include "util/bfloat.h"
 
 #include <stdio.h>
 
@@ -58,6 +59,9 @@ static const struct spirv_capabilities implemented_capabilities = {
    .AtomicFloat32MinMaxEXT = true,
    .AtomicFloat64MinMaxEXT = true,
    .AtomicStorage = true,
+   .BFloat16CooperativeMatrixKHR = true,
+   .BFloat16DotProductKHR = true,
+   .BFloat16TypeKHR = true,
    .ClipDistance = true,
    .ComputeDerivativeGroupLinearKHR = true,
    .ComputeDerivativeGroupQuadsKHR = true,
@@ -1833,14 +1837,9 @@ validate_image_type_for_sampled_image(struct vtn_builder *b,
                dim == GLSL_SAMPLER_DIM_SUBPASS_MS,
                "%s must not have a Dim of SubpassData.", operand);
 
-   if (dim == GLSL_SAMPLER_DIM_BUF) {
-      if (b->version >= 0x10600) {
-         vtn_fail("Starting with SPIR-V 1.6, %s "
-                  "must not have a Dim of Buffer.", operand);
-      } else {
-         vtn_warn("%s should not have a Dim of Buffer.", operand);
-      }
-   }
+   vtn_fail_if(dim == GLSL_SAMPLER_DIM_BUF && b->version >= 0x10600,
+               "Starting with SPIR-V 1.6, %s must not have a Dim of Buffer.",
+               operand);
 }
 
 static void
@@ -1886,10 +1885,26 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
    case SpvOpTypeFloat: {
       int bit_size = w[2];
       val->type->base_type = vtn_base_type_scalar;
-      vtn_fail_if(bit_size != 16 && bit_size != 32 && bit_size != 64,
-                  "Invalid float bit size: %u", bit_size);
-      val->type->type = glsl_floatN_t_type(bit_size);
       val->type->length = 1;
+
+      int32_t encoding = count > 3 ? w[3] : -1;
+      switch (encoding) {
+      case -1:
+         /* No encoding specified, it is a regular FP. */
+         vtn_fail_if(bit_size != 16 && bit_size != 32 && bit_size != 64,
+                     "Invalid float bit size: %u", bit_size);
+         val->type->type = glsl_floatN_t_type(bit_size);
+         break;
+
+      case SpvFPEncodingBFloat16KHR:
+         vtn_fail_if(bit_size != 16,
+                     "Invalid Bfloat16 bit size: %u", bit_size);
+         val->type->type = glsl_bfloatN_t_type(bit_size);
+         break;
+
+      default:
+         vtn_fail("Unsupported OpTypeFloat encoding: %d", encoding);
+      }
       break;
    }
 
@@ -2677,8 +2692,16 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
 
       default: {
          bool swap;
-         nir_alu_type dst_alu_type = nir_get_nir_type_for_glsl_type(val->type->type);
-         nir_alu_type src_alu_type = dst_alu_type;
+
+         const glsl_type *dst_type = val->type->type;
+         const glsl_type *src_type = dst_type;
+
+         const bool bfloat_dst = glsl_type_is_bfloat_16(dst_type);
+         bool bfloat_src = bfloat_dst;
+
+         if (bfloat_dst)
+            dst_type = glsl_float_type();
+
          unsigned num_components = glsl_get_vector_elements(val->type->type);
 
          vtn_assert(count <= 7);
@@ -2686,26 +2709,28 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
          switch (opcode) {
          case SpvOpSConvert:
          case SpvOpFConvert:
-         case SpvOpUConvert:
+         case SpvOpUConvert: {
             /* We have a different source type in a conversion. */
-            src_alu_type =
-               nir_get_nir_type_for_glsl_type(vtn_get_value_type(b, w[4])->type);
+            src_type = vtn_get_value_type(b, w[4])->type;
+            bfloat_src = glsl_type_is_bfloat_16(src_type);
+            if (bfloat_src)
+               src_type = glsl_float_type();
             break;
+         }
          default:
             break;
          };
 
          bool exact;
          nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &swap, &exact,
-                                                     nir_alu_type_get_type_size(src_alu_type),
-                                                     nir_alu_type_get_type_size(dst_alu_type));
+                                                     src_type, dst_type);
 
          /* No SPIR-V opcodes handled through this path should set exact.
           * Since it is ignored, assert on it.
           */
          assert(!exact);
 
-         unsigned bit_size = glsl_get_bit_size(val->type->type);
+         unsigned bit_size = glsl_get_bit_size(src_type);
          nir_const_value src[3][NIR_MAX_VEC_COMPONENTS];
 
          for (unsigned i = 0; i < count - 4; i++) {
@@ -2723,8 +2748,11 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
                                  num_components;
 
             unsigned j = swap ? 1 - i : i;
-            for (unsigned c = 0; c < src_comps; c++)
+            for (unsigned c = 0; c < src_comps; c++) {
                src[j][c] = src_val->constant->values[c];
+               if (bfloat_src)
+                  src[j][c].f32 = _mesa_bfloat16_bits_to_float(src[j][c].u16);
+            }
          }
 
          /* fix up fixed size sources */
@@ -2753,6 +2781,15 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
          nir_eval_const_opcode(op, val->constant->values,
                                num_components, bit_size, srcs,
                                b->shader->info.float_controls_execution_mode);
+
+         if (bfloat_dst) {
+            for (int i = 0; i < num_components; i++) {
+               const uint16_t b =
+                  _mesa_float_to_bfloat16_bits_rte(val->constant->values[i].f32);
+               val->constant->values[i] = nir_const_value_for_raw_uint(b, 16);
+            }
+         }
+
          break;
       } /* default */
       }

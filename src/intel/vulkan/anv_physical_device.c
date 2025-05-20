@@ -123,6 +123,21 @@ get_device_descriptor_limits(const struct anv_physical_device *device,
    limits->max_resources = MIN2(limits->max_resources, limits->max_samplers);
 }
 
+
+static const bool
+anv_device_has_bfloat16_cooperative_matrix(const struct anv_physical_device *pdevice)
+{
+   const struct intel_device_info *devinfo = &pdevice->info;
+
+   for (int i = 0; i < ARRAY_SIZE(devinfo->cooperative_matrix_configurations); i++) {
+      const struct intel_cooperative_matrix_configuration *cfg =
+         &devinfo->cooperative_matrix_configurations[i];
+      if (cfg->a == INTEL_CMAT_BFLOAT16 || cfg->b == INTEL_CMAT_BFLOAT16)
+         return true;
+   }
+   return false;
+}
+
 static void
 get_device_extensions(const struct anv_physical_device *device,
                       struct vk_device_extension_table *ext)
@@ -208,6 +223,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_ray_tracing_pipeline              = rt_enabled,
       .KHR_ray_tracing_position_fetch        = rt_enabled,
       .KHR_relaxed_block_layout              = true,
+      .KHR_robustness2                       = true,
       .KHR_sampler_mirror_clamp_to_edge      = true,
       .KHR_sampler_ycbcr_conversion          = true,
       .KHR_separate_depth_stencil_layouts    = true,
@@ -378,6 +394,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .MESA_image_alignment_control          = true,
       .NV_compute_shader_derivatives         = true,
       .VALVE_mutable_descriptor_type         = true,
+      .KHR_shader_bfloat16                   = device->info.has_bfloat16,
    };
 }
 
@@ -687,7 +704,7 @@ get_features(const struct anv_physical_device *pdevice,
       .rayTracingPipelineTraceRaysIndirect = rt_enabled,
       .rayTraversalPrimitiveCulling = rt_enabled,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
@@ -935,6 +952,12 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_maintenance8 */
       .maintenance8 = true,
+
+      /* VK_KHR_shader_bfloat16 */
+      .shaderBFloat16Type = pdevice->info.has_bfloat16,
+      .shaderBFloat16CooperativeMatrix =
+         anv_device_has_bfloat16_cooperative_matrix(pdevice),
+      .shaderBFloat16DotProduct = pdevice->info.has_bfloat16,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -1515,6 +1538,14 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxRayHitAttributeSize = BRW_RT_SIZEOF_HIT_ATTRIB_DATA;
    }
 
+   /* VK_KHR_robustness2 */
+   {
+      props->robustStorageBufferAccessSizeAlignment =
+         ANV_SSBO_BOUNDS_CHECK_ALIGNMENT;
+      props->robustUniformBufferAccessSizeAlignment =
+         ANV_UBO_ALIGNMENT;
+   }
+
    /* VK_KHR_vertex_attribute_divisor */
    {
       props->maxVertexAttribDivisor = UINT32_MAX / 16;
@@ -1899,14 +1930,6 @@ get_properties(const struct anv_physical_device *pdevice,
    {
       props->provokingVertexModePerPipeline = true;
       props->transformFeedbackPreservesTriangleFanProvokingVertex = false;
-   }
-
-   /* VK_EXT_robustness2 */
-   {
-      props->robustStorageBufferAccessSizeAlignment =
-         ANV_SSBO_BOUNDS_CHECK_ALIGNMENT;
-      props->robustUniformBufferAccessSizeAlignment =
-         ANV_UBO_ALIGNMENT;
    }
 
    /* VK_EXT_sample_locations */
@@ -2529,14 +2552,6 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
       goto fail_fd;
    }
 
-   /* Disable Wa_16013994831 on Gfx12.0 because we found other cases where we
-    * need to always disable preemption :
-    *    - https://gitlab.freedesktop.org/mesa/mesa/-/issues/5963
-    *    - https://gitlab.freedesktop.org/mesa/mesa/-/issues/5662
-    */
-   if (devinfo.verx10 == 120)
-      BITSET_CLEAR(devinfo.workarounds, INTEL_WA_16013994831);
-
    if (!devinfo.has_context_isolation) {
       result = vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
                          "Vulkan requires context isolation for %s", devinfo.name);
@@ -3119,12 +3134,13 @@ static VkComponentTypeKHR
 convert_component_type(enum intel_cooperative_matrix_component_type t)
 {
    switch (t) {
-   case INTEL_CMAT_FLOAT16: return VK_COMPONENT_TYPE_FLOAT16_KHR;
-   case INTEL_CMAT_FLOAT32: return VK_COMPONENT_TYPE_FLOAT32_KHR;
-   case INTEL_CMAT_SINT32:  return VK_COMPONENT_TYPE_SINT32_KHR;
-   case INTEL_CMAT_SINT8:   return VK_COMPONENT_TYPE_SINT8_KHR;
-   case INTEL_CMAT_UINT32:  return VK_COMPONENT_TYPE_UINT32_KHR;
-   case INTEL_CMAT_UINT8:   return VK_COMPONENT_TYPE_UINT8_KHR;
+   case INTEL_CMAT_FLOAT16:  return VK_COMPONENT_TYPE_FLOAT16_KHR;
+   case INTEL_CMAT_FLOAT32:  return VK_COMPONENT_TYPE_FLOAT32_KHR;
+   case INTEL_CMAT_SINT32:   return VK_COMPONENT_TYPE_SINT32_KHR;
+   case INTEL_CMAT_SINT8:    return VK_COMPONENT_TYPE_SINT8_KHR;
+   case INTEL_CMAT_UINT32:   return VK_COMPONENT_TYPE_UINT32_KHR;
+   case INTEL_CMAT_UINT8:    return VK_COMPONENT_TYPE_UINT8_KHR;
+   case INTEL_CMAT_BFLOAT16: return VK_COMPONENT_TYPE_BFLOAT16_KHR;
    }
    unreachable("invalid cooperative matrix component type in configuration");
 }

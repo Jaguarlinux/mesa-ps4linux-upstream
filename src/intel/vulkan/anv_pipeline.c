@@ -265,8 +265,6 @@ struct anv_pipeline_stage {
 
    bool uses_bt_for_push_descs;
 
-   enum anv_dynamic_push_bits dynamic_push_values;
-
    union brw_any_prog_data prog_data;
 
    uint32_t num_stats;
@@ -318,20 +316,23 @@ anv_get_robust_flags(const struct vk_pipeline_robustness_state *rstate)
 
 static void
 populate_base_prog_key(struct anv_pipeline_stage *stage,
-                       const struct anv_device *device)
+                       const struct anv_device *device,
+                       const enum intel_vue_layout vue_layout)
 {
    stage->key.base.robust_flags = anv_get_robust_flags(&stage->rstate);
+   stage->key.base.vue_layout = vue_layout;
    stage->key.base.limit_trig_input_range =
       device->physical->instance->limit_trig_input_range;
 }
 
 static void
 populate_vs_prog_key(struct anv_pipeline_stage *stage,
-                     const struct anv_device *device)
+                     const struct anv_device *device,
+                     const enum intel_vue_layout vue_layout)
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 
    stage->key.vs.vf_component_packing =
       device->physical->instance->vf_component_packing;
@@ -340,31 +341,34 @@ populate_vs_prog_key(struct anv_pipeline_stage *stage,
 static void
 populate_tcs_prog_key(struct anv_pipeline_stage *stage,
                       const struct anv_device *device,
-                      unsigned input_vertices)
+                      unsigned input_vertices,
+                      const enum intel_vue_layout vue_layout)
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 
    stage->key.tcs.input_vertices = input_vertices;
 }
 
 static void
 populate_tes_prog_key(struct anv_pipeline_stage *stage,
-                      const struct anv_device *device)
+                      const struct anv_device *device,
+                      const enum intel_vue_layout vue_layout)
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 }
 
 static void
 populate_gs_prog_key(struct anv_pipeline_stage *stage,
-                     const struct anv_device *device)
+                     const struct anv_device *device,
+                     const enum intel_vue_layout vue_layout)
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 }
 
 static bool
@@ -426,7 +430,7 @@ populate_task_prog_key(struct anv_pipeline_stage *stage,
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, INTEL_VUE_LAYOUT_FIXED);
 
    stage->key.base.uses_inline_push_addr = true;
 }
@@ -434,13 +438,12 @@ populate_task_prog_key(struct anv_pipeline_stage *stage,
 static void
 populate_mesh_prog_key(struct anv_pipeline_stage *stage,
                        const struct anv_device *device,
-                       bool compact_mue)
+                       const enum intel_vue_layout vue_layout)
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 
-   stage->key.mesh.compact_mue = compact_mue;
    stage->key.base.uses_inline_push_addr = true;
 }
 
@@ -456,15 +459,6 @@ rp_color_mask(const struct vk_render_pass_state *rp)
          color_mask |= BITFIELD_BIT(i);
    }
 
-   /* If there is depth/stencil attachment, even if the fragment shader
-    * doesn't write the depth/stencil output, we need a valid render target so
-    * that the compiler doesn't use the null-rt which would cull the
-    * depth/stencil output.
-    */
-   if (rp->depth_attachment_format != VK_FORMAT_UNDEFINED ||
-       rp->stencil_attachment_format != VK_FORMAT_UNDEFINED)
-      color_mask |= 1;
-
    return color_mask;
 }
 
@@ -475,13 +469,14 @@ populate_wm_prog_key(struct anv_pipeline_stage *stage,
                      const struct vk_multisample_state *ms,
                      const struct vk_fragment_shading_rate_state *fsr,
                      const struct vk_render_pass_state *rp,
-                     const enum intel_sometimes is_mesh)
+                     const enum intel_sometimes is_mesh,
+                     const enum intel_vue_layout vue_layout)
 {
    const struct anv_device *device = pipeline->base.device;
 
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, vue_layout);
 
    struct brw_wm_prog_key *key = &stage->key.wm;
 
@@ -566,7 +561,7 @@ populate_cs_prog_key(struct anv_pipeline_stage *stage,
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, INTEL_VUE_LAYOUT_FIXED);
 
    stage->key.base.uses_inline_push_addr = device->info->verx10 >= 125;
 }
@@ -578,7 +573,7 @@ populate_bs_prog_key(struct anv_pipeline_stage *stage,
 {
    memset(&stage->key, 0, sizeof(stage->key));
 
-   populate_base_prog_key(stage, device);
+   populate_base_prog_key(stage, device, INTEL_VUE_LAYOUT_FIXED);
 
    stage->key.bs.pipeline_ray_flags = ray_flags;
    stage->key.bs.pipeline_ray_flags = ray_flags;
@@ -605,12 +600,15 @@ anv_stage_write_shader_hash(struct anv_pipeline_stage *stage,
 static bool
 anv_graphics_pipeline_stage_fragment_dynamic(const struct anv_pipeline_stage *stage)
 {
-   if (stage->stage != MESA_SHADER_FRAGMENT)
-      return false;
+   return stage->stage == MESA_SHADER_FRAGMENT &&
+          brw_wm_prog_key_is_dynamic(&stage->key.wm);
+}
 
-   return stage->key.wm.persample_interp == INTEL_SOMETIMES ||
-          stage->key.wm.multisample_fbo == INTEL_SOMETIMES ||
-          stage->key.wm.alpha_to_coverage == INTEL_SOMETIMES;
+static bool
+anv_graphics_pipeline_stage_mesh_dynamic(const struct anv_pipeline_stage *stage)
+{
+   return stage->stage == MESA_SHADER_FRAGMENT &&
+          stage->key.wm.mesh_input == INTEL_SOMETIMES;
 }
 
 static void
@@ -807,36 +805,6 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *align = comp_size * (length == 3 ? 4 : length);
 }
 
-static enum anv_dynamic_push_bits
-anv_nir_compute_dynamic_push_bits(nir_shader *shader)
-{
-   enum anv_dynamic_push_bits ret = 0;
-
-   nir_foreach_function_impl(impl, shader) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-
-            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-            if (intrin->intrinsic != nir_intrinsic_load_push_constant)
-               continue;
-
-            switch (nir_intrinsic_base(intrin)) {
-            case anv_drv_const_offset(gfx.tcs_input_vertices):
-               ret |= ANV_DYNAMIC_PUSH_INPUT_VERTICES;
-               break;
-
-            default:
-               break;
-            }
-         }
-      }
-   }
-
-   return ret;
-}
-
 static void
 anv_fixup_subgroup_size(struct anv_device *device, struct shader_info *info)
 {
@@ -955,6 +923,12 @@ lower_non_tg4_non_uniform_offsets(const nir_tex_instr *tex,
    return false;
 }
 
+static nir_def *
+build_tcs_input_vertices(nir_builder *b, nir_instr *instr, void *data)
+{
+   return anv_load_driver_uniform(b, 1, gfx.tcs_input_vertices);
+}
+
 static void
 anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
                        void *mem_ctx,
@@ -1005,9 +979,11 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
    /* The patch control points are delivered through a push constant when
     * dynamic.
     */
-   if (nir->info.stage == MESA_SHADER_TESS_CTRL &&
-       stage->key.tcs.input_vertices == 0)
-      NIR_PASS(_, nir, anv_nir_lower_load_patch_vertices_in);
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+      NIR_PASS(_, nir, intel_nir_lower_patch_vertices_in,
+               stage->key.tcs.input_vertices,
+               build_tcs_input_vertices, NULL);
+   }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -1114,11 +1090,10 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
 
    NIR_PASS_V(nir, anv_nir_update_resource_intel_block);
 
-   stage->dynamic_push_values = anv_nir_compute_dynamic_push_bits(nir);
-
    NIR_PASS_V(nir, anv_nir_compute_push_layout,
               pdevice, stage->key.base.robust_flags,
               anv_graphics_pipeline_stage_fragment_dynamic(stage),
+              anv_graphics_pipeline_stage_mesh_dynamic(stage),
               prog_data, &stage->bind_map, &push_map,
               pipeline->layout.type, mem_ctx);
 
@@ -1200,7 +1175,7 @@ anv_pipeline_compile_vs(const struct brw_compiler *compiler,
    brw_compute_vue_map(compiler->devinfo,
                        &vs_stage->prog_data.vs.base.vue_map,
                        vs_stage->nir->info.outputs_written,
-                       vs_stage->nir->info.separate_shader,
+                       vs_stage->key.base.vue_layout,
                        pos_slots);
 
    vs_stage->num_stats = 1;
@@ -1376,7 +1351,7 @@ anv_pipeline_compile_gs(const struct brw_compiler *compiler,
    brw_compute_vue_map(compiler->devinfo,
                        &gs_stage->prog_data.gs.base.vue_map,
                        gs_stage->nir->info.outputs_written,
-                       gs_stage->nir->info.separate_shader, 1);
+                       gs_stage->key.base.vue_layout, 1);
 
    gs_stage->num_stats = 1;
 
@@ -1478,23 +1453,13 @@ anv_pipeline_link_fs(const struct brw_compiler *compiler,
                      const struct vk_render_pass_state *rp)
 {
    /* Initially the valid outputs value is set to all possible render targets
-    * valid (see populate_wm_prog_key()), before we look at the shader
-    * variables. Here we look at the output variables of the shader an compute
-    * a correct number of render target outputs.
+    * valid (see populate_wm_prog_key()), because we're not looking at the
+    * shader code yet. Here we look at the output written to get a correct
+    * number of render target outputs.
     */
-   stage->key.wm.color_outputs_valid = 0;
-   nir_foreach_shader_out_variable_safe(var, stage->nir) {
-      if (var->data.location < FRAG_RESULT_DATA0)
-         continue;
-
-      const unsigned rt = var->data.location - FRAG_RESULT_DATA0;
-      const unsigned array_len =
-         glsl_type_is_array(var->type) ? glsl_get_length(var->type) : 1;
-      assert(rt + array_len <= MAX_RTS);
-
-      stage->key.wm.color_outputs_valid |= BITFIELD_RANGE(rt, array_len);
-   }
-   stage->key.wm.color_outputs_valid &= rp_color_mask(rp);
+   const uint64_t rt_mask =
+      stage->nir->info.outputs_written >> FRAG_RESULT_DATA0;
+   stage->key.wm.color_outputs_valid = rt_mask & rp_color_mask(rp);
    stage->key.wm.nr_color_regions =
       util_last_bit(stage->key.wm.color_outputs_valid);
 
@@ -1524,6 +1489,9 @@ anv_pipeline_link_fs(const struct brw_compiler *compiler,
                  compiler->devinfo, stage->nir,
                  stage->key.wm.multisample_fbo != INTEL_NEVER,
                  stage->key.wm.alpha_to_coverage != INTEL_NEVER)) {
+      /* Ensure the shader doesn't discard the writes */
+      stage->key.wm.color_outputs_valid = 0x1;
+      stage->key.wm.nr_color_regions = 1;
       /* Setup a null render target */
       rt_bindings[0] = (struct anv_pipeline_binding) {
          .set = ANV_DESCRIPTOR_SET_COLOR_ATTACHMENTS,
@@ -1570,7 +1538,7 @@ anv_pipeline_compile_fs(const struct brw_compiler *compiler,
       brw_compute_vue_map(compiler->devinfo,
                           &prev_vue_map,
                           fs_stage->nir->info.inputs_read,
-                          fs_stage->nir->info.separate_shader,
+                          fs_stage->key.base.vue_layout,
                           pos_slots);
 
       fs_stage->key.wm.input_slots_valid = prev_vue_map.slots_valid;
@@ -1790,6 +1758,19 @@ anv_graphics_pipeline_init_keys(struct anv_graphics_base_pipeline *pipeline,
                                 const struct vk_graphics_pipeline_state *state,
                                 struct anv_pipeline_stage *stages)
 {
+   struct anv_device *device = pipeline->base.device;
+   enum intel_vue_layout vue_layout;
+
+   if ((pipeline->base.flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) ||
+       !device->vk.enabled_extensions.EXT_graphics_pipeline_library) {
+      vue_layout = INTEL_VUE_LAYOUT_FIXED;
+   } else {
+      vue_layout =
+         (pipeline->base.type == ANV_PIPELINE_GRAPHICS_LIB &&
+          device->vk.enabled_extensions.EXT_mesh_shader) ?
+         INTEL_VUE_LAYOUT_SEPARATE_MESH : INTEL_VUE_LAYOUT_SEPARATE;
+   }
+
    for (uint32_t s = 0; s < ANV_GRAPHICS_SHADER_STAGE_COUNT; s++) {
       if (!anv_pipeline_base_has_stage(pipeline, s))
          continue;
@@ -1799,20 +1780,21 @@ anv_graphics_pipeline_init_keys(struct anv_graphics_base_pipeline *pipeline,
       const struct anv_device *device = pipeline->base.device;
       switch (stages[s].stage) {
       case MESA_SHADER_VERTEX:
-         populate_vs_prog_key(&stages[s], device);
+         populate_vs_prog_key(&stages[s], device, vue_layout);
          break;
       case MESA_SHADER_TESS_CTRL:
          populate_tcs_prog_key(&stages[s],
                                device,
                                BITSET_TEST(state->dynamic,
                                            MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS) ?
-                               0 : state->ts->patch_control_points);
+                               0 : state->ts->patch_control_points,
+                               vue_layout);
          break;
       case MESA_SHADER_TESS_EVAL:
-         populate_tes_prog_key(&stages[s], device);
+         populate_tes_prog_key(&stages[s], device, vue_layout);
          break;
       case MESA_SHADER_GEOMETRY:
-         populate_gs_prog_key(&stages[s], device);
+         populate_gs_prog_key(&stages[s], device, vue_layout);
          break;
       case MESA_SHADER_FRAGMENT: {
          /* Assume rasterization enabled in any of the following case :
@@ -1842,7 +1824,8 @@ anv_graphics_pipeline_init_keys(struct anv_graphics_base_pipeline *pipeline,
                               pipeline,
                               state->dynamic,
                               raster_enabled ? state->ms : NULL,
-                              state->fsr, state->rp, is_mesh);
+                              state->fsr, state->rp, is_mesh,
+                              vue_layout);
          break;
       }
 
@@ -1851,10 +1834,7 @@ anv_graphics_pipeline_init_keys(struct anv_graphics_base_pipeline *pipeline,
          break;
 
       case MESA_SHADER_MESH: {
-         const bool compact_mue =
-            !(pipeline->base.type == ANV_PIPELINE_GRAPHICS_LIB &&
-              !anv_pipeline_base_has_stage(pipeline, MESA_SHADER_FRAGMENT));
-         populate_mesh_prog_key(&stages[s], device, compact_mue);
+         populate_mesh_prog_key(&stages[s], device, vue_layout);
          break;
       }
 
@@ -2070,8 +2050,11 @@ anv_pipeline_nir_preprocess(struct anv_pipeline *pipeline,
    };
    NIR_PASS(_, stage->nir, nir_opt_access, &opt_access_options);
 
-   /* Vulkan uses the separate-shader linking model */
-   stage->nir->info.separate_shader = true;
+   /* Use a separate-shader linking model for pipeline libraries, we do cross
+    * stage linking otherwise.
+    */
+   stage->nir->info.separate_shader =
+      stage->key.base.vue_layout != INTEL_VUE_LAYOUT_FIXED;
 
    struct brw_nir_compiler_opts opts = {
       .softfp64 = device->fp64_nir,
@@ -2087,6 +2070,8 @@ anv_pipeline_nir_preprocess(struct anv_pipeline *pipeline,
    brw_preprocess_nir(compiler, stage->nir, &opts);
 
    NIR_PASS(_, stage->nir, nir_opt_barrier_modes);
+   NIR_PASS(_, stage->nir, nir_opt_acquire_release_barriers,
+                           SCOPE_QUEUE_FAMILY);
 
    nir_shader_gather_info(stage->nir, nir_shader_get_entrypoint(stage->nir));
 }
@@ -2508,7 +2493,6 @@ anv_graphics_pipeline_compile(struct anv_graphics_base_pipeline *pipeline,
          .xfb_info            = stage->nir->xfb_info,
          .bind_map            = &stage->bind_map,
          .push_desc_info      = &stage->push_desc_info,
-         .dynamic_push_values = stage->dynamic_push_values,
       };
 
       stage->bin =
@@ -2564,12 +2548,6 @@ done:
    }
 
    pipeline_feedback->duration = os_time_get_nano() - pipeline_start;
-
-   if (pipeline->shaders[MESA_SHADER_FRAGMENT]) {
-      pipeline->fragment_dynamic =
-         anv_graphics_pipeline_stage_fragment_dynamic(
-            &stages[MESA_SHADER_FRAGMENT]);
-   }
 
    return VK_SUCCESS;
 
@@ -2696,7 +2674,6 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
          .num_stats           = stage.num_stats,
          .bind_map            = &stage.bind_map,
          .push_desc_info      = &stage.push_desc_info,
-         .dynamic_push_values = stage.dynamic_push_values,
       };
 
       stage.bin = anv_device_upload_kernel(device, cache, &upload_params);
@@ -2903,13 +2880,6 @@ anv_graphics_pipeline_emit(struct anv_graphics_pipeline *pipeline,
       /* TODO(mesh): Mesh vs. Multiview with Instancing. */
    }
 
-
-   pipeline->dynamic_patch_control_points =
-      anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_CTRL) &&
-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS) &&
-      (pipeline->base.shaders[MESA_SHADER_TESS_CTRL]->dynamic_push_values &
-       ANV_DYNAMIC_PUSH_INPUT_VERTICES);
-
    if (pipeline->base.shaders[MESA_SHADER_FRAGMENT] && state->ms) {
       pipeline->sample_shading_enable = state->ms->sample_shading_enable;
       pipeline->min_sample_shading = state->ms->min_sample_shading;
@@ -3001,17 +2971,6 @@ anv_graphics_pipeline_import_lib(struct anv_graphics_base_pipeline *pipeline,
    assert(!link_optimize || lib->retain_shaders);
 
    pipeline->base.active_stages |= lib->base.base.active_stages;
-
-   /* Propagate the fragment dynamic flag, unless we're doing link
-    * optimization, in that case we'll have all the state information and this
-    * will never be dynamic.
-    */
-   if (!link_optimize) {
-      if (lib->base.fragment_dynamic) {
-         assert(lib->base.base.active_stages & VK_SHADER_STAGE_FRAGMENT_BIT);
-         pipeline->fragment_dynamic = true;
-      }
-   }
 
    uint32_t shader_count = anv_graphics_pipeline_imported_shader_count(stages);
    for (uint32_t s = 0; s < ARRAY_SIZE(lib->base.shaders); s++) {
@@ -3391,6 +3350,8 @@ compile_upload_rt_shader(struct anv_ray_tracing_pipeline *pipeline,
          .should_remat_callback = should_remat_cb,
       };
 
+      NIR_PASS(_, nir, brw_nir_lower_rt_intrinsics_pre_trace);
+
       NIR_PASS(_, nir, nir_lower_shader_calls, &opts,
                &resume_shaders, &num_resume_shaders, mem_ctx);
       NIR_PASS(_, nir, brw_nir_lower_shader_calls, &lowering_state);
@@ -3440,7 +3401,6 @@ compile_upload_rt_shader(struct anv_ray_tracing_pipeline *pipeline,
       .num_stats           = 1,
       .bind_map            = &stage->bind_map,
       .push_desc_info      = &stage->push_desc_info,
-      .dynamic_push_values = stage->dynamic_push_values,
    };
 
    stage->bin =

@@ -156,6 +156,11 @@ panfrost_is_format_supported(struct pipe_screen *screen,
    case 1:
    case 4:
       break;
+   case 2:
+      if (dev->arch >= 12)
+         break;
+      else
+         return false;
    case 8:
    case 16:
       if (dev->debug & PAN_DBG_MSAA16)
@@ -455,11 +460,8 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
    caps->max_mem_alloc_size = MIN2(available_ram, user_va_end - user_va_start);
 
    caps->max_local_size = 32768;
-   caps->max_private_size =
-   caps->max_input_size = 4096;
    caps->max_clock_frequency = 800; /* MHz -- TODO */
    caps->max_compute_units = dev->core_count;
-   caps->images_supported = true;
    caps->subgroup_sizes = pan_subgroup_size(dev->arch);
    caps->max_variable_threads_per_block = 1024; // TODO
 }
@@ -725,7 +727,6 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
    panfrost_resource_screen_destroy(pscreen);
    panfrost_pool_cleanup(&screen->mempools.bin);
    panfrost_pool_cleanup(&screen->mempools.desc);
-   pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 
    if (screen->vtbl.screen_destroy)
       screen->vtbl.screen_destroy(pscreen);
@@ -743,7 +744,7 @@ panfrost_screen_get_compiler_options(struct pipe_screen *pscreen,
                                      enum pipe_shader_ir ir,
                                      enum pipe_shader_type shader)
 {
-   return pan_screen(pscreen)->vtbl.get_compiler_options();
+   return pan_shader_get_compiler_options(pan_screen(pscreen)->dev.arch);
 }
 
 static struct disk_cache *
@@ -905,8 +906,6 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       panfrost_query_compression_modifiers;
 
    panfrost_resource_screen_init(&screen->base);
-   pan_blend_shader_cache_init(&dev->blend_shaders,
-                               panfrost_device_gpu_id(dev));
 
    panfrost_init_shader_caps(screen);
    panfrost_init_compute_caps(screen);

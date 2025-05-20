@@ -41,6 +41,7 @@ type_size_xvec4(const struct glsl_type *type, bool as_vec4, bool bindless)
    case GLSL_TYPE_INT:
    case GLSL_TYPE_FLOAT:
    case GLSL_TYPE_FLOAT16:
+   case GLSL_TYPE_BFLOAT16:
    case GLSL_TYPE_BOOL:
    case GLSL_TYPE_DOUBLE:
    case GLSL_TYPE_UINT16:
@@ -291,56 +292,52 @@ is_output(nir_intrinsic_instr *intrin)
           intrin->intrinsic == nir_intrinsic_store_per_view_output;
 }
 
+struct remap_patch_urb_offset_state {
+   const struct intel_vue_map *vue_map;
+   enum tess_primitive_mode tes_primitive_mode;
+};
 
 static bool
-remap_patch_urb_offsets(nir_block *block, nir_builder *b,
-                        const struct intel_vue_map *vue_map,
-                        enum tess_primitive_mode tes_primitive_mode)
+remap_patch_urb_offsets(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
-   nir_foreach_instr_safe(instr, block) {
-      if (instr->type != nir_instr_type_intrinsic)
-         continue;
+   struct remap_patch_urb_offset_state *state = data;
 
-      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   if (!(b->shader->info.stage == MESA_SHADER_TESS_CTRL && is_output(intrin)) &&
+       !(b->shader->info.stage == MESA_SHADER_TESS_EVAL && is_input(intrin)))
+      return false;
 
-      gl_shader_stage stage = b->shader->info.stage;
+   if (remap_tess_levels(b, intrin, state->tes_primitive_mode))
+      return false;
 
-      if ((stage == MESA_SHADER_TESS_CTRL && is_output(intrin)) ||
-          (stage == MESA_SHADER_TESS_EVAL && is_input(intrin))) {
+   int vue_slot = state->vue_map->varying_to_slot[intrin->const_index[0]];
+   assert(vue_slot != -1);
+   intrin->const_index[0] = vue_slot;
 
-         if (remap_tess_levels(b, intrin, tes_primitive_mode))
-            continue;
+   nir_src *vertex = nir_get_io_arrayed_index_src(intrin);
+   if (vertex) {
+      if (nir_src_is_const(*vertex)) {
+         intrin->const_index[0] += nir_src_as_uint(*vertex) *
+            state->vue_map->num_per_vertex_slots;
+      } else {
+         b->cursor = nir_before_instr(&intrin->instr);
 
-         int vue_slot = vue_map->varying_to_slot[intrin->const_index[0]];
-         assert(vue_slot != -1);
-         intrin->const_index[0] = vue_slot;
+         /* Multiply by the number of per-vertex slots. */
+         nir_def *vertex_offset =
+            nir_imul(b,
+                     vertex->ssa,
+                     nir_imm_int(b,
+                                 state->vue_map->num_per_vertex_slots));
 
-         nir_src *vertex = nir_get_io_arrayed_index_src(intrin);
-         if (vertex) {
-            if (nir_src_is_const(*vertex)) {
-               intrin->const_index[0] += nir_src_as_uint(*vertex) *
-                                         vue_map->num_per_vertex_slots;
-            } else {
-               b->cursor = nir_before_instr(&intrin->instr);
+         /* Add it to the existing offset */
+         nir_src *offset = nir_get_io_offset_src(intrin);
+         nir_def *total_offset =
+            nir_iadd(b, vertex_offset,
+                     offset->ssa);
 
-               /* Multiply by the number of per-vertex slots. */
-               nir_def *vertex_offset =
-                  nir_imul(b,
-                           vertex->ssa,
-                           nir_imm_int(b,
-                                       vue_map->num_per_vertex_slots));
-
-               /* Add it to the existing offset */
-               nir_src *offset = nir_get_io_offset_src(intrin);
-               nir_def *total_offset =
-                  nir_iadd(b, vertex_offset,
-                           offset->ssa);
-
-               nir_src_rewrite(offset, total_offset);
-            }
-         }
+         nir_src_rewrite(offset, total_offset);
       }
    }
+
    return true;
 }
 
@@ -405,13 +402,13 @@ brw_nir_lower_vs_inputs(nir_shader *nir)
     * loaded as one vec4 or dvec4 per element (or matrix column), depending on
     * whether it is a double-precision type or not.
     */
-   nir_lower_io(nir, nir_var_shader_in, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32_new);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32_new);
 
    /* This pass needs actual constants */
-   nir_opt_constant_folding(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
-   nir_io_add_const_offset_to_base(nir, nir_var_shader_in);
+   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in);
 
    /* Update shader_info::dual_slot_inputs */
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
@@ -546,13 +543,13 @@ brw_nir_lower_vue_inputs(nir_shader *nir,
       var->data.driver_location = var->data.location;
 
    /* Inputs are stored in vec4 slots, so use type_size_vec4(). */
-   nir_lower_io(nir, nir_var_shader_in, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32);
 
    /* This pass needs actual constants */
-   nir_opt_constant_folding(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
-   nir_io_add_const_offset_to_base(nir, nir_var_shader_in);
+   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in);
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -594,21 +591,20 @@ brw_nir_lower_tes_inputs(nir_shader *nir, const struct intel_vue_map *vue_map)
    nir_foreach_shader_in_variable(var, nir)
       var->data.driver_location = var->data.location;
 
-   nir_lower_io(nir, nir_var_shader_in, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32);
 
    /* This pass needs actual constants */
-   nir_opt_constant_folding(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
-   nir_io_add_const_offset_to_base(nir, nir_var_shader_in);
+   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in);
 
-   nir_foreach_function_impl(impl, nir) {
-      nir_builder b = nir_builder_create(impl);
-      nir_foreach_block(block, impl) {
-         remap_patch_urb_offsets(block, &b, vue_map,
-                                 nir->info.tess._primitive_mode);
-      }
-   }
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, remap_patch_urb_offsets,
+            nir_metadata_control_flow,
+            &(struct remap_patch_urb_offset_state) {
+               .vue_map = vue_map,
+               .tes_primitive_mode = nir->info.tess._primitive_mode,
+            });
 }
 
 static bool
@@ -662,11 +658,75 @@ lower_barycentric_at_offset(nir_builder *b, nir_intrinsic_instr *intrin,
    return true;
 }
 
+static bool
+lower_indirect_primitive_id(nir_builder *b,
+                            nir_intrinsic_instr *intrin,
+                            void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_per_primitive_input)
+      return false;
+
+   if (nir_intrinsic_io_semantics(intrin).location != VARYING_SLOT_PRIMITIVE_ID)
+      return false;
+
+   nir_def *indirect_primitive_id = data;
+   nir_def_replace(&intrin->def, indirect_primitive_id);
+
+   return true;
+}
+
 void
 brw_nir_lower_fs_inputs(nir_shader *nir,
                         const struct intel_device_info *devinfo,
                         const struct brw_wm_prog_key *key)
 {
+   nir_def *indirect_primitive_id = NULL;
+   if (key->base.vue_layout == INTEL_VUE_LAYOUT_SEPARATE_MESH &&
+       (nir->info.inputs_read & VARYING_BIT_PRIMITIVE_ID)) {
+      nir_builder _b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir))), *b = &_b;
+      nir_def *index = nir_ushr_imm(b,
+                                    nir_load_fs_msaa_intel(b),
+                                    INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_OFFSET);
+      nir_def *max_poly = nir_load_max_polygon_intel(b);
+      /* Build the per-vertex offset into the attribute section of the thread
+       * payload. There is always one GRF of padding in front.
+       *
+       * The computation is fairly complicated due to the layout of the
+       * payload. You can find a description of the layout in
+       * brw_compile_fs.cpp brw_assign_urb_setup().
+       *
+       * Gfx < 20 packs 2 slots per GRF (hence the %/ 2 in the formula)
+       * Gfx >= 20 pack 5 slots per GRF (hence the %/ 5 in the formula)
+       *
+       * Then an additional offset needs to added to handle how multiple
+       * polygon data is interleaved.
+       */
+      nir_def *per_vertex_offset = nir_iadd_imm(
+         b,
+         devinfo->ver >= 20 ?
+         nir_iadd(b,
+                  nir_imul(b, nir_udiv_imm(b, index, 5), nir_imul_imm(b, max_poly, 64)),
+                  nir_imul_imm(b, nir_umod_imm(b, index, 5), 12)) :
+         nir_iadd_imm(
+            b,
+            nir_iadd(
+               b,
+               nir_imul(b, nir_udiv_imm(b, index, 2), nir_imul_imm(b, max_poly, 32)),
+               nir_imul_imm(b, nir_umod_imm(b, index, 2), 16)),
+            12),
+         devinfo->grf_size);
+      /* When the attribute index is INTEL_MSAA_FLAG_PRIMITIVE_ID_MESH_INDEX,
+       * it means the value is coming from the per-primitive block. We always
+       * lay out PrimitiveID at offset 0 in the per-primitive block.
+       */
+      nir_def *attribute_offset = nir_bcsel(
+         b,
+         nir_ieq_imm(b, index, INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_MESH),
+         nir_imm_int(b, 0), per_vertex_offset);
+      indirect_primitive_id =
+         nir_read_attribute_payload_intel(b, attribute_offset);
+   }
+
    nir_foreach_shader_in_variable(var, nir) {
       var->data.driver_location = var->data.location;
 
@@ -683,31 +743,50 @@ brw_nir_lower_fs_inputs(nir_shader *nir,
          var->data.interpolation = flat ? INTERP_MODE_FLAT
                                         : INTERP_MODE_SMOOTH;
       }
+
+      /* Always pull the PrimitiveID from the per-primitive block if mesh can be involved.
+       */
+      if (var->data.location == VARYING_SLOT_PRIMITIVE_ID &&
+         key->mesh_input != INTEL_NEVER) {
+         var->data.per_primitive = true;
+         nir->info.per_primitive_inputs |= VARYING_BIT_PRIMITIVE_ID;
+      }
    }
 
-   nir_lower_io(nir, nir_var_shader_in, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32 |
-                nir_lower_io_use_interpolated_input_intrinsics);
+   NIR_PASS(_, nir, nir_lower_io,
+            nir_var_shader_in, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32 |
+            nir_lower_io_use_interpolated_input_intrinsics);
    if (devinfo->ver >= 11)
-      nir_lower_interpolation(nir, ~0);
+      NIR_PASS(_, nir, nir_lower_interpolation, ~0);
 
    if (key->multisample_fbo == INTEL_NEVER) {
-      nir_lower_single_sampled(nir);
+      NIR_PASS(_, nir, nir_lower_single_sampled);
    } else if (key->persample_interp == INTEL_ALWAYS) {
-      nir_shader_intrinsics_pass(nir, lower_barycentric_per_sample,
-                                   nir_metadata_control_flow,
-                                   NULL);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               lower_barycentric_per_sample,
+               nir_metadata_control_flow,
+               NULL);
    }
 
-   if (devinfo->ver < 20)
-      nir_shader_intrinsics_pass(nir, lower_barycentric_at_offset,
-                                 nir_metadata_control_flow,
-                                 NULL);
+   if (devinfo->ver < 20) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               lower_barycentric_at_offset,
+               nir_metadata_control_flow,
+               NULL);
+   }
+
+   if (indirect_primitive_id != NULL) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               lower_indirect_primitive_id,
+               nir_metadata_control_flow,
+               indirect_primitive_id);
+   }
 
    /* This pass needs actual constants */
-   nir_opt_constant_folding(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
-   nir_io_add_const_offset_to_base(nir, nir_var_shader_in);
+   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in);
 }
 
 void
@@ -717,9 +796,9 @@ brw_nir_lower_vue_outputs(nir_shader *nir)
       var->data.driver_location = var->data.location;
    }
 
-   nir_lower_io(nir, nir_var_shader_out, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32);
-   brw_nir_lower_per_view_outputs(nir);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_out, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32);
+   NIR_PASS(_, nir, brw_nir_lower_per_view_outputs);
 }
 
 void
@@ -730,20 +809,20 @@ brw_nir_lower_tcs_outputs(nir_shader *nir, const struct intel_vue_map *vue_map,
       var->data.driver_location = var->data.location;
    }
 
-   nir_lower_io(nir, nir_var_shader_out, type_size_vec4,
-                nir_lower_io_lower_64bit_to_32);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_out, type_size_vec4,
+            nir_lower_io_lower_64bit_to_32);
 
    /* This pass needs actual constants */
-   nir_opt_constant_folding(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
-   nir_io_add_const_offset_to_base(nir, nir_var_shader_out);
+   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_out);
 
-   nir_foreach_function_impl(impl, nir) {
-      nir_builder b = nir_builder_create(impl);
-      nir_foreach_block(block, impl) {
-         remap_patch_urb_offsets(block, &b, vue_map, tes_primitive_mode);
-      }
-   }
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, remap_patch_urb_offsets,
+            nir_metadata_control_flow,
+            &(struct remap_patch_urb_offset_state) {
+               .vue_map = vue_map,
+               .tes_primitive_mode = tes_primitive_mode,
+            });
 }
 
 void
@@ -755,7 +834,7 @@ brw_nir_lower_fs_outputs(nir_shader *nir)
          SET_FIELD(var->data.location, BRW_NIR_FRAG_OUTPUT_LOCATION);
    }
 
-   nir_lower_io(nir, nir_var_shader_out, type_size_dvec4, 0);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_out, type_size_dvec4, 0);
 }
 
 static bool
@@ -2253,6 +2332,28 @@ lsc_op_for_nir_intrinsic(const nir_intrinsic_instr *intrin)
 }
 
 enum brw_reg_type
+brw_type_for_base_type(enum glsl_base_type base_type)
+{
+   switch (base_type) {
+   case GLSL_TYPE_UINT:      return BRW_TYPE_UD;
+   case GLSL_TYPE_INT:       return BRW_TYPE_D;
+   case GLSL_TYPE_FLOAT:     return BRW_TYPE_F;
+   case GLSL_TYPE_FLOAT16:   return BRW_TYPE_HF;
+   case GLSL_TYPE_BFLOAT16:  return BRW_TYPE_BF;
+   case GLSL_TYPE_DOUBLE:    return BRW_TYPE_DF;
+   case GLSL_TYPE_UINT16:    return BRW_TYPE_UW;
+   case GLSL_TYPE_INT16:     return BRW_TYPE_W;
+   case GLSL_TYPE_UINT8:     return BRW_TYPE_UB;
+   case GLSL_TYPE_INT8:      return BRW_TYPE_B;
+   case GLSL_TYPE_UINT64:    return BRW_TYPE_UQ;
+   case GLSL_TYPE_INT64:     return BRW_TYPE_Q;
+
+   default:
+      unreachable("invalid base type");
+   }
+}
+
+enum brw_reg_type
 brw_type_for_nir_type(const struct intel_device_info *devinfo,
                       nir_alu_type type)
 {
@@ -2459,12 +2560,9 @@ brw_nir_move_interpolation_to_top(nir_shader *nir)
                instr
             };
 
-            for (unsigned i = 0; i < ARRAY_SIZE(move); i++) {
-               if (move[i]->block != top) {
-                  nir_instr_move(cursor, move[i]);
-                  impl_progress = true;
-               }
-            }
+            for (unsigned i = 0; i < ARRAY_SIZE(move); i++)
+               nir_instr_move(cursor, move[i]);
+            impl_progress = true;
          }
       }
 
@@ -2524,4 +2622,26 @@ brw_nir_lower_simd(nir_shader *nir, unsigned dispatch_width)
 {
    return nir_shader_lower_instructions(nir, filter_simd, lower_simd,
                                  (void *)(uintptr_t)dispatch_width);
+}
+
+nir_variable *
+brw_nir_find_complete_variable_with_location(nir_shader *shader,
+                                             nir_variable_mode mode,
+                                             int location)
+{
+   nir_variable *best_var = NULL;
+   unsigned last_size = 0;
+
+   nir_foreach_variable_with_modes(var, shader, mode) {
+      if (var->data.location != location)
+         continue;
+
+      unsigned new_size = glsl_count_dword_slots(var->type, false);
+      if (new_size > last_size) {
+         best_var = var;
+         last_size = new_size;
+      }
+   }
+
+   return best_var;
 }

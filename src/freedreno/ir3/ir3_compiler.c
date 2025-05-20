@@ -36,6 +36,7 @@ static const struct debug_named_value shader_debug_options[] = {
    {"expandrpt",  IR3_DBG_EXPANDRPT,  "Expand rptN instructions"},
    {"noaliastex", IR3_DBG_NOALIASTEX, "Don't use alias.tex"},
    {"noaliasrt",  IR3_DBG_NOALIASRT,  "Don't use alias.rt"},
+   {"asmroundtrip", IR3_DBG_ASM_ROUNDTRIP, "Disassemble, reassemble and compare every shader"},
 #if MESA_DEBUG
    /* MESA_DEBUG-only options: */
    {"schedmsgs",  IR3_DBG_SCHEDMSGS,  "Enable scheduler debug messages"},
@@ -193,8 +194,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
        *
        * TODO: is this true on earlier gen's?
        */
-      compiler->max_const_compute =
-         (compiler->gen >= 7 && !dev_info->a7xx.compute_constlen_quirk) ? 512 : 256;
+      compiler->max_const_compute = compiler->gen >= 7 ? 512 : 256;
 
       /* TODO: implement clip+cull distances on earlier gen's */
       compiler->has_clip_cull = true;
@@ -239,6 +239,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->reading_shading_rate_requires_smask_quirk =
          dev_info->a7xx.reading_shading_rate_requires_smask_quirk;
       compiler->has_alias_rt = dev_info->a7xx.has_alias_rt;
+      compiler->mergedregs = true;
 
       if (compiler->gen >= 7) {
          compiler->has_alias_tex = true;
@@ -261,6 +262,14 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->has_isam_v = false;
       compiler->has_ssbo_imm_offsets = false;
       compiler->has_early_preamble = false;
+   }
+
+   if (dev_info->compute_lb_size) {
+      compiler->compute_lb_size = dev_info->compute_lb_size;
+   } else {
+      compiler->compute_lb_size =
+         compiler->max_const_compute * 16 /* bytes/vec4 */ *
+         compiler->wave_granularity + compiler->local_mem_size;
    }
 
    /* This is just a guess for a4xx. */
@@ -319,6 +328,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    if (compiler->gen >= 6) {
       compiler->nir_options.force_indirect_unrolling = nir_var_all,
       compiler->nir_options.lower_device_index_to_zero = true;
+      compiler->nir_options.instance_id_includes_base_index = true;
 
       if (dev_info->a6xx.has_dp2acc || dev_info->a6xx.has_dp4acc) {
          compiler->nir_options.has_udot_4x8 =

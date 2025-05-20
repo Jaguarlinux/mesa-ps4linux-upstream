@@ -292,9 +292,6 @@ typedef struct nir_shader_compiler_options {
    /* lower fdph to fdot4 */
    bool lower_fdph;
 
-   /** lower fdot to fmul and fsum/fadd. */
-   bool lower_fdot;
-
    /* Does the native fdot instruction replicate its result for four
     * components?  If so, then opt_algebraic_late will turn all fdotN
     * instructions into fdotN_replicated instructions.
@@ -358,6 +355,11 @@ typedef struct nir_shader_compiler_options {
     * is_indexed_draw (~0/0) & firstvertex
     */
    bool lower_base_vertex;
+
+   /* Indicates that gl_InstanceIndex already includes base index
+    * and doesn't require further lowering.
+    */
+   bool instance_id_includes_base_index;
 
    /**
     * If enabled, gl_HelperInvocation will be lowered as:
@@ -458,6 +460,11 @@ typedef struct nir_shader_compiler_options {
     * arithmetic.
     */
    bool lower_mul_32x16;
+
+   /**
+    * Set if bf2f and f2bf should be lowered to arithmetic.
+    */
+   bool lower_bfloat16_conversions;
 
    bool vectorize_tess_levels;
    bool lower_to_scalar;
@@ -580,6 +587,9 @@ typedef struct nir_shader_compiler_options {
 
    /** Backend supports sdot_2x16 and udot_2x16 opcodes. */
    bool has_dot_2x16;
+
+   /** Backend supports bfdot2_bfadd opcode. */
+   bool has_bfdot2_bfadd;
 
    /** Backend supports fmulz (and ffmaz if lower_ffma32=false) */
    bool has_fmulz;

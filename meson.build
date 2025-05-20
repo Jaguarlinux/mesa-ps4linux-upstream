@@ -53,7 +53,10 @@ cl_args = [
   # Set the OpenCL standard to CL 2.0, enabling everything at a frontend.
   # Drivers may not actually support everything but that's ok.
   '-cl-std=cl2.0',
-  '-D__OPENCL_VERSION__=200'
+  '-D__OPENCL_VERSION__=200',
+
+  # Declare supported clang builtins since we don't autodetect for OpenCL
+  '-DHAVE___BUILTIN_FFS',
 ]
 
 if with_mesa_ndebug
@@ -594,6 +597,14 @@ if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk or with_gfxstre
       fallback : ['DirectX-Headers', 'dep_dxheaders'],
       required : with_gallium_d3d12 or with_microsoft_vk
     )
+  endif
+endif
+
+if dep_dxheaders.found()
+  if (dep_dxheaders.version().version_compare('>= 1.700.0'))
+    pre_args += '-DUSE_D3D12_PREVIEW_HEADERS=1'
+  else
+    pre_args += '-DUSE_D3D12_PREVIEW_HEADERS=0'
   endif
 endif
 

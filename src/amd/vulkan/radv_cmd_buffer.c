@@ -74,11 +74,6 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
    dest->sample_location.count = src->sample_location.count;
 
    if (copy_mask & RADV_DYNAMIC_VIEWPORT) {
-      if (dest->vk.vp.viewport_count != src->vk.vp.viewport_count) {
-         dest->vk.vp.viewport_count = src->vk.vp.viewport_count;
-         dest_mask |= RADV_DYNAMIC_VIEWPORT;
-      }
-
       if (memcmp(&dest->vk.vp.viewports, &src->vk.vp.viewports, src->vk.vp.viewport_count * sizeof(VkViewport))) {
          typed_memcpy(dest->vk.vp.viewports, src->vk.vp.viewports, src->vk.vp.viewport_count);
          typed_memcpy(dest->hw_vp.xform, src->hw_vp.xform, src->vk.vp.viewport_count);
@@ -86,14 +81,23 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
       }
    }
 
-   if (copy_mask & RADV_DYNAMIC_SCISSOR) {
-      if (dest->vk.vp.scissor_count != src->vk.vp.scissor_count) {
-         dest->vk.vp.scissor_count = src->vk.vp.scissor_count;
-         dest_mask |= RADV_DYNAMIC_SCISSOR;
+   if (copy_mask & RADV_DYNAMIC_VIEWPORT_WITH_COUNT) {
+      if (dest->vk.vp.viewport_count != src->vk.vp.viewport_count) {
+         dest->vk.vp.viewport_count = src->vk.vp.viewport_count;
+         dest_mask |= RADV_DYNAMIC_VIEWPORT;
       }
+   }
 
+   if (copy_mask & RADV_DYNAMIC_SCISSOR) {
       if (memcmp(&dest->vk.vp.scissors, &src->vk.vp.scissors, src->vk.vp.scissor_count * sizeof(VkRect2D))) {
          typed_memcpy(dest->vk.vp.scissors, src->vk.vp.scissors, src->vk.vp.scissor_count);
+         dest_mask |= RADV_DYNAMIC_SCISSOR;
+      }
+   }
+
+   if (copy_mask & RADV_DYNAMIC_SCISSOR_WITH_COUNT) {
+      if (dest->vk.vp.scissor_count != src->vk.vp.scissor_count) {
+         dest->vk.vp.scissor_count = src->vk.vp.scissor_count;
          dest_mask |= RADV_DYNAMIC_SCISSOR;
       }
    }
@@ -6636,10 +6640,11 @@ radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 
     * in the L2 cache in CB/DB mode then they are already usable from all the other L2 clients. */
    image_is_coherent |= can_skip_buffer_l2_flushes(device) && !cmd_buffer->state.rb_noncoherent_dirty;
 
-   if (dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) {
+   if (dst_flags & (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT)) {
       /* SMEM loads are used to read compute dispatch size in shaders */
-      if (!device->load_grid_size_from_user_sgpr)
+      if ((dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) && !device->load_grid_size_from_user_sgpr) {
          flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
+      }
 
       /* Ensure the DGC meta shader can read the commands. */
       if (device->vk.enabled_features.deviceGeneratedCommands) {
@@ -7970,9 +7975,6 @@ radv_CmdSetViewport(VkCommandBuffer commandBuffer, uint32_t firstViewport, uint3
    assert(firstViewport < MAX_VIEWPORTS);
    assert(total_count >= 1 && total_count <= MAX_VIEWPORTS);
 
-   if (state->dynamic.vk.vp.viewport_count < total_count)
-      state->dynamic.vk.vp.viewport_count = total_count;
-
    memcpy(state->dynamic.vk.vp.viewports + firstViewport, pViewports, viewportCount * sizeof(*pViewports));
    for (unsigned i = 0; i < viewportCount; i++) {
       radv_get_viewport_xform(&pViewports[i], state->dynamic.hw_vp.xform[i + firstViewport].scale,
@@ -7993,9 +7995,6 @@ radv_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor, uint32_
 
    assert(firstScissor < MAX_SCISSORS);
    assert(total_count >= 1 && total_count <= MAX_SCISSORS);
-
-   if (state->dynamic.vk.vp.scissor_count < total_count)
-      state->dynamic.vk.vp.scissor_count = total_count;
 
    memcpy(state->dynamic.vk.vp.scissors + firstScissor, pScissors, scissorCount * sizeof(*pScissors));
 
@@ -8174,12 +8173,22 @@ radv_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology 
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t viewportCount, const VkViewport *pViewports)
 {
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   struct radv_cmd_state *state = &cmd_buffer->state;
+
+   state->dynamic.vk.vp.viewport_count = viewportCount;
+
    radv_CmdSetViewport(commandBuffer, 0, viewportCount, pViewports);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t scissorCount, const VkRect2D *pScissors)
 {
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   struct radv_cmd_state *state = &cmd_buffer->state;
+
+   state->dynamic.vk.vp.scissor_count = scissorCount;
+
    radv_CmdSetScissor(commandBuffer, 0, scissorCount, pScissors);
 }
 
@@ -9323,6 +9332,8 @@ radv_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRe
 
    cmd_buffer->state.dirty_dynamic |=
       RADV_DYNAMIC_DEPTH_BIAS | RADV_DYNAMIC_STENCIL_TEST_ENABLE | RADV_DYNAMIC_COLOR_BLEND_ENABLE;
+   if (pdev->info.gfx_level >= GFX10_3)
+      cmd_buffer->state.dirty_dynamic |= RADV_DYNAMIC_FRAGMENT_SHADING_RATE;
    if (pdev->info.gfx_level >= GFX12)
       cmd_buffer->state.dirty_dynamic |= RADV_DYNAMIC_RASTERIZATION_SAMPLES;
 
@@ -9482,7 +9493,7 @@ radv_cs_emit_compute_predication(const struct radv_device *device, struct radv_c
    if (!state->predicating)
       return;
 
-   uint64_t va = state->predication_va;
+   uint64_t va = state->user_predication_va;
 
    if (!state->predication_type) {
       /* Invert the condition the first time it is needed. */
@@ -12676,6 +12687,8 @@ radv_trace_rays(struct radv_cmd_buffer *cmd_buffer, VkTraceRaysIndirectCommand2K
    if (instance->debug_flags & RADV_DEBUG_NO_RT)
       return;
 
+   radv_suspend_conditional_rendering(cmd_buffer);
+
    if (unlikely(device->rra_trace.ray_history_buffer))
       radv_trace_trace_rays(cmd_buffer, tables, indirect_va);
 
@@ -12758,6 +12771,8 @@ radv_trace_rays(struct radv_cmd_buffer *cmd_buffer, VkTraceRaysIndirectCommand2K
 
       radv_dispatch(cmd_buffer, &info, pipeline, rt_prolog, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
    }
+
+   radv_resume_conditional_rendering(cmd_buffer);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -12896,7 +12911,7 @@ radv_handle_depth_image_transition(struct radv_cmd_buffer *cmd_buffer, struct ra
    if (!radv_htile_enabled(image, range->baseMipLevel))
       return;
 
-   if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+   if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED || src_layout == VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT) {
       radv_initialize_htile(cmd_buffer, image, range);
    } else if (radv_layout_is_htile_compressed(device, image, range->baseMipLevel, src_layout, src_queue_mask) &&
               !radv_layout_is_htile_compressed(device, image, range->baseMipLevel, dst_layout, dst_queue_mask)) {
@@ -13058,7 +13073,7 @@ radv_handle_color_image_transition(struct radv_cmd_buffer *cmd_buffer, struct ra
    if (!radv_image_has_cmask(image) && !radv_image_has_fmask(image) && !radv_dcc_enabled(image, range->baseMipLevel))
       return;
 
-   if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+   if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED || src_layout == VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT) {
       radv_init_color_image_metadata(cmd_buffer, image, src_layout, dst_layout, src_queue_mask, dst_queue_mask, range);
 
       if (radv_image_need_retile(cmd_buffer, image))
@@ -13341,10 +13356,28 @@ radv_barrier(struct radv_cmd_buffer *cmd_buffer, uint32_t dep_count, const VkDep
                          sample_locs_info->sampleLocationsCount);
          }
 
+         uint32_t src_qf_index = dep_info->pImageMemoryBarriers[i].srcQueueFamilyIndex;
+         uint32_t dst_qf_index = dep_info->pImageMemoryBarriers[i].dstQueueFamilyIndex;
+
+         /* The src and dst queue family indices may contrain arbitrary values
+          * that should be ignored if they are equal. For example, see
+          * VUID-VkBufferMemoryBarrier-buffer-09095 (Vulkan spec 1.4.313).
+          *
+          *   If buffer was created with a sharing mode of
+          *   VK_SHARING_MODE_EXCLUSIVE, and srcQueueFamilyIndex and
+          *   dstQueueFamilyIndex are not equal, srcQueueFamilyIndex must be
+          *   VK_QUEUE_FAMILY_EXTERNAL, VK_QUEUE_FAMILY_FOREIGN_EXT, or a valid
+          *   queue family
+          */
+         if (src_qf_index == dst_qf_index)
+         {
+            src_qf_index = VK_QUEUE_FAMILY_IGNORED;
+            dst_qf_index = VK_QUEUE_FAMILY_IGNORED;
+         }
+
          radv_handle_image_transition(
             cmd_buffer, image, dep_info->pImageMemoryBarriers[i].oldLayout, dep_info->pImageMemoryBarriers[i].newLayout,
-            dep_info->pImageMemoryBarriers[i].srcQueueFamilyIndex,
-            dep_info->pImageMemoryBarriers[i].dstQueueFamilyIndex, &dep_info->pImageMemoryBarriers[i].subresourceRange,
+            src_qf_index, dst_qf_index, &dep_info->pImageMemoryBarriers[i].subresourceRange,
             sample_locs_info ? &sample_locations : NULL);
       }
    }
@@ -13551,12 +13584,15 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radeon_cmdbuf *cs = cmd_buffer->cs;
    unsigned pred_op = PREDICATION_OP_BOOL32;
+   uint64_t emulated_va = 0;
 
    radv_emit_cache_flush(cmd_buffer);
 
    if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {
-      if (!pdev->info.has_32bit_predication) {
-         uint64_t pred_value = 0, pred_va;
+      if (pdev->info.has_32bit_predication) {
+         radv_emit_set_predication_state(cmd_buffer, draw_visible, pred_op, va);
+      } else {
+         uint64_t pred_value = 0;
          unsigned pred_offset;
 
          /* From the Vulkan spec 1.1.107:
@@ -13587,7 +13623,7 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
           */
          radv_cmd_buffer_upload_data(cmd_buffer, 8, &pred_value, &pred_offset);
 
-         pred_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + pred_offset;
+         emulated_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + pred_offset;
 
          radeon_check_space(device->ws, cmd_buffer->cs, 8);
          radeon_begin(cs);
@@ -13597,18 +13633,17 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
                      COPY_DATA_WR_CONFIRM);
          radeon_emit(va);
          radeon_emit(va >> 32);
-         radeon_emit(pred_va);
-         radeon_emit(pred_va >> 32);
+         radeon_emit(emulated_va);
+         radeon_emit(emulated_va >> 32);
 
          radeon_emit(PKT3(PKT3_PFP_SYNC_ME, 0, 0));
          radeon_emit(0);
          radeon_end();
 
-         va = pred_va;
          pred_op = PREDICATION_OP_BOOL64;
-      }
 
-      radv_emit_set_predication_state(cmd_buffer, draw_visible, pred_op, va);
+         radv_emit_set_predication_state(cmd_buffer, draw_visible, pred_op, emulated_va);
+      }
    } else {
       /* Compute queue doesn't support predication and it's emulated elsewhere. */
    }
@@ -13617,7 +13652,8 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
    cmd_buffer->state.predicating = true;
    cmd_buffer->state.predication_type = draw_visible;
    cmd_buffer->state.predication_op = pred_op;
-   cmd_buffer->state.predication_va = va;
+   cmd_buffer->state.user_predication_va = va;
+   cmd_buffer->state.emulated_predication_va = emulated_va;
    cmd_buffer->state.mec_inv_pred_emitted = false;
 }
 
@@ -13634,7 +13670,8 @@ radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
    cmd_buffer->state.predicating = false;
    cmd_buffer->state.predication_type = -1;
    cmd_buffer->state.predication_op = 0;
-   cmd_buffer->state.predication_va = 0;
+   cmd_buffer->state.user_predication_va = 0;
+   cmd_buffer->state.emulated_predication_va = 0;
    cmd_buffer->state.mec_inv_pred_emitted = false;
 }
 

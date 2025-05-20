@@ -167,13 +167,16 @@ pan_wls_adjust_size(unsigned wls_size)
 
 #ifdef PAN_ARCH
 
-#if PAN_ARCH >= 5
 static inline enum mali_sample_pattern
 pan_sample_pattern(unsigned samples)
 {
    switch (samples) {
    case 1:
       return MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+#if PAN_ARCH >= 12
+   case 2:
+      return MALI_SAMPLE_PATTERN_ROTATED_2X_GRID;
+#endif
    case 4:
       return MALI_SAMPLE_PATTERN_ROTATED_4X_GRID;
    case 8:
@@ -184,7 +187,6 @@ pan_sample_pattern(unsigned samples)
       unreachable("Unsupported sample count");
    }
 }
-#endif
 
 void GENX(pan_select_tile_size)(struct pan_fb_info *fb);
 

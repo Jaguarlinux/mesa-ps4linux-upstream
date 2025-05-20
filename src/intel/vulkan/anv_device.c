@@ -31,6 +31,7 @@
 
 #include "anv_private.h"
 #include "anv_measure.h"
+#include "anv_slab_bo.h"
 #include "util/u_debug.h"
 #include "util/os_file.h"
 #include "util/os_misc.h"
@@ -74,10 +75,7 @@ static VkResult
 anv_device_init_trivial_batch(struct anv_device *device)
 {
    VkResult result = anv_device_alloc_bo(device, "trivial-batch", 4096,
-                                         ANV_BO_ALLOC_MAPPED |
-                                         ANV_BO_ALLOC_HOST_COHERENT |
-                                         ANV_BO_ALLOC_INTERNAL |
-                                         ANV_BO_ALLOC_CAPTURE,
+                                         ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS,
                                          0 /* explicit_address */,
                                          &device->trivial_batch_bo);
    ANV_DMR_BO_ALLOC(&device->vk.base, device->trivial_batch_bo, result);
@@ -485,9 +483,12 @@ VkResult anv_CreateDevice(
    list_inithead(&device->image_private_objects);
    list_inithead(&device->bvh_dumps);
 
+   if (!anv_slab_bo_init(device))
+      goto fail_vmas;
+
    if (pthread_mutex_init(&device->mutex, NULL) != 0) {
       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
-      goto fail_vmas;
+      goto fail_slab;
    }
 
    pthread_condattr_t condattr;
@@ -515,9 +516,7 @@ VkResult anv_CreateDevice(
       goto fail_queue_cond;
 
    anv_bo_pool_init(&device->batch_bo_pool, device, "batch",
-                    ANV_BO_ALLOC_MAPPED |
-                    ANV_BO_ALLOC_HOST_CACHED_COHERENT |
-                    ANV_BO_ALLOC_CAPTURE);
+                    ANV_BO_ALLOC_BATCH_BUFFER_FLAGS);
    if (device->vk.enabled_extensions.KHR_acceleration_structure) {
       anv_bo_pool_init(&device->bvh_bo_pool, device, "bvh build",
                        0 /* alloc_flags */);
@@ -1126,6 +1125,8 @@ VkResult anv_CreateDevice(
    pthread_cond_destroy(&device->queue_submit);
  fail_mutex:
    pthread_mutex_destroy(&device->mutex);
+fail_slab:
+   anv_slab_bo_deinit(device);
  fail_vmas:
    util_vma_heap_finish(&device->vma_trtt);
    util_vma_heap_finish(&device->vma_dynamic_visible);
@@ -1278,6 +1279,7 @@ void anv_DestroyDevice(
       anv_bo_pool_finish(&device->bvh_bo_pool);
    anv_bo_pool_finish(&device->batch_bo_pool);
 
+   anv_slab_bo_deinit(device);
    anv_bo_cache_finish(&device->bo_cache);
 
    util_vma_heap_finish(&device->vma_trtt);
@@ -1898,7 +1900,7 @@ VkResult anv_MapMemory2KHR(
    }
 
    uint64_t map_offset, map_size;
-   anv_sanitize_map_params(device, offset, size, &map_offset, &map_size);
+   anv_sanitize_map_params(device, mem->bo, offset, size, &map_offset, &map_size);
 
    void *map;
    VkResult result = anv_device_map_bo(device, mem->bo, map_offset,
@@ -2174,8 +2176,13 @@ anv_device_get_pat_entry(struct anv_device *device,
    if (alloc_flags & ANV_BO_ALLOC_IMPORTED)
       return &device->info->pat.cached_coherent;
 
-   if (alloc_flags & ANV_BO_ALLOC_COMPRESSED)
-      return &device->info->pat.compressed;
+   if (alloc_flags & ANV_BO_ALLOC_COMPRESSED) {
+      /* Compressed PAT entries are available on Xe2+. */
+      assert(device->info->ver >= 20);
+      return alloc_flags & ANV_BO_ALLOC_SCANOUT ?
+             &device->info->pat.compressed_scanout :
+             &device->info->pat.compressed;
+   }
 
    if (alloc_flags & (ANV_BO_ALLOC_EXTERNAL | ANV_BO_ALLOC_SCANOUT))
       return &device->info->pat.scanout;

@@ -302,7 +302,6 @@ struct pipe_shader_state
    /* TODO move tokens into union. */
    const struct tgsi_token *tokens;
    union {
-      void *native;
       struct nir_shader *nir;
    } ir;
    struct pipe_stream_output_info stream_output;
@@ -942,19 +941,6 @@ struct pipe_blit_info
 struct pipe_grid_info
 {
    /**
-    * For drivers that use PIPE_SHADER_IR_NATIVE as their preferred IR, this
-    * value will be the index of the kernel in the opencl.kernels metadata
-    * list.
-    */
-   uint32_t pc;
-
-   /**
-    * Will be used to initialize the INPUT resource, and it should point to a
-    * buffer of at least pipe_compute_state::req_input_mem bytes.
-    */
-   const void *input;
-
-   /**
     * Variable shared memory used by this invocation.
     *
     * This comes on top of shader declared shared memory.
@@ -1225,21 +1211,11 @@ struct pipe_ml_subgraph
    struct pipe_context *context;
 };
 
-/**
- * Structure used as a header for serialized compute programs.
- */
-struct pipe_binary_program_header
-{
-   uint32_t num_bytes; /**< Number of bytes in the LLVM bytecode program. */
-   char blob[];
-};
-
 struct pipe_compute_state
 {
    enum pipe_shader_ir ir_type; /**< IR type contained in prog. */
    const void *prog; /**< Compute program to be executed. */
    unsigned static_shared_mem; /**< equal to info.shared_size, used for shaders passed as TGSI */
-   unsigned req_input_mem; /**< Required size of the INPUT resource. */
 };
 
 struct pipe_compute_state_object_info

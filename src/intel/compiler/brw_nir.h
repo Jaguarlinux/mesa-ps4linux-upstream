@@ -154,6 +154,13 @@ brw_nir_fs_needs_null_rt(const struct intel_device_info *devinfo,
    if (devinfo->ver < 11)
       return true;
 
+   /* Depth/Stencil needs a valid render target even if there is no color
+    * output.
+    */
+   if (nir->info.outputs_written & (BITFIELD_BIT(FRAG_RESULT_DEPTH) |
+                                    BITFIELD_BIT(FRAG_RESULT_STENCIL)))
+      return true;
+
    uint64_t relevant_outputs = 0;
    if (multisample_fbo)
       relevant_outputs |= BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
@@ -173,9 +180,10 @@ brw_nir_link_shaders(const struct brw_compiler *compiler,
 bool brw_nir_lower_cs_intrinsics(nir_shader *nir,
                                  const struct intel_device_info *devinfo,
                                  struct brw_cs_prog_data *prog_data);
-bool brw_nir_lower_alpha_to_coverage(nir_shader *shader,
-                                     const struct brw_wm_prog_key *key,
-                                     const struct brw_wm_prog_data *prog_data);
+bool brw_nir_lower_alpha_to_coverage(nir_shader *shader);
+bool brw_nir_lower_fs_msaa(nir_shader *shader,
+                           const struct brw_wm_prog_key *key);
+
 void brw_nir_lower_vs_inputs(nir_shader *nir);
 void brw_nir_lower_vue_inputs(nir_shader *nir,
                               const struct intel_vue_map *vue_map);
@@ -242,6 +250,7 @@ unsigned brw_nir_api_subgroup_size(const nir_shader *nir,
 
 enum brw_conditional_mod brw_cmod_for_nir_comparison(nir_op op);
 enum lsc_opcode lsc_op_for_nir_intrinsic(const nir_intrinsic_instr *intrin);
+enum brw_reg_type brw_type_for_base_type(enum glsl_base_type base_type);
 enum brw_reg_type brw_type_for_nir_type(const struct intel_device_info *devinfo,
                                         nir_alu_type type);
 
@@ -310,6 +319,10 @@ bool brw_nir_uses_inline_data(nir_shader *shader);
 nir_shader *
 brw_nir_from_spirv(void *mem_ctx, const uint32_t *spirv, size_t spirv_size);
 
+nir_variable *
+brw_nir_find_complete_variable_with_location(nir_shader *shader,
+                                             nir_variable_mode mode,
+                                             int location);
 #ifdef __cplusplus
 }
 #endif

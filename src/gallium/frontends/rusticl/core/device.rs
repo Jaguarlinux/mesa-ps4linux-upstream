@@ -1104,12 +1104,10 @@ impl Device {
         }
     }
 
-    pub fn subgroup_sizes(&self) -> Vec<usize> {
+    pub fn subgroup_sizes(&self) -> impl ExactSizeIterator<Item = usize> {
         let subgroup_size = self.screen.compute_caps().subgroup_sizes;
 
-        SetBitIndices::from_msb(subgroup_size)
-            .map(|bit| 1 << bit)
-            .collect()
+        SetBitIndices::from_msb(subgroup_size).map(|bit| 1 << bit)
     }
 
     pub fn max_subgroups(&self) -> u32 {
@@ -1182,7 +1180,7 @@ impl Device {
     }
 }
 
-pub fn devs() -> &'static Vec<Device> {
+pub fn devs() -> &'static [Device] {
     &Platform::get().devs
 }
 

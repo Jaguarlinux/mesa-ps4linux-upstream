@@ -202,13 +202,6 @@ class LAVAJobDefinition:
                 f"{self.job_submitter.dtb_filename}.dtb"
             }
 
-    def attach_external_modules(self, deploy_field):
-        if self.job_submitter.kernel_external:
-            deploy_field["modules"] = {
-                "url": f"{self.job_submitter.kernel_url_prefix}/modules.tar.zst",
-                "compression": "zstd"
-            }
-
     def jwt_steps(self):
         """
         This function is responsible for setting up the SSH server in the DUT and to
@@ -257,7 +250,8 @@ class LAVAJobDefinition:
         # since the license isn't bundled inside the repository
         if self.job_submitter.device_type == "sm8350-hdk":
             run_steps.append(
-                "curl -L --retry 4 -f --retry-all-errors --retry-delay 60 "
+                "mkdir -p /lib/firmware/qcom/sm8350 && "
+                + "curl -L --retry 4 -f --retry-all-errors --retry-delay 60 "
                 + "https://github.com/allahjasif1990/hdk888-firmware/raw/main/a660_zap.mbn "
                 + '-o "/lib/firmware/qcom/sm8350/a660_zap.mbn"'
             )

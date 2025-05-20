@@ -8,13 +8,12 @@ uncollapsed_section_start piglit "Building piglit"
 # .gitlab-ci/image-tags.yml tags:
 # DEBIAN_TEST_GL_TAG
 # DEBIAN_TEST_VK_TAG
-# KERNEL_ROOTFS_TAG
 
 # Do a very early check to make sure the tag is correct without the need of
 # setting up the environment variables locally
 ci_tag_build_time_check "PIGLIT_TAG"
 
-REV="c50d9aa54f85e0af9d72fab86c73f89356d96399"
+REV="1767af745ed96f77b16c0c205015366d1fbbdb22"
 
 git clone https://gitlab.freedesktop.org/mesa/piglit.git --single-branch --no-checkout /piglit
 pushd /piglit

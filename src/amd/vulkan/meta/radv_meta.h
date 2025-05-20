@@ -115,6 +115,11 @@ enum radv_meta_object_key_type {
    RADV_META_OBJECT_KEY_QUERY_TIMESTAMP,
    RADV_META_OBJECT_KEY_QUERY_PRIMS_GEN,
    RADV_META_OBJECT_KEY_QUERY_MESH_PRIMS_GEN,
+   RADV_META_OBJECT_KEY_BVH_COPY,
+   RADV_META_OBJECT_KEY_BVH_COPY_BLAS_ADDRS_GFX12,
+   RADV_META_OBJECT_KEY_BVH_ENCODE,
+   RADV_META_OBJECT_KEY_BVH_UPDATE,
+   RADV_META_OBJECT_KEY_BVH_HEADER,
 };
 
 VkResult radv_device_init_meta(struct radv_device *device);
@@ -218,6 +223,9 @@ uint32_t radv_clear_htile(struct radv_cmd_buffer *cmd_buffer, const struct radv_
                           const VkImageSubresourceRange *range, uint32_t value, bool is_clear);
 
 void radv_update_memory_cp(struct radv_cmd_buffer *cmd_buffer, uint64_t va, const void *data, uint64_t size);
+
+void radv_update_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size, const void *data,
+                        enum radv_copy_flags dst_copy_flags);
 
 void radv_meta_decode_etc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
                           const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent);

@@ -1881,33 +1881,49 @@ static void
 bi_emit_derivative(bi_builder *b, bi_index dst, nir_intrinsic_instr *instr,
                    unsigned axis, bool coarse)
 {
+   assert(axis == 1 || axis == 2);
+
    bi_index left, right;
    bi_index s0 = bi_src_index(&instr->src[0]);
+
    unsigned sz = instr->def.bit_size;
 
    /* If all uses are fabs, the sign of the derivative doesn't matter. This is
     * inherently based on fine derivatives so we can't do it for coarse.
     */
-   if (nir_def_all_uses_ignore_sign_bit(&instr->def) && !coarse) {
+   if (coarse) {
+      left = bi_clper(b, s0, bi_imm_u8(0), BI_LANE_OP_NONE);
+      right = bi_clper(b, s0, bi_imm_u8(axis), BI_LANE_OP_NONE);
+   } else {
       left = s0;
       right = bi_clper(b, s0, bi_imm_u8(axis), BI_LANE_OP_XOR);
-   } else {
-      bi_index lane1, lane2;
-      if (coarse) {
-         lane1 = bi_imm_u32(0);
-         lane2 = bi_imm_u32(axis);
-      } else {
-         lane1 = bi_lshift_and_i32(b, bi_fau(BIR_FAU_LANE_ID, false),
-                                   bi_imm_u32(0x3 & ~axis), bi_imm_u8(0));
-
-         lane2 = bi_iadd_u32(b, lane1, bi_imm_u32(axis), false);
-      }
-
-      left = bi_clper(b, s0, bi_byte(lane1, 0), BI_LANE_OP_NONE);
-      right = bi_clper(b, s0, bi_byte(lane2, 0), BI_LANE_OP_NONE);
    }
 
-   bi_fadd_to(b, sz, dst, right, bi_neg(left));
+   if (!coarse && !nir_def_all_uses_ignore_sign_bit(&instr->def)) {
+      /* If the user cares about the sign, we need to take into account the fact
+       * left/right (or top/bottom) might be inverted. Instead of using a couple
+       * CSEL, we just invert the sign bit with
+       *
+       *    sign_bit = XOR(sign_bit, axis_bit(lane_id)).
+       */
+      bi_index res = bi_fadd(b, sz, right, bi_neg(left));
+      bi_index lane = bi_fau(BIR_FAU_LANE_ID, false);
+      bi_index lane_shift = bi_imm_u8(sz - ffs(axis));
+
+      /* Clear the low bit before the shift if this is the Y-axis we want.
+       * We skip it on the X-axis, because the lshift-by-31 will get us a
+       * clean mask. */
+      if (axis == 2)
+         lane = bi_lshift_and_i32(b, lane, bi_imm_u32(2), bi_imm_u8(0));
+
+      if (sz == 16)
+         lane = bi_half(lane, false);
+
+      /* And here comes the final XOR on the sign bit. */
+      bi_lshift_xor_to(b, sz, dst, lane, res, lane_shift);
+   } else {
+      bi_fadd_to(b, sz, dst, right, bi_neg(left));
+   }
 }
 
 static enum bi_subgroup
@@ -2118,11 +2134,11 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       bi_emit_ld_tile(b, instr);
       break;
 
-   case nir_intrinsic_terminate_if:
+   case nir_intrinsic_demote_if:
       bi_discard_b32(b, bi_src_index(&instr->src[0]));
       break;
 
-   case nir_intrinsic_terminate:
+   case nir_intrinsic_demote:
       bi_discard_f32(b, bi_zero(), bi_zero(), BI_CMPF_EQ);
       break;
 
@@ -3356,11 +3372,25 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
    case nir_op_fround_even:
    case nir_op_fceil:
    case nir_op_ffloor:
-   case nir_op_ftrunc:
+   case nir_op_ftrunc: {
       /* On v11+, FROUND.v2s16 is gone, we lower this in nir_lower_bit_size */
       assert(sz != 16 || b->shader->arch < 11);
-      bi_fround_to(b, sz, dst, s0, bi_nir_round(instr->op));
+
+      enum bi_round round = bi_nir_round(instr->op);
+
+      /* On v11+, FROUND does not flush subnormals to zero even when configured
+       * in the shader program header */
+      if (b->shader->arch >= 11 &&
+          (round == BI_ROUND_RTP || round == BI_ROUND_RTN) &&
+          b->shader->ftz_fp32) {
+         bi_instr *flush = bi_flush_to(b, 32, bi_temp(b->shader), s0);
+         flush->ftz = true;
+         s0 = flush->dest[0];
+      }
+
+      bi_fround_to(b, sz, dst, s0, round);
       break;
+   }
 
    case nir_op_fmin:
       bi_fmin_to(b, sz, dst, s0, s1);
@@ -5011,6 +5041,7 @@ bi_lower_bit_size(const nir_instr *instr, void *data)
       case nir_op_fround_even:
       case nir_op_fceil:
       case nir_op_ffloor:
+      case nir_op_ffract:
       case nir_op_ftrunc:
       case nir_op_frexp_sig:
       case nir_op_frexp_exp:
@@ -5018,6 +5049,19 @@ bi_lower_bit_size(const nir_instr *instr, void *data)
          if (pan_arch(gpu_id) < 11)
             return 0;
          return (nir_src_bit_size(alu->src[0].src) == 32) ? 0 : 32;
+      case nir_op_iadd:
+      case nir_op_isub:
+      case nir_op_iadd_sat:
+      case nir_op_uadd_sat:
+      case nir_op_isub_sat:
+      case nir_op_usub_sat:
+      case nir_op_ineg:
+      case nir_op_iabs:
+         /* On v11+, IABS.v4s8, IADD.v4s8 and ISUB.v4s8 are gone */
+         if (pan_arch(gpu_id) < 11)
+            return 0;
+
+         return (nir_src_bit_size(alu->src[0].src) == 8) ? 16 : 0;
       default:
          return 0;
       }
@@ -5355,11 +5399,12 @@ bi_optimize_nir(nir_shader *nir, unsigned gpu_id, bool is_blend)
 
    /* We might lower attribute, varying, and image indirects. Use the
     * gathered info to skip the extra analysis in the happy path. */
-   bool any_indirects = nir->info.inputs_read_indirectly ||
-                        nir->info.outputs_accessed_indirectly ||
-                        nir->info.patch_inputs_read_indirectly ||
-                        nir->info.patch_outputs_accessed_indirectly ||
-                        nir->info.images_used[0];
+   bool any_indirects =
+      nir->info.inputs_read_indirectly || nir->info.outputs_read_indirectly ||
+      nir->info.outputs_written_indirectly ||
+      nir->info.patch_inputs_read_indirectly ||
+      nir->info.patch_outputs_read_indirectly ||
+      nir->info.patch_outputs_written_indirectly || nir->info.images_used[0];
 
    if (any_indirects) {
       nir_divergence_analysis(nir);
@@ -5687,6 +5732,18 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
 {
    MESA_TRACE_FUNC();
 
+   /* The DISCARD instruction just flags the thread as discarded, but the
+    * actual termination only happens when all threads in the quad are
+    * discarded, or when an instruction with a .discard flow is
+    * encountered (Valhall) or when a clause with a .terminate_discarded_thread
+    * is reached (Bifrost).
+    * We could do without nir_lower_terminate_to_demote(), but this allows
+    * for extra dead-code elimination when code sections are detected as
+    * being unused after a termination is crossed.
+    */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_lower_terminate_to_demote);
+
    /* Ensure that halt are translated to returns and get ride of them */
    NIR_PASS(_, nir, nir_shader_instructions_pass, bi_lower_halt_to_return,
             nir_metadata_all, NULL);
@@ -5780,7 +5837,11 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
    NIR_PASS(_, nir, nir_lower_ssbo, &ssbo_opts);
 
    NIR_PASS(_, nir, pan_lower_sample_pos);
-   NIR_PASS(_, nir, pan_lower_helper_invocation);
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
+      NIR_PASS(_, nir, pan_lower_helper_invocation);
+   }
 
    /*
     * Lower subgroups ops before lowering int64: nir_lower_int64 doesn't know
@@ -5883,6 +5944,7 @@ bi_compile_variant_nir(nir_shader *nir,
    unsigned execution_mode = nir->info.float_controls_execution_mode;
    ctx->rtz_fp16 = nir_is_rounding_mode_rtz(execution_mode, 16);
    ctx->rtz_fp32 = nir_is_rounding_mode_rtz(execution_mode, 32);
+   ctx->ftz_fp32 = nir_is_denorm_flush_to_zero(execution_mode, 32);
 
    if (idvs == BI_IDVS_POSITION || idvs == BI_IDVS_VARYING) {
       /* Specializing shaders for IDVS is destructive, so we need to

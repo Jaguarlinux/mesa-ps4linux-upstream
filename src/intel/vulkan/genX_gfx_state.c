@@ -193,10 +193,6 @@ genX(streamout_prologue)(struct anv_cmd_buffer *cmd_buffer)
 #if INTEL_WA_16013994831_GFX_VER
    /* Wa_16013994831 - Disable preemption during streamout, enable back
     * again if XFB not used by the current pipeline.
-    *
-    * Although this workaround applies to Gfx12+, we already disable object
-    * level preemption for another reason in genX_state.c so we can skip this
-    * for Gfx12.
     */
    if (!intel_needs_workaround(cmd_buffer->device->info, 16013994831))
       return;
@@ -769,9 +765,7 @@ update_fs_msaa_flags(struct anv_gfx_dynamic_state *hw_state,
    /* If we have any dynamic bits here, we might need to update the value
     * in the push constant for the shader.
     */
-   if (wm_prog_data->coarse_pixel_dispatch != INTEL_SOMETIMES &&
-       wm_prog_data->persample_dispatch != INTEL_SOMETIMES &&
-       wm_prog_data->alpha_to_coverage != INTEL_SOMETIMES)
+   if (!brw_wm_prog_data_is_dynamic(wm_prog_data))
       return;
 
    enum intel_msaa_flags fs_msaa_flags =
@@ -782,6 +776,7 @@ update_fs_msaa_flags(struct anv_gfx_dynamic_state *hw_state,
             .rasterization_samples     = dyn->ms.rasterization_samples,
             .coarse_pixel              = !vk_fragment_shading_rate_is_disabled(&dyn->fsr),
             .alpha_to_coverage         = dyn->ms.alpha_to_coverage_enable,
+            .primitive_id_index        = pipeline->primitive_id_index,
          });
 
    SET(FS_MSAA_FLAGS, fs_msaa_flags, fs_msaa_flags);
@@ -890,27 +885,16 @@ update_ps_extra_has_uav(struct anv_gfx_dynamic_state *hw_state,
 {
    const struct brw_wm_prog_data *wm_prog_data = get_wm_prog_data(pipeline);
 
-#if GFX_VERx10 >= 125
-   SET_STAGE(PS_EXTRA, ps_extra.PixelShaderHasUAV,
-                       wm_prog_data && wm_prog_data->has_side_effects,
-                       FRAGMENT);
-#else
-   /* Prior to Gfx12.5 the HW seems to avoid spawning fragment shaders even if
-    * 3DSTATE_PS_EXTRA::PixelShaderKillsPixel=true when
-    * 3DSTATE_PS_BLEND::HasWriteableRT=false. This is causing problems with
-    * occlusion queries with 0 attachments. There are no CTS tests exercising
-    * this but zink+anv fails a bunch of tests like piglit
-    * arb_framebuffer_no_attachments-query.
-    *
-    * Here we choose to tweak the PixelShaderHasUAV to make sure the fragment
-    * shaders are run properly.
+   /* Force fragment shader execution if occlusion queries are active to
+    * ensure PS_DEPTH_COUNT is correct. Otherwise a fragment shader with
+    * discard and no render target setup could be increment PS_DEPTH_COUNT if
+    * the HW internally decides to not run the shader because it has already
+    * established that depth-test is passing.
     */
    SET_STAGE(PS_EXTRA, ps_extra.PixelShaderHasUAV,
                        wm_prog_data && (wm_prog_data->has_side_effects ||
-                                        (gfx->color_att_count == 0 &&
-                                         gfx->n_occlusion_queries > 0)),
+                                        gfx->n_occlusion_queries > 0),
                        FRAGMENT);
-#endif
 }
 
 ALWAYS_INLINE static void
@@ -2031,7 +2015,8 @@ cmd_buffer_flush_gfx_runtime_state(struct anv_gfx_dynamic_state *hw_state,
     * the pipeline change or the dynamic value change, check the value and
     * reemit if needed.
     */
-   if (pipeline->dynamic_patch_control_points &&
+   const struct brw_tcs_prog_data *tcs_prog_data = get_tcs_prog_data(pipeline);
+   if (tcs_prog_data && tcs_prog_data->input_vertices == 0 &&
        ((gfx->dirty & ANV_CMD_DIRTY_PIPELINE) ||
         BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS)))
       SET(TCS_INPUT_VERTICES, tcs_input_vertices, dyn->ts.patch_control_points);

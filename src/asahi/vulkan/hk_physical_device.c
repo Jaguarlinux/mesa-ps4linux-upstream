@@ -108,6 +108,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_quad_control = true,
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
@@ -162,7 +163,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_inline_uniform_block = true,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
-      .EXT_map_memory_placed = false,
+      .EXT_map_memory_placed = true,
       .EXT_memory_budget = false,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
@@ -414,6 +415,9 @@ hk_get_device_features(
       /* VK_KHR_shader_maximal_reconvergence */
       .shaderMaximalReconvergence = true,
 
+      /* VK_KHR_shader_quad_control */
+      .shaderQuadControl = true,
+
       /* VK_KHR_shader_subgroup_rotate */
       .shaderSubgroupRotate = true,
       .shaderSubgroupRotateClustered = true,
@@ -531,9 +535,9 @@ hk_get_device_features(
       .minLod = true,
 
       /* VK_EXT_map_memory_placed */
-      .memoryMapPlaced = false,
+      .memoryMapPlaced = true,
       .memoryMapRangePlaced = false,
-      .memoryUnmapReserve = false,
+      .memoryUnmapReserve = true,
 
       /* VK_EXT_multi_draw */
       .multiDraw = true,

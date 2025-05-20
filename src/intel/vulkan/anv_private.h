@@ -61,6 +61,7 @@
 #include "util/macros.h"
 #include "util/hash_table.h"
 #include "util/list.h"
+#include "util/pb_slab.h"
 #include "util/perf/u_trace.h"
 #include "util/set.h"
 #include "util/sparse_array.h"
@@ -270,7 +271,14 @@ struct intel_perf_query_result;
 #define ANV_TRTT_L1_NULL_TILE_VAL 0
 #define ANV_TRTT_L1_INVALID_TILE_VAL 1
 
+/* The binding table entry id disabled, the shader can write to it and the
+ * driver should use a null surface state so that writes are discarded.
+ */
 #define ANV_COLOR_OUTPUT_DISABLED (0xff)
+/* The binding table entry id unused, the shader does not write to it and the
+ * driver can leave whatever surface state was used before. Transitioning
+ * to/from this entry does not require render target cache flush.
+ */
 #define ANV_COLOR_OUTPUT_UNUSED   (0xfe)
 
 static inline uint32_t
@@ -455,12 +463,33 @@ enum anv_bo_alloc_flags {
 
    /** Compressed buffer, only supported in Xe2+ */
    ANV_BO_ALLOC_COMPRESSED =              (1 << 21),
+
+   /** Specifies that this bo is a slab parent */
+   ANV_BO_ALLOC_SLAB_PARENT =             (1 << 22),
 };
 
 /** Specifies that the BO should be cached and coherent. */
 #define ANV_BO_ALLOC_HOST_CACHED_COHERENT (ANV_BO_ALLOC_HOST_COHERENT | \
                                            ANV_BO_ALLOC_HOST_CACHED)
 
+#define ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL_FLAGS (ANV_BO_ALLOC_CAPTURE |              \
+                                                 ANV_BO_ALLOC_MAPPED |               \
+                                                 ANV_BO_ALLOC_HOST_CACHED_COHERENT | \
+                                                 ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL)
+
+#define ANV_BO_ALLOC_DESCRIPTOR_POOL_FLAGS (ANV_BO_ALLOC_CAPTURE |              \
+                                            ANV_BO_ALLOC_MAPPED |               \
+                                            ANV_BO_ALLOC_HOST_CACHED_COHERENT | \
+                                            ANV_BO_ALLOC_DESCRIPTOR_POOL)
+
+#define ANV_BO_ALLOC_BATCH_BUFFER_FLAGS (ANV_BO_ALLOC_MAPPED |               \
+                                         ANV_BO_ALLOC_HOST_CACHED_COHERENT | \
+                                         ANV_BO_ALLOC_CAPTURE)
+
+#define ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS (ANV_BO_ALLOC_MAPPED |        \
+                                                  ANV_BO_ALLOC_HOST_COHERENT | \
+                                                  ANV_BO_ALLOC_INTERNAL |      \
+                                                  ANV_BO_ALLOC_CAPTURE)
 
 struct anv_bo {
    const char *name;
@@ -514,12 +543,23 @@ struct anv_bo {
 
    enum anv_bo_alloc_flags alloc_flags;
 
+   /** If slab_parent is set, this bo is a slab */
+   struct anv_bo *slab_parent;
+   struct pb_slab_entry slab_entry;
+
    /** True if this BO wraps a host pointer */
    bool from_host_ptr:1;
 
    /** True if this BO is mapped in the GTT (only used for RMV) */
    bool gtt_mapped:1;
 };
+
+/* If bo is a slab, return the real/slab_parent bo */
+static inline struct anv_bo *
+anv_bo_get_real(struct anv_bo *bo)
+{
+   return bo->slab_parent ? bo->slab_parent : bo;
+}
 
 static inline bool
 anv_bo_is_external(const struct anv_bo *bo)
@@ -1300,6 +1340,7 @@ enum anv_debug {
    ANV_DEBUG_VIDEO_DECODE      = BITFIELD_BIT(5),
    ANV_DEBUG_VIDEO_ENCODE      = BITFIELD_BIT(6),
    ANV_DEBUG_SHADER_HASH       = BITFIELD_BIT(7),
+   ANV_DEBUG_NO_SLAB           = BITFIELD_BIT(8),
 };
 
 struct anv_instance {
@@ -1411,7 +1452,6 @@ struct nir_xfb_info;
 struct anv_pipeline_bind_map;
 struct anv_pipeline_sets_layout;
 struct anv_push_descriptor_info;
-enum anv_dynamic_push_bits;
 
 void anv_device_init_embedded_samplers(struct anv_device *device);
 void anv_device_finish_embedded_samplers(struct anv_device *device);
@@ -2172,6 +2212,8 @@ struct anv_device {
    } accel_struct_build;
 
    struct vk_meta_device meta_device;
+
+   struct pb_slabs bo_slabs[3];
 };
 
 static inline uint32_t
@@ -2260,6 +2302,7 @@ void anv_device_finish_blorp(struct anv_device *device);
 
 static inline void
 anv_sanitize_map_params(struct anv_device *device,
+                        struct anv_bo *bo,
                         uint64_t in_offset,
                         uint64_t in_size,
                         uint64_t *out_offset,
@@ -2273,13 +2316,19 @@ anv_sanitize_map_params(struct anv_device *device,
    assert(in_offset >= *out_offset);
    *out_size = (in_offset + in_size) - *out_offset;
 
+   /* Don't round up slab bos to not fail mmap() of slabs at the end of slab
+    * parent, all the adjustment for slabs will be done in anv_device_map_bo().
+    */
+   if (anv_bo_get_real(bo) != bo)
+      return;
+
    /* Let's map whole pages */
    *out_size = align64(*out_size, 4096);
 }
 
 
 VkResult anv_device_alloc_bo(struct anv_device *device,
-                             const char *name, uint64_t size,
+                             const char *name, const uint64_t size,
                              enum anv_bo_alloc_flags alloc_flags,
                              uint64_t explicit_address,
                              struct anv_bo **bo);
@@ -2395,6 +2444,16 @@ uint64_t anv_vma_alloc(struct anv_device *device,
 void anv_vma_free(struct anv_device *device,
                   struct util_vma_heap *vma_heap,
                   uint64_t address, uint64_t size);
+
+static inline bool
+anv_bo_is_small_heap(enum anv_bo_alloc_flags alloc_flags)
+{
+   if (alloc_flags & ANV_BO_ALLOC_SLAB_PARENT)
+      return false;
+   return alloc_flags & (ANV_BO_ALLOC_DESCRIPTOR_POOL |
+                         ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL |
+                         ANV_BO_ALLOC_32BIT_ADDRESS);
+}
 
 struct anv_reloc_list {
    bool                                         uses_relocs;
@@ -3234,6 +3293,7 @@ anv_descriptor_set_write_template(struct anv_device *device,
                                   const struct vk_descriptor_update_template *template,
                                   const void *data);
 
+#define ANV_DESCRIPTOR_SET_PER_PRIM_PADDING   (UINT8_MAX - 5)
 #define ANV_DESCRIPTOR_SET_DESCRIPTORS_BUFFER (UINT8_MAX - 4)
 #define ANV_DESCRIPTOR_SET_NULL               (UINT8_MAX - 3)
 #define ANV_DESCRIPTOR_SET_PUSH_CONSTANTS     (UINT8_MAX - 2)
@@ -4292,10 +4352,6 @@ struct anv_cmd_buffer {
 
    struct anv_cmd_state                         state;
 
-   /* Fast-clear statistics. */
-   uint64_t                                     num_dependent_clears;
-   uint64_t                                     num_independent_clears;
-
    struct anv_address                           return_addr;
 
    /* Set by SetPerformanceMarkerINTEL, written into queries by CmdBeginQuery */
@@ -4708,11 +4764,6 @@ struct anv_push_descriptor_info {
    uint8_t used_set_buffer;
 };
 
-/* A list of values we push to implement some of the dynamic states */
-enum anv_dynamic_push_bits {
-   ANV_DYNAMIC_PUSH_INPUT_VERTICES = BITFIELD_BIT(0),
-};
-
 struct anv_shader_upload_params {
    gl_shader_stage stage;
 
@@ -4733,8 +4784,6 @@ struct anv_shader_upload_params {
    const struct anv_pipeline_bind_map *bind_map;
 
    const struct anv_push_descriptor_info *push_desc_info;
-
-   enum anv_dynamic_push_bits dynamic_push_values;
 };
 
 struct anv_embedded_sampler {
@@ -4765,8 +4814,6 @@ struct anv_shader_bin {
    struct anv_push_descriptor_info push_desc_info;
 
    struct anv_pipeline_bind_map bind_map;
-
-   enum anv_dynamic_push_bits dynamic_push_values;
 
    /* Not saved in the pipeline cache.
     *
@@ -4865,11 +4912,6 @@ struct anv_graphics_base_pipeline {
    /* Robustness flags used shaders
     */
    enum brw_robustness_flags                    robust_flags[ANV_GRAPHICS_SHADER_STAGE_COUNT];
-
-   /* True if at the time the fragment shader was compiled, it didn't have all
-    * the information to avoid INTEL_MSAA_FLAG_ENABLE_DYNAMIC.
-    */
-   bool                                         fragment_dynamic;
 };
 
 /* The library graphics pipeline object has a partial graphic state and
@@ -4928,13 +4970,11 @@ struct anv_graphics_pipeline {
    struct vk_sample_locations_state             sample_locations;
    struct vk_dynamic_graphics_state             dynamic_state;
 
-   /* If true, the patch control points are passed through push constants
-    * (anv_push_constants::gfx::tcs_input_vertices)
-    */
-   bool                                         dynamic_patch_control_points;
-
    uint32_t                                     view_mask;
    uint32_t                                     instance_multiplier;
+
+   /* Attribute index of the PrimitiveID in the delivered attributes */
+   uint32_t                                     primitive_id_index;
 
    bool                                         kill_pixel;
    bool                                         uses_xfb;
@@ -5643,22 +5683,6 @@ anv_image_format_is_d16_or_s8(const struct anv_image *image)
       image->vk.format == VK_FORMAT_D24_UNORM_S8_UINT ||
       image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
       image->vk.format == VK_FORMAT_S8_UINT;
-}
-
-static inline bool
-anv_image_can_host_memcpy(const struct anv_image *image)
-{
-   const struct isl_surf *surf = &image->planes[0].primary_surface.isl;
-   struct isl_tile_info tile_info;
-   isl_surf_get_tile_info(surf, &tile_info);
-
-   const bool array_pitch_aligned_to_tile =
-      surf->array_pitch_el_rows % tile_info.logical_extent_el.height == 0;
-
-   return image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
-          image->n_planes == 1 &&
-          array_pitch_aligned_to_tile &&
-          image->vk.mip_levels == 1;
 }
 
 /* The ordering of this enum is important */

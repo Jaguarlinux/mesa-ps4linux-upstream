@@ -1842,6 +1842,31 @@ brw_from_nir_emit_alu(nir_to_brw_state &ntb, nir_alu_instr *instr,
       break;
    }
 
+   /* BFloat16 values in NIR are represented by uint16_t,
+    * but BRW can handle them natively.
+    */
+
+   case nir_op_bf2f:
+      bld.MOV(result, retype(op[0], BRW_TYPE_BF));
+      break;
+
+   case nir_op_f2bf:
+      bld.MOV(retype(result, BRW_TYPE_BF), op[0]);
+      break;
+
+   case nir_op_bfmul:
+      bld.MUL(retype(result, BRW_TYPE_BF),
+              retype(op[0], BRW_TYPE_BF),
+              retype(op[1], BRW_TYPE_BF));
+      break;
+
+   case nir_op_bffma:
+      bld.MAD(retype(result, BRW_TYPE_BF),
+              retype(op[2], BRW_TYPE_BF),
+              retype(op[1], BRW_TYPE_BF),
+              retype(op[0], BRW_TYPE_BF));
+      break;
+
    default:
       unreachable("unhandled instruction");
    }
@@ -4128,17 +4153,14 @@ brw_interp_reg(const brw_builder &bld, unsigned location,
 {
    brw_shader &s = *bld.shader;
    assert(s.stage == MESA_SHADER_FRAGMENT);
-   assert(BITFIELD64_BIT(location) & ~s.nir->info.per_primitive_inputs);
+   assert((BITFIELD64_BIT(location) & ~s.nir->info.per_primitive_inputs) ||
+          location == VARYING_SLOT_PRIMITIVE_ID);
 
    const struct brw_wm_prog_data *prog_data = brw_wm_prog_data(s.prog_data);
 
    assert(prog_data->urb_setup[location] >= 0);
    unsigned nr = prog_data->urb_setup[location];
    channel += prog_data->urb_setup_channel[location];
-
-   /* Adjust so we start counting from the first per_vertex input. */
-   assert(nr >= prog_data->num_per_primitive_inputs);
-   nr -= prog_data->num_per_primitive_inputs;
 
    const unsigned per_vertex_start = prog_data->num_per_primitive_inputs;
    const unsigned regnr = per_vertex_start + (nr * 4) + channel;
@@ -4167,17 +4189,19 @@ brw_per_primitive_reg(const brw_builder &bld, int location, unsigned comp)
 {
    brw_shader &s = *bld.shader;
    assert(s.stage == MESA_SHADER_FRAGMENT);
-   assert(BITFIELD64_BIT(location) & s.nir->info.per_primitive_inputs);
+   assert((BITFIELD64_BIT(location) & s.nir->info.per_primitive_inputs) ||
+          location == VARYING_SLOT_PRIMITIVE_ID);
 
    const struct brw_wm_prog_data *prog_data = brw_wm_prog_data(s.prog_data);
 
-   comp += prog_data->urb_setup_channel[location];
+   comp += (s.fs.per_primitive_offsets[location] % 16) / 4;
 
-   assert(prog_data->urb_setup[location] >= 0);
+   const unsigned regnr = s.fs.per_primitive_offsets[location] / 16 + comp / 4;
 
-   const unsigned regnr = prog_data->urb_setup[location] + comp / 4;
-
+   assert(s.fs.per_primitive_offsets[location] >= 0);
    assert(regnr < prog_data->num_per_primitive_inputs);
+
+   brw_reg loc_reg = brw_attr_reg(regnr, BRW_TYPE_UD);
 
    if (s.max_polygons > 1) {
       /* In multipolygon dispatch each primitive constant is a
@@ -4186,11 +4210,10 @@ brw_per_primitive_reg(const brw_builder &bld, int location, unsigned comp)
        * component() to select the specified parameter.
        */
       const brw_reg tmp = bld.vgrf(BRW_TYPE_UD);
-      bld.MOV(tmp, offset(brw_attr_reg(regnr, BRW_TYPE_UD),
-                          s.dispatch_width, comp % 4));
+      bld.MOV(tmp, offset(loc_reg, s.dispatch_width, comp % 4));
       return retype(tmp, BRW_TYPE_F);
    } else {
-      return component(brw_attr_reg(regnr, BRW_TYPE_F), comp % 4);
+      return component(loc_reg, comp % 4);
    }
 }
 
@@ -4394,7 +4417,7 @@ brw_from_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
          break;
       }
 
-      if (BITFIELD64_BIT(base) & s.nir->info.per_primitive_inputs) {
+      if (instr->intrinsic == nir_intrinsic_load_per_primitive_input) {
          assert(base != VARYING_SLOT_PRIMITIVE_INDICES);
          for (unsigned int i = 0; i < num_components; i++) {
             bld.MOV(offset(dest, bld, i),
@@ -4563,6 +4586,22 @@ brw_from_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
       break;
    }
 
+   case nir_intrinsic_load_fs_msaa_intel:
+      bld.MOV(retype(dest, BRW_TYPE_UD),
+              brw_dynamic_msaa_flags(brw_wm_prog_data(s.prog_data)));
+      break;
+
+   case nir_intrinsic_load_max_polygon_intel:
+      bld.MOV(retype(dest, BRW_TYPE_UD), brw_imm_ud(s.max_polygons));
+      break;
+
+   case nir_intrinsic_read_attribute_payload_intel: {
+      const brw_reg offset = retype(get_nir_src(ntb, instr->src[0], 0),
+                                    BRW_TYPE_UD);
+      bld.emit(FS_OPCODE_READ_ATTRIBUTE_PAYLOAD, retype(dest, BRW_TYPE_UD), offset);
+      break;
+   }
+
    default:
       brw_from_nir_emit_intrinsic(ntb, bld, instr);
       break;
@@ -4693,9 +4732,9 @@ brw_from_nir_emit_cs_intrinsic(nir_to_brw_state &ntb,
       const unsigned rcount = nir_intrinsic_repeat_count(instr);
 
       const brw_reg_type dest_type =
-         brw_type_for_nir_type(devinfo, nir_intrinsic_dest_type(instr));
+         brw_type_for_base_type(nir_intrinsic_dest_base_type(instr));
       const brw_reg_type src_type =
-         brw_type_for_nir_type(devinfo, nir_intrinsic_src_type(instr));
+         brw_type_for_base_type(nir_intrinsic_src_base_type(instr));
 
       brw_reg src[3] = {};
       for (unsigned i = 0; i < ARRAY_SIZE(src); i++) {

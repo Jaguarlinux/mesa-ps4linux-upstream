@@ -60,6 +60,7 @@
 #include "pan_shader.h"
 #include "pan_texture.h"
 #include "pan_util.h"
+#include "pan_desc.h"
 
 /* JOBX() is used to select the job backend helpers to call from generic
  * functions. */
@@ -104,23 +105,6 @@ static_assert((int)PIPE_FUNC_GREATER == MALI_FUNC_GREATER, "must match");
 static_assert((int)PIPE_FUNC_NOTEQUAL == MALI_FUNC_NOT_EQUAL, "must match");
 static_assert((int)PIPE_FUNC_GEQUAL == MALI_FUNC_GEQUAL, "must match");
 static_assert((int)PIPE_FUNC_ALWAYS == MALI_FUNC_ALWAYS, "must match");
-
-static inline enum mali_sample_pattern
-panfrost_sample_pattern(unsigned samples)
-{
-   switch (samples) {
-   case 1:
-      return MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
-   case 4:
-      return MALI_SAMPLE_PATTERN_ROTATED_4X_GRID;
-   case 8:
-      return MALI_SAMPLE_PATTERN_D3D_8X_GRID;
-   case 16:
-      return MALI_SAMPLE_PATTERN_D3D_16X_GRID;
-   default:
-      unreachable("Unsupported sample count");
-   }
-}
 
 static unsigned
 translate_tex_wrap(enum pipe_tex_wrap w, bool using_nearest)
@@ -274,17 +258,17 @@ static void
 panfrost_get_blend_shaders(struct panfrost_batch *batch,
                            uint64_t *blend_shaders)
 {
-   unsigned shader_offset = 0;
-   struct panfrost_bo *shader_bo = NULL;
+   bool used = false;
 
    for (unsigned c = 0; c < batch->key.nr_cbufs; ++c) {
       if (batch->key.cbufs[c]) {
-         blend_shaders[c] =
-            panfrost_get_blend(batch, c, &shader_bo, &shader_offset);
+         blend_shaders[c] = panfrost_get_blend(batch, c);
+         if (blend_shaders[c])
+            used = true;
       }
    }
 
-   if (shader_bo)
+   if (used)
       perf_debug(batch->ctx, "Blend shader use");
 }
 
@@ -1243,7 +1227,7 @@ panfrost_upload_sample_positions_sysval(struct panfrost_batch *batch,
    unsigned samples = util_framebuffer_get_num_samples(&batch->key);
    uniform->du[0] =
       dev->sample_positions->ptr.gpu +
-      panfrost_sample_positions_offset(panfrost_sample_pattern(samples));
+      panfrost_sample_positions_offset(pan_sample_pattern(samples));
 }
 
 static void
@@ -1252,6 +1236,15 @@ panfrost_upload_multisampled_sysval(struct panfrost_batch *batch,
 {
    unsigned samples = util_framebuffer_get_num_samples(&batch->key);
    uniform->u[0] = (samples > 1) ? ~0 : 0;
+}
+
+static void
+panfrost_upload_blend_constants_sysval(struct panfrost_batch *batch,
+                                       struct sysval_uniform *uniform)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   for (unsigned i = 0; i < 4; i++)
+      uniform->f[i] = ctx->blend_color.color[i];
 }
 
 #if PAN_ARCH >= 6
@@ -1366,6 +1359,9 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          break;
       case PAN_SYSVAL_MULTISAMPLED:
          panfrost_upload_multisampled_sysval(batch, &uniforms[i]);
+         break;
+      case PAN_SYSVAL_BLEND_CONSTANTS:
+         panfrost_upload_blend_constants_sysval(batch, &uniforms[i]);
          break;
 #if PAN_ARCH >= 6
       case PAN_SYSVAL_RT_CONVERSION:
@@ -1482,7 +1478,7 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    /* Next up, attach UBOs. UBO count includes gaps but no sysval UBO */
    struct panfrost_compiled_shader *shader = ctx->prog[stage];
    unsigned ubo_count = shader->info.ubo_count - (sys_size ? 1 : 0);
-   unsigned sysval_ubo = sys_size ? ubo_count : ~0;
+   unsigned sysval_ubo = sys_size ? PAN_UBO_SYSVALS : ~0;
    unsigned desc_size;
    struct panfrost_ptr ubos = {0};
 
@@ -1503,18 +1499,36 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    assert(buffer_count);
    *buffer_count = ubo_count + (sys_size ? 1 : 0);
 
-   /* Upload sysval as a final UBO */
+   /* If sysvals are present, panfrost_nir_lower_sysvals assigns UBO1 to
+    * sysvals and remaps UBOs from the original shader up by one to make
+    * space. Applications use the original UBO indices, which we call
+    * "adjusted" UBOs here to distinguish them from the actual indices we are
+    * using on the hardware. */
+
+   /* Upload sysvals to UBO1 */
    if (sys_size)
-      panfrost_emit_ubo(ubos.cpu, ubo_count, transfer.gpu, sys_size);
+      panfrost_emit_ubo(ubos.cpu, PAN_UBO_SYSVALS, transfer.gpu, sys_size);
 
    /* The rest are honest-to-goodness UBOs */
-   unsigned user_ubo_mask = ss->info.ubo_mask & BITFIELD_MASK(ubo_count);
-   u_foreach_bit(ubo, user_ubo_mask & buf->enabled_mask) {
-      size_t usz = buf->cb[ubo].buffer_size;
+
+   unsigned user_ubo_mask =
+      ss->info.ubo_mask & BITFIELD_MASK(shader->info.ubo_count);
+
+   unsigned user_ubo_mask_adj = user_ubo_mask;
+   /* Shift remapped bits to convert to a mask of adjusted indices */
+   if (sys_size)
+      user_ubo_mask_adj = (user_ubo_mask & BITFIELD_MASK(PAN_UBO_SYSVALS)) |
+         ((user_ubo_mask & ~BITFIELD_MASK(PAN_UBO_SYSVALS + 1)) >> 1);
+
+   u_foreach_bit(ubo_adj, user_ubo_mask_adj & buf->enabled_mask) {
+      unsigned ubo = ubo_adj + (ubo_adj >= sysval_ubo ? 1 : 0);
+
+      size_t usz = buf->cb[ubo_adj].buffer_size;
       uint64_t address = 0;
 
       if (usz > 0) {
-         address = panfrost_map_constant_buffer_gpu(batch, stage, buf, ubo);
+         address =
+            panfrost_map_constant_buffer_gpu(batch, stage, buf, ubo_adj);
       }
 
       panfrost_emit_ubo(ubos.cpu, ubo, address, usz);
@@ -1571,7 +1585,9 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
       if (src.ubo == sysval_ubo) {
          mapped_ubo = sysvals;
       } else {
-         struct pipe_constant_buffer *cb = &buf->cb[src.ubo];
+         unsigned ubo_adj = src.ubo - (src.ubo > sysval_ubo ? 1 : 0);
+
+         struct pipe_constant_buffer *cb = &buf->cb[ubo_adj];
          assert(!cb->buffer && cb->user_buffer &&
                 "only user buffers use this path");
 
@@ -4198,6 +4214,7 @@ screen_destroy(struct pipe_screen *pscreen)
 {
    struct panfrost_device *dev = pan_device(pscreen);
    GENX(pan_fb_preload_cache_cleanup)(&dev->fb_preload_cache);
+   pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 }
 
 static void
@@ -4354,13 +4371,15 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    screen->vtbl.cleanup_batch = JOBX(cleanup_batch);
    screen->vtbl.submit_batch = submit_batch;
    screen->vtbl.get_blend_shader = GENX(pan_blend_get_shader_locked);
-   screen->vtbl.get_compiler_options = GENX(pan_shader_get_compiler_options);
-   screen->vtbl.compile_shader = GENX(pan_shader_compile);
+   screen->vtbl.compile_shader = pan_shader_compile;
    screen->vtbl.afbc_size = panfrost_afbc_size;
    screen->vtbl.afbc_pack = panfrost_afbc_pack;
    screen->vtbl.mtk_detile = panfrost_mtk_detile_compute;
    screen->vtbl.emit_write_timestamp = emit_write_timestamp;
    screen->vtbl.select_tile_size = GENX(pan_select_tile_size);
+
+   pan_blend_shader_cache_init(&dev->blend_shaders, panfrost_device_gpu_id(dev),
+                               &screen->mempools.bin.base);
 
    GENX(pan_fb_preload_cache_init)
    (&dev->fb_preload_cache, panfrost_device_gpu_id(dev), &dev->blend_shaders,
