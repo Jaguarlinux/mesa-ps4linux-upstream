@@ -18,9 +18,9 @@ Meson (`docs/meson.rst <https://docs.mesa3d.org/meson.html>`_):
 
 .. code-block:: sh
 
-  $ meson setup build
-  $ ninja -C build/
-  $ sudo ninja -C build/ install
+  $ chmod +x setup32.sh setup64.sh
+  $ ./setup64.sh
+  $ ./setup32.sh
 
 Support
 -------
