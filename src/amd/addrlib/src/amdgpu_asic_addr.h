@@ -62,10 +62,9 @@
 #define AMDGPU_HAWAII_RANGE     0x28, 0x3C //# 40 <= x < 60
 
 #define AMDGPU_SPECTRE_RANGE    0x01, 0x41 //#   1 <= x < 65
-#define AMDGPU_SPOOKY_RANGE     0x41, 0x61 //#  65 <= x < 129
-#define AMDGPU_STARSHA_RANGE    0x61, 0x71
-#define AMDGPU_STARSHP_RANGE    0x71, 0x81
-#define AMDGPU_KALINDI_RANGE    0x81, 0xA1 //# 129 <= x < 161
+#define AMDGPU_SPOOKY_RANGE     0x41, 0x61 //#  65 <= x < 97
+#define AMDGPU_STARSHA_RANGE    0x61, 0x71 //#  97 <= x < 113
+#define AMDGPU_STARSHP_RANGE    0x71, 0x81 //# 113 <= x < 129
 #define AMDGPU_GODAVARI_RANGE   0xA1, 0xFF //# 161 <= x < max
 
 #define AMDGPU_ICELAND_RANGE    0x01, 0x14 //#  1 <= x < 20
