@@ -123,7 +123,6 @@
 #define AMDGPU_RANGE_HELPER(val, min, max) ((val >= min) && (val < max))
 #define AMDGPU_IN_RANGE(val, ...)   AMDGPU_EXPAND_FIX(AMDGPU_RANGE_HELPER(val, __VA_ARGS__))
 
-
 // ASICREV_IS(eRevisionId, revisionName)
 #define ASICREV_IS(r, rn)              AMDGPU_IN_RANGE(r, AMDGPU_##rn##_RANGE)
 #define ASICREV_IS_TAHITI_P(r)         ASICREV_IS(r, TAHITI)
