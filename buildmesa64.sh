@@ -1,4 +1,7 @@
-meson setup build  \
+
+mkdir -pv build
+cd build
+meson setup  \
   --buildtype=release \
   -Dprefix=/usr \
   -Dplatforms=x11,wayland \
@@ -19,7 +22,6 @@ meson setup build  \
   -Dgallium-vdpau=enabled \
   -Dgallium-va=enabled \
   -Dglvnd=enabled \
-  -Dgbm=enabled \
   -Dlibunwind=enabled \
   -Dosmesa=true \
   -Dgallium-nine=true \
@@ -29,6 +31,7 @@ meson setup build  \
   -Dzstd=enabled \
   -Dshared-glapi=enabled \
   -Dmicrosoft-clc=disabled  \
-  -Dvalgrind=disabled && \
-meson configure build && \
-ninja -C build
+  -Dvalgrind=disabled  \
+  .. &&
+meson configure  && \
+ninja 

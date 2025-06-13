@@ -24,7 +24,6 @@ meson setup  \
   -Dgallium-vdpau=enabled \
   -Dgallium-va=enabled  \
   -Dglvnd=enabled  \
-  -Dgbm=enabled \
   -Dlibunwind=enabled  \
   -Dosmesa=true \
   -Dgallium-nine=true \
@@ -37,4 +36,4 @@ meson setup  \
   -Dvalgrind=disabled  \
    .. &&
 sed -i 's/\/usr\/lib\//\/usr\/lib32\//g' ./build.ninja &&
-BINDGEN_EXTRA_CLANG_ARGS="-m32" ninja
+BINDGEN_EXTRA_CLANG_ARGS="-m32" ninja -j4
