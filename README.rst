@@ -19,8 +19,8 @@ Meson (`docs/meson.rst <https://docs.mesa3d.org/meson.html>`_):
 .. code-block:: sh
 
   $ chmod +x setup32.sh setup64.sh
-  $ ./setup64.sh
-  $ ./setup32.sh
+  $ ./buildmesa64.sh
+  $ ./buildmesa32.sh
 
 Support
 -------
