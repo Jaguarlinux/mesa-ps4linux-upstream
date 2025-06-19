@@ -56,7 +56,7 @@ documentation (`docs/submittingpatches.rst
 
 Screenshots
 ------------
-### ![alt text](https://github.com/Ksawlii-Android-Repos/mesa-ps4patched/blob/test/mesa.png)
+### ![alt text](https://github.com/Jaguarlinux/mesa-ps4linux-upstream/blob/main/mesa.png)
 #BUGS:
 LLVM - everywhere, no matter what distro (vkmark broken) games should work fine tho :)
 #TESTED ON
