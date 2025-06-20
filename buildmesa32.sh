@@ -1,6 +1,6 @@
 #!/bin.sh
-mkdir -p build && \
 cd build
+rm -rfv *
 meson setup \
   --cross-file=lib32       \
   --buildtype=release \
