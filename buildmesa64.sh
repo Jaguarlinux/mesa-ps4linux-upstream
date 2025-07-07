@@ -55,4 +55,4 @@
 meson configure && \
 ninja   && \
 ninja install && \
-cp -rv ../docs -T /usr/share/doc/mesa-25.1.2
+cp -rv ../docs -T /usr/share/doc/mesa-25.1.5
