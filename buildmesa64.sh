@@ -53,6 +53,6 @@
     -Dglvnd=disabled && \
 
 meson configure && \
-ninja -j4  && \
+ninja   && \
 ninja install && \
-cp -rv ../docs -T /usr/share/doc/mesa-25.2.0
+cp -rv ../docs -T /usr/share/doc/mesa-25.1.2
