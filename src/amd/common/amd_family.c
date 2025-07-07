@@ -19,6 +19,8 @@ const char *ac_get_family_name(enum radeon_family family)
    CASE(OLAND);
    CASE(HAINAN);
    CASE(BONAIRE);
+   CASE(LIVERPOOL);
+   CASE(GLADIUS);
    CASE(KABINI);
    CASE(KAVERI);
    CASE(HAWAII);
@@ -104,6 +106,10 @@ const char *ac_get_llvm_processor_name(enum radeon_family family)
    case CHIP_HAINAN:
       return "hainan";
    case CHIP_BONAIRE:
+      return "bonaire";
+   case CHIP_LIVERPOOL:
+      return "bonaire";
+   case CHIP_GLADIUS:
       return "bonaire";
    case CHIP_KABINI:
       return "kabini";
