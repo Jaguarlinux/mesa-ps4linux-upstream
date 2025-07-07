@@ -669,6 +669,7 @@ zink_init_compute_caps(struct zink_screen *screen)
    caps->max_local_size =
       screen->info.props.limits.maxComputeSharedMemorySize;
 
+   caps->images_supported = true;
    caps->subgroup_sizes = screen->info.props11.subgroupSize;
    caps->max_mem_alloc_size = screen->clamp_video_mem;
    caps->max_global_size = screen->total_video_mem;
@@ -858,9 +859,8 @@ zink_init_screen_caps(struct zink_screen *screen)
        screen->info.have_EXT_shader_subgroup_ballot);
 
    caps->demote_to_helper_invocation =
-      (screen->spirv_version >= SPIRV_VERSION(1, 6) ||
-       screen->info.have_EXT_shader_demote_to_helper_invocation) &&
-      !screen->driver_compiler_workarounds.broken_demote;
+      screen->spirv_version >= SPIRV_VERSION(1, 6) ||
+      screen->info.have_EXT_shader_demote_to_helper_invocation;
 
    caps->sample_shading = screen->info.feats.features.sampleRateShading;
 
@@ -2222,7 +2222,12 @@ setup_renderdoc(struct zink_screen *screen)
    const char *capture_id = debug_get_option("ZINK_RENDERDOC", NULL);
    if (!capture_id)
       return;
-   void *renderdoc = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+#if DETECT_OS_ANDROID
+   const char *libstr = "libVkLayer_GLES_RenderDoc.so";
+#else
+   const char *libstr = "librenderdoc.so";
+#endif
+   void *renderdoc = dlopen(libstr, RTLD_NOW | RTLD_NOLOAD);
    /* not loaded */
    if (!renderdoc)
       return;
@@ -2933,16 +2938,6 @@ init_driver_workarounds(struct zink_screen *screen)
       break;
    }
 
-   /* these drivers do not implement demote properly */
-   switch (zink_driverid(screen)) {
-   case VK_DRIVER_ID_IMAGINATION_PROPRIETARY:
-      screen->driver_compiler_workarounds.broken_demote = true;
-      break;
-   default:
-      screen->driver_compiler_workarounds.broken_demote = false;
-      break;
-   }
-
    /* When robust contexts are advertised but robustImageAccess2 is not available */
    screen->driver_compiler_workarounds.lower_robustImageAccess2 =
       !screen->info.rb2_feats.robustImageAccess2 &&
@@ -3289,10 +3284,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (++instance_refcount == 1) {
       instance_info.loader_version = zink_get_loader_version(screen);
       instance = zink_create_instance(screen, &instance_info);
-      if (!instance)
-         goto fail;
-   } else {
-      assert(instance);
+   }
+   if (!instance) {
+      /* We don't decrement instance_refcount here. This prevents us from trying
+       * to create another instance on subsequent calls.
+       */
+      simple_mtx_unlock(&instance_lock);
+      goto fail;
    }
    screen->instance = instance;
    screen->instance_info = &instance_info;

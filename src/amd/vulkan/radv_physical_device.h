@@ -49,7 +49,6 @@ struct radv_physical_device_cache_key {
    uint32_t disable_sinking_load_input_fs : 1;
    uint32_t disable_trunc_coord : 1;
    uint32_t emulate_rt : 1;
-   uint32_t bvh8 : 1;
    uint32_t ge_wave32 : 1;
    uint32_t invariant_geom : 1;
    uint32_t no_fmask : 1;
@@ -99,6 +98,9 @@ struct radv_physical_device {
 
    /* Whether to enable FMASK compression for MSAA textures (GFX6-GFX10.3) */
    bool use_fmask;
+
+   /* Whether to enable HTILE compression for depth/stencil images. */
+   bool use_hiz;
 
    /* Whether to enable NGG. */
    bool use_ngg;
@@ -159,6 +161,7 @@ struct radv_physical_device {
 
    uint32_t gs_table_depth;
 
+   struct ac_hs_info hs;
    struct ac_task_info task_info;
 
    struct radv_binning_settings binning_settings;
@@ -257,8 +260,6 @@ radv_use_llvm_for_stage(const struct radv_physical_device *pdev, UNUSED gl_shade
 bool radv_enable_rt(const struct radv_physical_device *pdev);
 
 bool radv_emulate_rt(const struct radv_physical_device *pdev);
-
-bool radv_use_bvh8(const struct radv_physical_device *pdev);
 
 uint32_t radv_find_memory_index(const struct radv_physical_device *pdev, VkMemoryPropertyFlags flags);
 

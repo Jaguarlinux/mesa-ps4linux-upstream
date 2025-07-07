@@ -3,10 +3,10 @@
 
 use crate::ir::*;
 
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 pub struct ConstTracker {
-    map: FxHashMap<SSAValue, SrcRef>,
+    map: HashMap<SSAValue, SrcRef>,
 }
 
 /// A tracker struct for finding re-materializable constants
@@ -18,7 +18,7 @@ pub struct ConstTracker {
 impl ConstTracker {
     pub fn new() -> Self {
         ConstTracker {
-            map: Default::default(),
+            map: HashMap::new(),
         }
     }
 
@@ -43,7 +43,7 @@ impl ConstTracker {
         };
 
         if is_const {
-            self.map.insert(dst, op.src.src_ref.clone());
+            self.map.insert(dst, op.src.src_ref);
         }
     }
 

@@ -96,7 +96,6 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::HSet2(_)
         | Op::HSetP2(_)
         | Op::HMnMx2(_)
-        | Op::FSwz(_)
         | Op::FSwzAdd(_) => SideEffect::None,
 
         // Multi-function unit
@@ -194,14 +193,17 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         Op::Out(_) | Op::OutFinal(_) => SideEffect::Barrier,
 
         // Miscellaneous ops
-        Op::Bar(_)
-        | Op::TexDepBar(_)
-        | Op::CS2R(_)
-        | Op::Isberd(_)
-        | Op::ViLd(_)
-        | Op::Kill(_)
-        | Op::S2R(_) => SideEffect::Barrier,
-        Op::PixLd(_) | Op::Nop(_) | Op::Vote(_) => SideEffect::None,
+        Op::Bar(_) | Op::CS2R(_) | Op::Isberd(_) | Op::Kill(_) | Op::S2R(_) => {
+            SideEffect::Barrier
+        }
+        Op::PixLd(_) | Op::Vote(_) => SideEffect::None,
+        Op::Nop(OpNop { label, .. }) => {
+            if label.is_none() {
+                SideEffect::None
+            } else {
+                SideEffect::Barrier
+            }
+        }
 
         // Virtual ops
         Op::Annotate(_)
@@ -221,8 +223,8 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
 
 /// Try to guess how many cycles a variable latency instruction will take
 ///
-/// These values are based on the cycle estimates from ["Dissecting the NVidia
-/// Turing T4 GPU via Microbenchmarking"](https://arxiv.org/pdf/1903.07486).
+/// These values are based on the cycle estimates from "Dissecting the NVidia
+/// Turing T4 GPU via Microbenchmarking" https://arxiv.org/pdf/1903.07486
 /// Memory instructions were copied from L1 data cache latencies.
 /// For instructions not mentioned in the paper, I made up numbers.
 /// This could probably be improved.
@@ -287,10 +289,8 @@ pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
 
         // Miscellaneous ops
         Op::Bar(_)
-        | Op::TexDepBar(_)
         | Op::CS2R(_)
         | Op::Isberd(_)
-        | Op::ViLd(_)
         | Op::Kill(_)
         | Op::PixLd(_)
         | Op::S2R(_) => 16,
@@ -335,8 +335,7 @@ pub fn calc_statistics(g: &mut DepGraph) -> Vec<usize> {
             initial_ready_list.push(i);
         }
     }
-
-    initial_ready_list
+    return initial_ready_list;
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]

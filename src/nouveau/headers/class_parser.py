@@ -177,7 +177,7 @@ void
 P_DUMP_${nvcl}_MTHD_DATA(FILE *fp, uint16_t idx, uint32_t data,
                          const char *prefix)
 {
-    UNUSED uint32_t parsed;
+    uint32_t parsed;
     switch (idx) {
 %for mthd in methods:
   %if mthd.is_array and mthd.array_size == 0:

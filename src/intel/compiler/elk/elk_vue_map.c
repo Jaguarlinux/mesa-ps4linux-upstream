@@ -60,20 +60,17 @@ void
 elk_compute_vue_map(const struct intel_device_info *devinfo,
                     struct intel_vue_map *vue_map,
                     uint64_t slots_valid,
-                    enum intel_vue_layout layout,
+                    bool separate,
                     uint32_t pos_slots)
 {
-   assert(layout == INTEL_VUE_LAYOUT_FIXED ||
-          layout == INTEL_VUE_LAYOUT_SEPARATE);
-
    /* Keep using the packed/contiguous layout on old hardware - we only need
     * the SSO layout when using geometry/tessellation shaders or 32 FS input
     * varyings, which only exist on Gen >= 6.  It's also a bit more efficient.
     */
    if (devinfo->ver < 6)
-      layout = INTEL_VUE_LAYOUT_FIXED;
+      separate = false;
 
-   if (layout == INTEL_VUE_LAYOUT_SEPARATE) {
+   if (separate) {
       /* In SSO mode, we don't know whether the adjacent stage will
        * read/write gl_ClipDistance, which has a fixed slot location.
        * We have to assume the worst and reserve a slot for it, or else
@@ -87,7 +84,7 @@ elk_compute_vue_map(const struct intel_device_info *devinfo,
    }
 
    vue_map->slots_valid = slots_valid;
-   vue_map->layout = layout;
+   vue_map->separate = separate;
 
    /* gl_Layer, gl_ViewportIndex & gl_PrimitiveShadingRateEXT don't get their
     * own varying slots -- they are stored in the first VUE slot
@@ -201,7 +198,7 @@ elk_compute_vue_map(const struct intel_device_info *devinfo,
    uint64_t generics = slots_valid & ~BITFIELD64_MASK(VARYING_SLOT_VAR0);
    while (generics != 0) {
       const int varying = ffsll(generics) - 1;
-      if (layout == INTEL_VUE_LAYOUT_SEPARATE) {
+      if (separate) {
          slot = first_generic_slot + varying - VARYING_SLOT_VAR0;
       }
       assign_vue_slot(vue_map, varying, slot++);
@@ -227,7 +224,7 @@ elk_compute_tess_vue_map(struct intel_vue_map *vue_map,
    vue_map->slots_valid = vertex_slots;
 
    /* separate isn't really meaningful, but make sure it's initialized */
-   vue_map->layout = INTEL_VUE_LAYOUT_FIXED;
+   vue_map->separate = false;
 
    vertex_slots &= ~(VARYING_BIT_TESS_LEVEL_OUTER |
                      VARYING_BIT_TESS_LEVEL_INNER);
@@ -304,15 +301,12 @@ void
 elk_print_vue_map(FILE *fp, const struct intel_vue_map *vue_map,
                   gl_shader_stage stage)
 {
-   const char *layout_name =
-      vue_map->layout == INTEL_VUE_LAYOUT_FIXED ? "non-SSO" : "SSO";
-
    if (vue_map->num_per_vertex_slots > 0 || vue_map->num_per_patch_slots > 0) {
       fprintf(fp, "PUE map (%d slots, %d/patch, %d/vertex, %s)\n",
               vue_map->num_slots,
               vue_map->num_per_patch_slots,
               vue_map->num_per_vertex_slots,
-              layout_name);
+              vue_map->separate ? "SSO" : "non-SSO");
       for (int i = 0; i < vue_map->num_slots; i++) {
          if (vue_map->slot_to_varying[i] >= VARYING_SLOT_PATCH0) {
             fprintf(fp, "  [%d] VARYING_SLOT_PATCH%d\n", i,
@@ -323,7 +317,8 @@ elk_print_vue_map(FILE *fp, const struct intel_vue_map *vue_map,
          }
       }
    } else {
-      fprintf(fp, "VUE map (%d slots, %s)\n", vue_map->num_slots, layout_name);
+      fprintf(fp, "VUE map (%d slots, %s)\n",
+              vue_map->num_slots, vue_map->separate ? "SSO" : "non-SSO");
       for (int i = 0; i < vue_map->num_slots; i++) {
          fprintf(fp, "  [%d] %s\n", i,
                  varying_name(vue_map->slot_to_varying[i], stage));

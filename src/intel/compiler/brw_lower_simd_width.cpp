@@ -110,9 +110,6 @@ get_fpu_lowered_simd_width(const brw_shader *shader,
    if (inst->is_3src(compiler) && !devinfo->supports_simd16_3src)
       max_width = MIN2(max_width, inst->exec_size / reg_count);
 
-   if (has_bfloat_operands(inst))
-      max_width = MIN2(max_width, devinfo->ver < 20 ? 8 : 16);
-
    if (inst->opcode != BRW_OPCODE_MOV) {
       /* From the SKL PRM, Special Restrictions for Handling Mixed Mode
        * Float Operations:
@@ -423,8 +420,7 @@ brw_get_lowered_simd_width(const brw_shader *shader, const brw_inst *inst)
               swiz == BRW_SWIZZLE_XYXY || swiz == BRW_SWIZZLE_ZWZW ? 4 :
               get_fpu_lowered_simd_width(shader, inst));
    }
-   case SHADER_OPCODE_MOV_INDIRECT:
-   case FS_OPCODE_READ_ATTRIBUTE_PAYLOAD: {
+   case SHADER_OPCODE_MOV_INDIRECT: {
       /* From IVB and HSW PRMs:
        *
        * "2.When the destination requires two registers and the sources are

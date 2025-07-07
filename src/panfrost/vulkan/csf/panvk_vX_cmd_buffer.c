@@ -128,11 +128,11 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    struct cs_index flush_id = cs_scratch_reg32(b, 0);
 
    cs_move32_to(b, flush_id, 0);
-   cs_wait_slots(b, SB_ALL_MASK);
+   cs_wait_slots(b, SB_ALL_MASK, false);
    cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
                    MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
                    cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
-   cs_wait_slot(b, SB_ID(IMM_FLUSH));
+   cs_wait_slot(b, SB_ID(IMM_FLUSH), false);
 
    /* If we're in sync/trace more, we signal the debug object. */
    if (instance->debug_flags & (PANVK_DEBUG_SYNC | PANVK_DEBUG_TRACE)) {
@@ -144,11 +144,12 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
       cs_move32_to(b, one, 1);
       cs_load64_to(b, debug_sync_addr, cs_subqueue_ctx_reg(b),
                    offsetof(struct panvk_cs_subqueue_context, debug.syncobjs));
+      cs_wait_slot(b, SB_ID(LS), false);
       cs_add64(b, debug_sync_addr, debug_sync_addr,
                sizeof(struct panvk_cs_sync32) * subqueue);
       cs_load32_to(b, error, debug_sync_addr,
                    offsetof(struct panvk_cs_sync32, error));
-      cs_wait_slots(b, SB_ALL_MASK);
+      cs_wait_slots(b, SB_ALL_MASK, false);
       if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY)
          cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, one,
                        debug_sync_addr, cs_now());
@@ -161,7 +162,7 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
             /* Overwrite the sync error with the first error we encountered. */
             cs_store32(b, error, debug_sync_addr,
                        offsetof(struct panvk_cs_sync32, error));
-            cs_flush_stores(b);
+            cs_wait_slot(b, SB_ID(LS), false);
          }
       }
    }
@@ -443,36 +444,39 @@ normalize_dependency(VkPipelineStageFlags2 *src_stages,
                      VkAccessFlags2 *src_access, VkAccessFlags2 *dst_access,
                      uint32_t src_qfi, uint32_t dst_qfi)
 {
-   /* queue family acquire operation */
-   switch (src_qfi) {
-   case VK_QUEUE_FAMILY_EXTERNAL:
-      /* no execution dependency and no availability operation */
-      *src_stages = VK_PIPELINE_STAGE_2_NONE;
-      *src_access = VK_ACCESS_2_NONE;
-      break;
-   case VK_QUEUE_FAMILY_FOREIGN_EXT:
-      /* treat the foreign queue as the host */
-      *src_stages = VK_PIPELINE_STAGE_2_HOST_BIT;
-      *src_access = VK_ACCESS_2_HOST_WRITE_BIT;
-      break;
-   default:
-      break;
-   }
+   /* Perform queue family ownership transfer if src and dst are unequal. */
+   if (src_qfi != dst_qfi) {
+      /* queue family acquire operation */
+      switch (src_qfi) {
+      case VK_QUEUE_FAMILY_EXTERNAL:
+         /* no execution dependency and no availability operation */
+         *src_stages = VK_PIPELINE_STAGE_2_NONE;
+         *src_access = VK_ACCESS_2_NONE;
+         break;
+      case VK_QUEUE_FAMILY_FOREIGN_EXT:
+         /* treat the foreign queue as the host */
+         *src_stages = VK_PIPELINE_STAGE_2_HOST_BIT;
+         *src_access = VK_ACCESS_2_HOST_WRITE_BIT;
+         break;
+      default:
+         break;
+      }
 
-   /* queue family release operation */
-   switch (dst_qfi) {
-   case VK_QUEUE_FAMILY_EXTERNAL:
-      /* no execution dependency and no visibility operation */
-      *dst_stages = VK_PIPELINE_STAGE_2_NONE;
-      *dst_access = VK_ACCESS_2_NONE;
-      break;
-   case VK_QUEUE_FAMILY_FOREIGN_EXT:
-      /* treat the foreign queue as the host */
-      *dst_stages = VK_PIPELINE_STAGE_2_HOST_BIT;
-      *dst_access = VK_ACCESS_2_HOST_WRITE_BIT;
-      break;
-   default:
-      break;
+      /* queue family release operation */
+      switch (dst_qfi) {
+      case VK_QUEUE_FAMILY_EXTERNAL:
+         /* no execution dependency and no visibility operation */
+         *dst_stages = VK_PIPELINE_STAGE_2_NONE;
+         *dst_access = VK_ACCESS_2_NONE;
+         break;
+      case VK_QUEUE_FAMILY_FOREIGN_EXT:
+         /* treat the foreign queue as the host */
+         *dst_stages = VK_PIPELINE_STAGE_2_HOST_BIT;
+         *dst_access = VK_ACCESS_2_HOST_WRITE_BIT;
+         break;
+      default:
+         break;
+      }
    }
 
    *src_stages = vk_expand_src_stage_flags2(*src_stages);
@@ -565,7 +569,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
 
       if (deps.src[i].wait_sb_mask)
-         cs_wait_slots(b, deps.src[i].wait_sb_mask);
+         cs_wait_slots(b, deps.src[i].wait_sb_mask, false);
 
       struct panvk_cache_flush_info cache_flush = deps.src[i].cache_flush;
       if (cache_flush.l2 != MALI_CS_FLUSH_MODE_NONE ||
@@ -576,7 +580,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
          cs_move32_to(b, flush_id, 0);
          cs_flush_caches(b, cache_flush.l2, cache_flush.lsc, cache_flush.others,
                          flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
-         cs_wait_slot(b, SB_ID(IMM_FLUSH));
+         cs_wait_slot(b, SB_ID(IMM_FLUSH), false);
       }
 
       /* If no one waits on us, there's no point signaling the sync object. */
@@ -588,6 +592,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 
          cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
                       offsetof(struct panvk_cs_subqueue_context, syncobjs));
+         cs_wait_slot(b, SB_ID(LS), false);
          cs_add64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * i);
          cs_move64_to(b, add_val, 1);
          cs_sync64_add(b, false, MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
@@ -605,6 +610,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 
          cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
                       offsetof(struct panvk_cs_subqueue_context, syncobjs));
+         cs_wait_slot(b, SB_ID(LS), false);
          cs_add64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * j);
 
          cs_add64(b, wait_val, cs_progress_seqno_reg(b, j),
@@ -625,11 +631,12 @@ panvk_per_arch(cs_pick_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
 
    cs_load32_to(b, iter_sb, cs_subqueue_ctx_reg(b),
                 offsetof(struct panvk_cs_subqueue_context, iter_sb));
+   cs_wait_slot(b, SB_ID(LS), false);
 
    cs_match(b, iter_sb, cmp_scratch) {
 #define CASE(x)                                                                \
    cs_case(b, x) {                                                             \
-      cs_wait_slot(b, SB_ITER(x));                                             \
+      cs_wait_slot(b, SB_ITER(x), false);                                      \
       cs_select_sb_entries_for_async_ops(b, SB_ITER(x));                       \
    }
 
@@ -699,10 +706,15 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
          .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
          .alloc_buffer = alloc_cs_buffer,
          .cookie = cmdbuf,
-         .ls_sb_slot = SB_ID(LS),
       };
 
       if (instance->debug_flags & PANVK_DEBUG_CS) {
+         cmdbuf->state.cs[i].ls_tracker = (struct cs_load_store_tracker){
+            .sb_slot = SB_ID(LS),
+         };
+
+         conf.ls_tracker = &cmdbuf->state.cs[i].ls_tracker;
+
          cmdbuf->state.cs[i].reg_access.upd_ctx_stack = NULL;
          cmdbuf->state.cs[i].reg_access.base_perm = base_reg_perms[i];
          conf.reg_perm = cs_reg_perm;
@@ -716,6 +728,7 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
             .ctx_reg = cs_subqueue_ctx_reg(b),
             .tracebuf_addr_offset =
                offsetof(struct panvk_cs_subqueue_context, debug.tracebuf.cs),
+            .ls_sb_slot = SB_ID(LS),
          };
       }
    }

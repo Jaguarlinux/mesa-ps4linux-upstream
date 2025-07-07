@@ -421,6 +421,31 @@ hk_lower_multiview(nir_shader *nir)
    b.shader->info.outputs_written |= VARYING_BIT_LAYER;
 }
 
+/*
+ * KHR_maintenance5 requires that points rasterize with a default point size of
+ * 1.0, while our hardware requires an explicit point size write for this.
+ * Since topology may be dynamic, we insert an unconditional write if necessary.
+ */
+static bool
+hk_nir_insert_psiz_write(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   if (nir->info.outputs_written & VARYING_BIT_PSIZ) {
+      return nir_no_progress(impl);
+   }
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+
+   nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                    .write_mask = nir_component_mask(1),
+                    .io_semantics.location = VARYING_SLOT_PSIZ,
+                    .io_semantics.num_slots = 1, .src_type = nir_type_float32);
+
+   nir->info.outputs_written |= VARYING_BIT_PSIZ;
+   return nir_progress(true, b.impl, nir_metadata_control_flow);
+}
+
 static nir_def *
 query_custom_border(nir_builder *b, nir_tex_instr *tex)
 {
@@ -725,10 +750,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &soft_fault);
 
-   assert(nir->info.shared_size == 0);
+   if (!nir->info.shared_memory_explicit_layout) {
+      /* There may be garbage in shared_size, but it's the job of
+       * nir_lower_vars_to_explicit_types to allocate it. We have to reset to
+       * avoid overallocation.
+       */
+      nir->info.shared_size = 0;
 
-   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
-            shared_var_info);
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+               shared_var_info);
+   }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
             nir_address_format_32bit_offset);
 
@@ -808,6 +839,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
       cfg.preshader_register_count = shader->b.info.nr_preamble_gprs;
       cfg.sampler_state_register_count = agx_translate_sampler_state_count(
          shader->b.info.uses_txf ? 1 : 0, false);
+      cfg.texture_state_register_count = 0;
    }
 }
 
@@ -1041,7 +1073,7 @@ hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader)
    NIR_PASS(_, nir, nir_lower_point_size, 1.0f, 511.95f);
 
    /* TODO: Optimize out for monolithic? */
-   NIR_PASS(_, nir, nir_lower_default_point_size);
+   NIR_PASS(_, nir, hk_nir_insert_psiz_write);
 
    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
    NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
@@ -1515,6 +1547,7 @@ hk_fast_link(struct hk_device *dev, bool fragment, struct hk_shader *main,
          cfg.cf_binding_count = s->b.cf.nr_bindings;
          cfg.uniform_register_count = main->b.info.push_count;
          cfg.preshader_register_count = main->b.info.nr_preamble_gprs;
+         cfg.texture_state_register_count = 0;
          cfg.sampler_state_register_count =
             agx_translate_sampler_state_count(s->b.uses_txf ? 1 : 0, false);
       }

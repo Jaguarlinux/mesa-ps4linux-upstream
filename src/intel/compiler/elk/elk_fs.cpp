@@ -1424,9 +1424,7 @@ calculate_urb_setup(const struct intel_device_info *devinfo,
          struct intel_vue_map prev_stage_vue_map;
          elk_compute_vue_map(devinfo, &prev_stage_vue_map,
                              key->input_slots_valid,
-                             nir->info.separate_shader ?
-                             INTEL_VUE_LAYOUT_SEPARATE :
-                             INTEL_VUE_LAYOUT_FIXED, 1);
+                             nir->info.separate_shader, 1);
 
          int first_slot =
             elk_compute_first_urb_slot_required(inputs_read,

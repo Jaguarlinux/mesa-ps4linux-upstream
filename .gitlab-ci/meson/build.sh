@@ -151,7 +151,6 @@ meson_subprojects=(
   pest_generator
   pest_meta
   roxmltree
-  rustc-hash
   indexmap
   ${FORCE_FALLBACK_FOR:-}
 )
@@ -178,6 +177,7 @@ meson setup _build \
       -D libunwind=${UNWIND} \
       ${DRI_LOADERS} \
       ${GALLIUM_ST} \
+      -D gallium-opencl=disabled \
       -D gallium-drivers=${GALLIUM_DRIVERS:-[]} \
       -D vulkan-drivers=${VULKAN_DRIVERS:-[]} \
       -D video-codecs=all \

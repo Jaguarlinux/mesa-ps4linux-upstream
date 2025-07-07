@@ -326,8 +326,6 @@ util_bitcount(unsigned n)
 {
 #if defined(HAVE___BUILTIN_POPCOUNT)
    return __builtin_popcount(n);
-#elif __OPENCL_VERSION__
-   return popcount(n);
 #else
    /* K&R classic bitcount.
     *
@@ -368,8 +366,6 @@ util_bitcount64(uint64_t n)
 {
 #ifdef HAVE___BUILTIN_POPCOUNTLL
    return __builtin_popcountll(n);
-#elif __OPENCL_VERSION__
-   return popcount(n);
 #else
    return util_bitcount((unsigned)n) + util_bitcount((unsigned)(n >> 32));
 #endif

@@ -5,23 +5,22 @@ use crate::ir::*;
 use crate::union_find::UnionFind;
 
 use compiler::bitset::BitSet;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
-struct PhiTracker {
-    phi: Phi,
+struct Phi {
+    idx: u32,
     orig: SSAValue,
     dst: SSAValue,
-    srcs: FxHashMap<usize, SSAValue>,
+    srcs: HashMap<usize, SSAValue>,
 }
 
 struct DefTrackerBlock {
     pred: Vec<usize>,
     succ: Vec<usize>,
-    defs: RefCell<FxHashMap<SSAValue, SSAValue>>,
-    phis: RefCell<Vec<PhiTracker>>,
+    defs: RefCell<HashMap<SSAValue, SSAValue>>,
+    phis: RefCell<Vec<Phi>>,
 }
 
 fn get_ssa_or_phi(
@@ -62,13 +61,15 @@ fn get_ssa_or_phi(
                 // This is a loop back-edge, add a phi just in case.  We'll
                 // remove it later if it's not needed
                 all_same = false;
-            } else if let Some(&p_ssa) = blocks[p_idx].defs.borrow().get(&ssa) {
-                if *pred_ssa.get_or_insert(p_ssa) != p_ssa {
-                    all_same = false;
-                }
             } else {
-                worklist.push(Reverse(p_idx));
-                pushed_pred = true;
+                if let Some(&p_ssa) = blocks[p_idx].defs.borrow().get(&ssa) {
+                    if *pred_ssa.get_or_insert(p_ssa) != p_ssa {
+                        all_same = false;
+                    }
+                } else {
+                    worklist.push(Reverse(p_idx));
+                    pushed_pred = true;
+                }
             }
         }
 
@@ -82,13 +83,13 @@ fn get_ssa_or_phi(
         let b_ssa = if all_same {
             pred_ssa.expect("Undefined value")
         } else {
-            let phi = phi_alloc.alloc();
+            let phi_idx = phi_alloc.alloc();
             let phi_ssa = ssa_alloc.alloc(ssa.file());
-            let mut pt = PhiTracker {
-                phi,
+            let mut phi = Phi {
+                idx: phi_idx,
                 orig: ssa,
                 dst: phi_ssa,
-                srcs: Default::default(),
+                srcs: HashMap::new(),
             };
             for &p_idx in &b.pred {
                 if p_idx >= b_idx {
@@ -97,9 +98,9 @@ fn get_ssa_or_phi(
                 }
                 // Earlier iterations of the loop ensured this exists
                 let p_ssa = *blocks[p_idx].defs.borrow().get(&ssa).unwrap();
-                pt.srcs.insert(p_idx, p_ssa);
+                phi.srcs.insert(p_idx, p_ssa);
             }
-            blocks[b_idx].phis.borrow_mut().push(pt);
+            blocks[b_idx].phis.borrow_mut().push(phi);
             phi_ssa
         };
 
@@ -119,7 +120,7 @@ fn get_or_insert_phi_dsts(bb: &mut BasicBlock) -> &mut OpPhiDsts {
         0
     };
     match &mut bb.instrs[ip].op {
-        Op::PhiDsts(op) => op,
+        Op::PhiDsts(phi) => phi,
         _ => panic!("Expected to find the phi we just inserted"),
     }
 }
@@ -135,7 +136,7 @@ fn get_or_insert_phi_srcs(bb: &mut BasicBlock) -> &mut OpPhiSrcs {
         bb.instrs.len() - 1
     };
     match &mut bb.instrs[ip].op {
-        Op::PhiSrcs(op) => op,
+        Op::PhiSrcs(phi) => phi,
         _ => panic!("Expected to find the phi we just inserted"),
     }
 }
@@ -162,7 +163,7 @@ impl Function {
         // us to skip any SSA values which only have a single definition in
         // later passes.
         let mut has_mult_defs = false;
-        let mut num_defs = FxHashMap::default();
+        let mut num_defs = HashMap::new();
         for b in &self.blocks {
             for instr in &b.instrs {
                 instr.for_each_ssa_def(|ssa| {
@@ -193,7 +194,7 @@ impl Function {
             blocks.push(DefTrackerBlock {
                 pred: cfg.pred_indices(b_idx).to_vec(),
                 succ: cfg.succ_indices(b_idx).to_vec(),
-                defs: RefCell::new(Default::default()),
+                defs: RefCell::new(HashMap::new()),
                 phis: RefCell::new(Vec::new()),
             });
 
@@ -257,7 +258,7 @@ impl Function {
 
         // For loop back-edges, we inserted a phi whether we need one or not.
         // We want to eliminate any redundant phis.
-        let mut ssa_map = UnionFind::<SSAValue, FxBuildHasher>::new();
+        let mut ssa_map = UnionFind::new();
         if cfg.has_loop() {
             let mut to_do = true;
             while to_do {
@@ -316,8 +317,8 @@ impl Function {
             let b_phis = blocks[b_idx].phis.borrow();
             if !b_phis.is_empty() {
                 let phi_dst = get_or_insert_phi_dsts(bb);
-                for pt in b_phis.iter() {
-                    phi_dst.dsts.push(pt.phi, pt.dst.into());
+                for phi in b_phis.iter() {
+                    phi_dst.dsts.push(phi.idx, phi.dst.into());
                 }
             }
 
@@ -334,10 +335,10 @@ impl Function {
                 let s_phis = blocks[s_idx].phis.borrow();
                 if !s_phis.is_empty() {
                     let phi_src = get_or_insert_phi_srcs(bb);
-                    for pt in s_phis.iter() {
-                        let mut ssa = *pt.srcs.get(&b_idx).unwrap();
+                    for phi in s_phis.iter() {
+                        let mut ssa = *phi.srcs.get(&b_idx).unwrap();
                         ssa = ssa_map.find(ssa);
-                        phi_src.srcs.push(pt.phi, ssa.into());
+                        phi_src.srcs.push(phi.idx, ssa.into());
                     }
                 }
             }

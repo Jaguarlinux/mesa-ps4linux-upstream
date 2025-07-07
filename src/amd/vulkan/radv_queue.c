@@ -313,11 +313,10 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
    desc += 8;
 
    if (tess_rings_bo) {
-      radv_set_ring_buffer(pdev, tess_rings_bo, pdev->info.tess_offchip_ring_size, pdev->info.tess_factor_ring_size,
-                           false, false, true, 0, 0, &desc[0]);
+      radv_set_ring_buffer(pdev, tess_rings_bo, 0, pdev->hs.tess_factor_ring_size, false, false, true, 0, 0, &desc[0]);
 
-      radv_set_ring_buffer(pdev, tess_rings_bo, 0, pdev->info.tess_offchip_ring_size, false, false, true, 0, 0,
-                           &desc[4]);
+      radv_set_ring_buffer(pdev, tess_rings_bo, pdev->hs.tess_offchip_ring_offset, pdev->hs.tess_offchip_ring_size,
+                           false, false, true, 0, 0, &desc[4]);
    }
 
    desc += 8;
@@ -398,8 +397,8 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radeon_cmdbuf *cs,
    if (!tess_rings_bo)
       return;
 
-   tf_ring_size = pdev->info.tess_factor_ring_size / 4;
-   tf_va = radv_buffer_get_va(tess_rings_bo) + pdev->info.tess_offchip_ring_size;
+   tf_ring_size = pdev->hs.tess_factor_ring_size / 4;
+   tf_va = radv_buffer_get_va(tess_rings_bo);
 
    radv_cs_add_buffer(device->ws, cs, tess_rings_bo);
 
@@ -422,11 +421,11 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radeon_cmdbuf *cs,
          radeon_set_uconfig_reg(R_030944_VGT_TF_MEMORY_BASE_HI, S_030944_BASE_HI(tf_va >> 40));
       }
 
-      radeon_set_uconfig_reg(R_03093C_VGT_HS_OFFCHIP_PARAM, pdev->info.hs_offchip_param);
+      radeon_set_uconfig_reg(R_03093C_VGT_HS_OFFCHIP_PARAM, pdev->hs.hs_offchip_param);
    } else {
       radeon_set_config_reg(R_008988_VGT_TF_RING_SIZE, S_008988_SIZE(tf_ring_size));
       radeon_set_config_reg(R_0089B8_VGT_TF_MEMORY_BASE, tf_va >> 8);
-      radeon_set_config_reg(R_0089B0_VGT_HS_OFFCHIP_PARAM, pdev->info.hs_offchip_param);
+      radeon_set_config_reg(R_0089B0_VGT_HS_OFFCHIP_PARAM, pdev->hs.hs_offchip_param);
    }
 
    radeon_end();
@@ -493,12 +492,9 @@ radv_emit_graphics_scratch(struct radv_device *device, struct radeon_cmdbuf *cs,
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radeon_info *gpu_info = &pdev->info;
-   uint32_t tmpring_size;
 
    if (!scratch_bo)
       return;
-
-   ac_get_scratch_tmpring_size(gpu_info, waves, size_per_wave, &tmpring_size);
 
    radv_cs_add_buffer(device->ws, cs, scratch_bo);
 
@@ -507,12 +503,16 @@ radv_emit_graphics_scratch(struct radv_device *device, struct radeon_cmdbuf *cs,
    if (gpu_info->gfx_level >= GFX11) {
       uint64_t va = radv_buffer_get_va(scratch_bo);
 
+      /* WAVES is per SE for SPI_TMPRING_SIZE. */
+      waves /= gpu_info->max_se;
+
       radeon_set_context_reg_seq(R_0286E8_SPI_TMPRING_SIZE, 3);
-      radeon_emit(tmpring_size);
+      radeon_emit(S_0286E8_WAVES(waves) | S_0286E8_WAVESIZE(DIV_ROUND_UP(size_per_wave, 256)));
       radeon_emit(va >> 8);  /* SPI_GFX_SCRATCH_BASE_LO */
       radeon_emit(va >> 40); /* SPI_GFX_SCRATCH_BASE_HI */
    } else {
-      radeon_set_context_reg(R_0286E8_SPI_TMPRING_SIZE, tmpring_size);
+      radeon_set_context_reg(R_0286E8_SPI_TMPRING_SIZE,
+                             S_0286E8_WAVES(waves) | S_0286E8_WAVESIZE(DIV_ROUND_UP(size_per_wave, 1024)));
    }
 
    radeon_end();
@@ -524,7 +524,6 @@ radv_emit_compute_scratch(struct radv_device *device, struct radeon_cmdbuf *cs, 
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radeon_info *gpu_info = &pdev->info;
-   uint32_t tmpring_size;
    uint64_t scratch_va;
    uint32_t rsrc1;
 
@@ -538,8 +537,6 @@ radv_emit_compute_scratch(struct radv_device *device, struct radeon_cmdbuf *cs, 
       rsrc1 |= S_008F04_SWIZZLE_ENABLE_GFX11(1);
    else
       rsrc1 |= S_008F04_SWIZZLE_ENABLE_GFX6(1);
-
-   ac_get_scratch_tmpring_size(gpu_info, waves, size_per_wave, &tmpring_size);
 
    radv_cs_add_buffer(device->ws, cs, compute_scratch_bo);
 
@@ -557,7 +554,9 @@ radv_emit_compute_scratch(struct radv_device *device, struct radeon_cmdbuf *cs, 
    radeon_emit(scratch_va);
    radeon_emit(rsrc1);
 
-   radeon_set_sh_reg(R_00B860_COMPUTE_TMPRING_SIZE, tmpring_size);
+   radeon_set_sh_reg(R_00B860_COMPUTE_TMPRING_SIZE,
+                     S_00B860_WAVES(waves) |
+                        S_00B860_WAVESIZE(DIV_ROUND_UP(size_per_wave, gpu_info->gfx_level >= GFX11 ? 256 : 1024)));
 
    radeon_end();
 }
@@ -700,6 +699,14 @@ radv_emit_ge_rings(struct radv_device *device, struct radeon_cmdbuf *cs, struct 
                   S_0309AC_PAF_TEMPORAL(gfx12_store_high_temporal_stay_dirty) |
                   S_0309AC_PAB_TEMPORAL(gfx12_load_last_use_discard) | S_0309AC_SPEC_DATA_READ(gfx12_spec_read_auto) |
                   S_0309AC_FORCE_SE_SCOPE(1) | S_0309AC_PAB_NOFILL(1)); /* R_0309AC_GE_PRIM_RING_SIZE */
+
+      if (pdev->info.gfx_level == GFX12 && pdev->info.pfp_fw_version >= 2680) {
+         /* Mitigate the HiZ GPU hang by increasing a timeout when BOTTOM_OF_PIPE_TS is used as the
+          * workaround. This must be emitted when the gfx queue is idle.
+          */
+         radeon_emit(PKT3(PKT3_UPDATE_DB_SUMMARIZER_TIMEOUT, 0, 0));
+         radeon_emit(S_EF1_SUMM_CNTL_EVICT_TIMEOUT(0xfff));
+      }
    }
 
    radeon_end();
@@ -854,7 +861,8 @@ radv_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
    if (pdev->info.family >= CHIP_POLARIS10) {
       unsigned small_prim_filter_cntl = S_028830_SMALL_PRIM_FILTER_ENABLE(1) |
                                         /* Workaround for a hw line bug. */
-                                        S_028830_LINE_FILTER_DISABLE(pdev->info.family <= CHIP_POLARIS12);
+                                        S_028830_LINE_FILTER_DISABLE(pdev->info.family <= CHIP_POLARIS12) |
+                                        S_028830_SC_1XMSAA_COMPATIBLE_DISABLE(pdev->info.gfx_level >= GFX10);
 
       ac_pm4_set_reg(pm4, R_028830_PA_SU_SMALL_PRIM_FILTER_CNTL, small_prim_filter_cntl);
    }
@@ -1004,11 +1012,12 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
    }
 
    if (!queue->ring_info.tess_rings && needs->tess_rings) {
-      result = radv_bo_create(device, NULL, pdev->info.total_tess_ring_size, 256, RADEON_DOMAIN_VRAM, ring_bo_flags,
+      uint64_t tess_rings_size = pdev->hs.tess_offchip_ring_offset + pdev->hs.tess_offchip_ring_size;
+      result = radv_bo_create(device, NULL, tess_rings_size, 256, RADEON_DOMAIN_VRAM, ring_bo_flags,
                               RADV_BO_PRIORITY_SCRATCH, 0, true, &tess_rings_bo);
       if (result != VK_SUCCESS)
          goto fail;
-      radv_rmv_log_command_buffer_bo_create(device, tess_rings_bo, 0, 0, pdev->info.total_tess_ring_size);
+      radv_rmv_log_command_buffer_bo_create(device, tess_rings_bo, 0, 0, tess_rings_size);
    }
 
    if (!queue->ring_info.task_rings && needs->task_rings) {
@@ -1344,10 +1353,6 @@ radv_update_preambles(struct radv_queue_state *queue, struct radv_device *device
       needs.compute_scratch_size_per_wave
          ? MIN2(needs.compute_scratch_waves, UINT32_MAX / needs.compute_scratch_size_per_wave)
          : 0;
-
-   /* Compute the optimal scratch wavesize. */
-   needs.scratch_size_per_wave = ac_compute_scratch_wavesize(&pdev->info, needs.scratch_size_per_wave);
-   needs.compute_scratch_size_per_wave = ac_compute_scratch_wavesize(&pdev->info, needs.compute_scratch_size_per_wave);
 
    if (pdev->info.gfx_level >= GFX11 && queue->qf == RADV_QUEUE_GENERAL) {
       needs.ge_rings = true;

@@ -1881,49 +1881,33 @@ static void
 bi_emit_derivative(bi_builder *b, bi_index dst, nir_intrinsic_instr *instr,
                    unsigned axis, bool coarse)
 {
-   assert(axis == 1 || axis == 2);
-
    bi_index left, right;
    bi_index s0 = bi_src_index(&instr->src[0]);
-
    unsigned sz = instr->def.bit_size;
 
    /* If all uses are fabs, the sign of the derivative doesn't matter. This is
     * inherently based on fine derivatives so we can't do it for coarse.
     */
-   if (coarse) {
-      left = bi_clper(b, s0, bi_imm_u8(0), BI_LANE_OP_NONE);
-      right = bi_clper(b, s0, bi_imm_u8(axis), BI_LANE_OP_NONE);
-   } else {
+   if (nir_def_all_uses_ignore_sign_bit(&instr->def) && !coarse) {
       left = s0;
       right = bi_clper(b, s0, bi_imm_u8(axis), BI_LANE_OP_XOR);
-   }
-
-   if (!coarse && !nir_def_all_uses_ignore_sign_bit(&instr->def)) {
-      /* If the user cares about the sign, we need to take into account the fact
-       * left/right (or top/bottom) might be inverted. Instead of using a couple
-       * CSEL, we just invert the sign bit with
-       *
-       *    sign_bit = XOR(sign_bit, axis_bit(lane_id)).
-       */
-      bi_index res = bi_fadd(b, sz, right, bi_neg(left));
-      bi_index lane = bi_fau(BIR_FAU_LANE_ID, false);
-      bi_index lane_shift = bi_imm_u8(sz - ffs(axis));
-
-      /* Clear the low bit before the shift if this is the Y-axis we want.
-       * We skip it on the X-axis, because the lshift-by-31 will get us a
-       * clean mask. */
-      if (axis == 2)
-         lane = bi_lshift_and_i32(b, lane, bi_imm_u32(2), bi_imm_u8(0));
-
-      if (sz == 16)
-         lane = bi_half(lane, false);
-
-      /* And here comes the final XOR on the sign bit. */
-      bi_lshift_xor_to(b, sz, dst, lane, res, lane_shift);
    } else {
-      bi_fadd_to(b, sz, dst, right, bi_neg(left));
+      bi_index lane1, lane2;
+      if (coarse) {
+         lane1 = bi_imm_u32(0);
+         lane2 = bi_imm_u32(axis);
+      } else {
+         lane1 = bi_lshift_and_i32(b, bi_fau(BIR_FAU_LANE_ID, false),
+                                   bi_imm_u32(0x3 & ~axis), bi_imm_u8(0));
+
+         lane2 = bi_iadd_u32(b, lane1, bi_imm_u32(axis), false);
+      }
+
+      left = bi_clper(b, s0, bi_byte(lane1, 0), BI_LANE_OP_NONE);
+      right = bi_clper(b, s0, bi_byte(lane2, 0), BI_LANE_OP_NONE);
    }
+
+   bi_fadd_to(b, sz, dst, right, bi_neg(left));
 }
 
 static enum bi_subgroup
@@ -2034,7 +2018,7 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
           * scheduler from reordering memory operations around the barrier.
           * Avail and vis are trivially established.
           */
-         bi_memory_barrier(b);
+         bi_nop(b)->scheduling_barrier = true;
          break;
 
       case SCOPE_WORKGROUP:
@@ -2134,11 +2118,11 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       bi_emit_ld_tile(b, instr);
       break;
 
-   case nir_intrinsic_demote_if:
+   case nir_intrinsic_terminate_if:
       bi_discard_b32(b, bi_src_index(&instr->src[0]));
       break;
 
-   case nir_intrinsic_demote:
+   case nir_intrinsic_terminate:
       bi_discard_f32(b, bi_zero(), bi_zero(), BI_CMPF_EQ);
       break;
 
@@ -2247,9 +2231,9 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       break;
 
    case nir_intrinsic_shader_clock:
-      assert(nir_intrinsic_memory_scope(instr) == SCOPE_SUBGROUP);
       bi_ld_gclk_u64_to(b, dst, BI_SOURCE_CYCLE_COUNTER);
       bi_split_def(b, &instr->def);
+      b->shader->info.has_ld_gclk_instr = true;
       break;
 
    case nir_intrinsic_ddx:
@@ -2909,11 +2893,14 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
       bi_index idx = bi_src_index(&instr->src[0].src);
       unsigned factor = src_sz / 8;
       unsigned chan[4] = {0};
+      bi_index idxs[4];
 
-      for (unsigned i = 0; i < comps; ++i)
+      for (unsigned i = 0; i < comps; ++i) {
+         idxs[i] = idx;
          chan[i] = instr->src[0].swizzle[i] * factor;
+      }
 
-      bi_make_vec_to(b, dst, &idx, chan, comps, 8);
+      bi_make_vec_to(b, dst, idxs, chan, comps, 8);
       return;
    }
 
@@ -5399,12 +5386,11 @@ bi_optimize_nir(nir_shader *nir, unsigned gpu_id, bool is_blend)
 
    /* We might lower attribute, varying, and image indirects. Use the
     * gathered info to skip the extra analysis in the happy path. */
-   bool any_indirects =
-      nir->info.inputs_read_indirectly || nir->info.outputs_read_indirectly ||
-      nir->info.outputs_written_indirectly ||
-      nir->info.patch_inputs_read_indirectly ||
-      nir->info.patch_outputs_read_indirectly ||
-      nir->info.patch_outputs_written_indirectly || nir->info.images_used[0];
+   bool any_indirects = nir->info.inputs_read_indirectly ||
+                        nir->info.outputs_accessed_indirectly ||
+                        nir->info.patch_inputs_read_indirectly ||
+                        nir->info.patch_outputs_accessed_indirectly ||
+                        nir->info.images_used[0];
 
    if (any_indirects) {
       nir_divergence_analysis(nir);
@@ -5732,18 +5718,6 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
 {
    MESA_TRACE_FUNC();
 
-   /* The DISCARD instruction just flags the thread as discarded, but the
-    * actual termination only happens when all threads in the quad are
-    * discarded, or when an instruction with a .discard flow is
-    * encountered (Valhall) or when a clause with a .terminate_discarded_thread
-    * is reached (Bifrost).
-    * We could do without nir_lower_terminate_to_demote(), but this allows
-    * for extra dead-code elimination when code sections are detected as
-    * being unused after a termination is crossed.
-    */
-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      NIR_PASS(_, nir, nir_lower_terminate_to_demote);
-
    /* Ensure that halt are translated to returns and get ride of them */
    NIR_PASS(_, nir, nir_shader_instructions_pass, bi_lower_halt_to_return,
             nir_metadata_all, NULL);
@@ -5837,11 +5811,7 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
    NIR_PASS(_, nir, nir_lower_ssbo, &ssbo_opts);
 
    NIR_PASS(_, nir, pan_lower_sample_pos);
-
-   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
-      NIR_PASS(_, nir, pan_lower_helper_invocation);
-   }
+   NIR_PASS(_, nir, pan_lower_helper_invocation);
 
    /*
     * Lower subgroups ops before lowering int64: nir_lower_int64 doesn't know
@@ -6241,6 +6211,7 @@ bi_compile_variant(nir_shader *nir,
 
    info->ubo_mask |= ctx->ubo_mask;
    info->tls_size = MAX2(info->tls_size, ctx->info.tls_size);
+   info->has_shader_clk_instr = ctx->info.has_ld_gclk_instr;
 
    if (idvs == BI_IDVS_VARYING) {
       info->vs.secondary_enable = (binary->size > offset);
@@ -6329,10 +6300,12 @@ bifrost_compile_shader_nir(nir_shader *nir,
     */
    NIR_PASS(_, nir, pan_nir_lower_zs_store);
 
-   info->vs.idvs = bi_should_idvs(nir, inputs);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      info->vs.idvs = bi_should_idvs(nir, inputs);
 
-   if (info->vs.idvs)
-      NIR_PASS(_, nir, bifrost_nir_lower_shader_output);
+      if (info->vs.idvs)
+         NIR_PASS(_, nir, bifrost_nir_lower_shader_output);
+   }
 
    bi_optimize_nir(nir, inputs->gpu_id, inputs->is_blend);
 
@@ -6340,12 +6313,14 @@ bifrost_compile_shader_nir(nir_shader *nir,
 
    pan_nir_collect_varyings(nir, info, PAN_MEDIUMP_VARY_32BIT);
 
-   /* On Avalon, IDVS is only in one binary */
-   if (info->vs.idvs && pan_arch(inputs->gpu_id) >= 12) {
-      bi_compile_variant(nir, inputs, binary, info, BI_IDVS_ALL);
-   } else if (info->vs.idvs) {
-      bi_compile_variant(nir, inputs, binary, info, BI_IDVS_POSITION);
-      bi_compile_variant(nir, inputs, binary, info, BI_IDVS_VARYING);
+   if (nir->info.stage == MESA_SHADER_VERTEX && info->vs.idvs) {
+      /* On Avalon, IDVS is only in one binary */
+      if (pan_arch(inputs->gpu_id) >= 12)
+         bi_compile_variant(nir, inputs, binary, info, BI_IDVS_ALL);
+      else {
+         bi_compile_variant(nir, inputs, binary, info, BI_IDVS_POSITION);
+         bi_compile_variant(nir, inputs, binary, info, BI_IDVS_VARYING);
+      }
    } else {
       bi_compile_variant(nir, inputs, binary, info, BI_IDVS_NONE);
    }

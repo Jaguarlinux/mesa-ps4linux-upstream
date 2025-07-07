@@ -28,16 +28,23 @@ struct lower_gs_state {
    int static_count[MAX_VERTEX_STREAMS];
    nir_variable *outputs[NUM_TOTAL_VARYING_SLOTS][MAX_PRIM_OUT_SIZE];
 
+   /* Per-input primitive stride of the output index buffer */
+   unsigned max_indices;
+
+   /* The count buffer contains `count_stride_el` 32-bit words in a row for each
+    * input primitive, for `input_primitives * count_stride_el * 4` total bytes.
+    */
+   unsigned count_stride_el;
+
    /* The index of each counter in the count buffer, or -1 if it's not in the
     * count buffer.
     *
-    * Invariant: info->count_words == sum(count_index[i] >= 0).
+    * Invariant: count_stride_el == sum(count_index[i][j] >= 0).
     */
    int count_index[MAX_VERTEX_STREAMS];
 
    bool rasterizer_discard;
-
-   struct agx_gs_info *info;
+   bool prefix_summing;
 };
 
 /* Helpers for loading from the geometry state buffer */
@@ -89,13 +96,9 @@ add_counter(nir_builder *b, nir_def *counter, nir_def *increment)
 }
 
 /* Helpers for lowering I/O to variables */
-struct lower_output_to_var_state {
-   nir_variable *outputs[NUM_TOTAL_VARYING_SLOTS];
-};
-
 static void
 lower_store_to_var(nir_builder *b, nir_intrinsic_instr *intr,
-                   struct lower_output_to_var_state *state)
+                   struct agx_lower_output_to_var_state *state)
 {
    b->cursor = nir_instr_remove(&intr->instr);
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
@@ -124,8 +127,8 @@ lower_store_to_var(nir_builder *b, nir_intrinsic_instr *intr,
    nir_store_var(b, var, value, BITFIELD_BIT(component));
 }
 
-static bool
-lower_output_to_var(nir_builder *b, nir_instr *instr, void *data)
+bool
+agx_lower_output_to_var(nir_builder *b, nir_instr *instr, void *data)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
@@ -224,7 +227,7 @@ lower_gs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *_)
    if (intr->intrinsic != nir_intrinsic_load_per_vertex_input)
       return false;
 
-   b->cursor = nir_before_instr(&intr->instr);
+   b->cursor = nir_instr_remove(&intr->instr);
 
    /* Calculate the vertex ID we're pulling, based on the topology class */
    nir_def *vert_in_prim = intr->src[0].ssa;
@@ -236,7 +239,7 @@ lower_gs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *_)
       nir_iadd(b, nir_imul(b, nir_load_instance_id(b), verts), vertex);
 
    nir_def *val = agx_load_per_vertex_input(b, intr, unrolled);
-   nir_def_replace(&intr->def, val);
+   nir_def_rewrite_uses(&intr->def, val);
    return true;
 }
 
@@ -253,9 +256,10 @@ calc_unrolled_id(nir_builder *b)
 }
 
 static unsigned
-output_vertex_id_pot_stride(const nir_shader *gs)
+output_vertex_id_stride(nir_shader *gs)
 {
-   return util_next_power_of_two(gs->info.gs.vertices_out);
+   /* round up to power of two for cheap multiply/division */
+   return util_next_power_of_two(MAX2(gs->info.gs.vertices_out, 1));
 }
 
 /* Variant of calc_unrolled_id that uses a power-of-two stride for indices. This
@@ -270,8 +274,7 @@ output_vertex_id_pot_stride(const nir_shader *gs)
 static nir_def *
 calc_unrolled_index_id(nir_builder *b)
 {
-   /* We know this is a dynamic topology and hence indexed */
-   unsigned vertex_stride = output_vertex_id_pot_stride(b->shader);
+   unsigned vertex_stride = output_vertex_id_stride(b->shader);
    nir_def *primitives_log2 = load_geometry_param(b, primitives_log2);
 
    nir_def *instance = nir_ishl(b, load_instance_id(b), primitives_log2);
@@ -289,7 +292,7 @@ load_xfb_count_address(nir_builder *b, struct lower_gs_state *state,
       return NULL;
 
    nir_def *prim_offset_el =
-      nir_imul_imm(b, unrolled_id, state->info->count_words);
+      nir_imul_imm(b, unrolled_id, state->count_stride_el);
 
    nir_def *offset_el = nir_iadd_imm(b, prim_offset_el, index);
 
@@ -303,14 +306,14 @@ write_xfb_counts(nir_builder *b, nir_intrinsic_instr *intr,
 {
    /* Store each required counter */
    nir_def *id =
-      state->info->prefix_sum ? calc_unrolled_id(b) : nir_imm_int(b, 0);
+      state->prefix_summing ? calc_unrolled_id(b) : nir_imm_int(b, 0);
 
    nir_def *addr =
       load_xfb_count_address(b, state, id, nir_intrinsic_stream_id(intr));
    if (!addr)
       return;
 
-   if (state->info->prefix_sum) {
+   if (state->prefix_summing) {
       nir_store_global(b, addr, 4, intr->src[2].ssa, nir_component_mask(1));
    } else {
       nir_global_atomic(b, 32, addr, intr->src[2].ssa,
@@ -356,7 +359,8 @@ lower_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    else
       return false;
 
-   nir_def_replace(&intr->def, id);
+   b->cursor = nir_instr_remove(&intr->instr);
+   nir_def_rewrite_uses(&intr->def, id);
    return true;
 }
 
@@ -392,10 +396,9 @@ agx_nir_create_geometry_count_shader(nir_shader *gs,
 }
 
 struct lower_gs_rast_state {
-   nir_def *raw_instance_id;
    nir_def *instance_id, *primitive_id, *output_id;
-   struct lower_output_to_var_state outputs;
-   struct lower_output_to_var_state selected;
+   struct agx_lower_output_to_var_state outputs;
+   struct agx_lower_output_to_var_state selected;
 };
 
 static void
@@ -437,15 +440,11 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
 
    case nir_intrinsic_load_primitive_id:
-      nir_def_replace(&intr->def, state->primitive_id);
+      nir_def_rewrite_uses(&intr->def, state->primitive_id);
       return true;
 
    case nir_intrinsic_load_instance_id:
-      /* Don't lower recursively */
-      if (state->raw_instance_id == &intr->def)
-         return false;
-
-      nir_def_replace(&intr->def, state->instance_id);
+      nir_def_rewrite_uses(&intr->def, state->instance_id);
       return true;
 
    case nir_intrinsic_load_flat_mask:
@@ -585,11 +584,12 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
  * shades each rasterized output vertex in parallel.
  */
 static nir_shader *
-agx_nir_create_gs_rast_shader(const nir_shader *gs, bool *side_effects_for_rast,
-                              const struct lower_gs_state *state)
+agx_nir_create_gs_rast_shader(const nir_shader *gs, bool *side_effects_for_rast)
 {
    /* Don't muck up the original shader */
    nir_shader *shader = nir_shader_clone(NULL, gs);
+
+   unsigned max_verts = output_vertex_id_stride(shader);
 
    /* Turn into a vertex shader run only for rasterization. Transform feedback
     * was handled in the prepass.
@@ -615,45 +615,22 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, bool *side_effects_for_rast,
    if (shader->info.gs.output_primitive != MESA_PRIM_POINTS)
       shader->info.outputs_written &= ~VARYING_BIT_PSIZ;
 
-   nir_def *raw_vertex_id = nir_load_vertex_id(b);
-   struct lower_gs_rast_state rs = {.raw_instance_id = nir_load_instance_id(b)};
+   /* See calc_unrolled_index_id */
+   nir_def *raw_id = nir_load_vertex_id(b);
+   nir_def *output_id = nir_umod_imm(b, raw_id, max_verts);
+   nir_def *unrolled = nir_udiv_imm(b, raw_id, max_verts);
 
-   switch (state->info->shape) {
-   case AGX_GS_SHAPE_DYNAMIC_INDEXED: {
-      unsigned stride = output_vertex_id_pot_stride(gs);
+   nir_def *primitives_log2 = load_geometry_param(b, primitives_log2);
+   nir_def *instance_id = nir_ushr(b, unrolled, primitives_log2);
+   nir_def *primitive_id = nir_iand(
+      b, unrolled,
+      nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), primitives_log2), -1));
 
-      nir_def *unrolled = nir_udiv_imm(b, raw_vertex_id, stride);
-      nir_def *primitives_log2 = load_geometry_param(b, primitives_log2);
-      nir_def *bit = nir_ishl(b, nir_imm_int(b, 1), primitives_log2);
-
-      rs.output_id = nir_umod_imm(b, raw_vertex_id, stride);
-      rs.instance_id = nir_ushr(b, unrolled, primitives_log2);
-      rs.primitive_id = nir_iand(b, unrolled, nir_iadd_imm(b, bit, -1));
-      break;
-   }
-
-   case AGX_GS_SHAPE_STATIC_INDEXED:
-   case AGX_GS_SHAPE_STATIC_PER_PRIM: {
-      nir_def *stride = load_geometry_param(b, gs_grid[0]);
-
-      rs.output_id = raw_vertex_id;
-      rs.instance_id = nir_udiv(b, rs.raw_instance_id, stride);
-      rs.primitive_id = nir_umod(b, rs.raw_instance_id, stride);
-      break;
-   }
-
-   case AGX_GS_SHAPE_STATIC_PER_INSTANCE: {
-      unsigned stride = MAX2(state->info->max_indices, 1);
-
-      rs.output_id = nir_umod_imm(b, raw_vertex_id, stride);
-      rs.primitive_id = nir_udiv_imm(b, raw_vertex_id, stride);
-      rs.instance_id = rs.raw_instance_id;
-      break;
-   }
-
-   default:
-      unreachable("invalid shape");
-   }
+   struct lower_gs_rast_state rast_state = {
+      .instance_id = instance_id,
+      .primitive_id = primitive_id,
+      .output_id = output_id,
+   };
 
    u_foreach_bit64(slot, shader->info.outputs_written) {
       const char *slot_name =
@@ -664,24 +641,24 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, bool *side_effects_for_rast,
                     (slot == VARYING_SLOT_VIEWPORT);
       unsigned comps = scalar ? 1 : 4;
 
-      rs.outputs.outputs[slot] = nir_variable_create(
+      rast_state.outputs.outputs[slot] = nir_variable_create(
          shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, comps),
          ralloc_asprintf(shader, "%s-temp", slot_name));
 
-      rs.selected.outputs[slot] = nir_variable_create(
+      rast_state.selected.outputs[slot] = nir_variable_create(
          shader, nir_var_shader_temp, glsl_vector_type(GLSL_TYPE_UINT, comps),
          ralloc_asprintf(shader, "%s-selected", slot_name));
    }
 
    nir_shader_intrinsics_pass(shader, lower_to_gs_rast,
-                              nir_metadata_control_flow, &rs);
+                              nir_metadata_control_flow, &rast_state);
 
    b->cursor = nir_after_impl(b->impl);
 
    /* Forward each selected output to the rasterizer */
    u_foreach_bit64(slot, shader->info.outputs_written) {
-      assert(rs.selected.outputs[slot] != NULL);
-      nir_def *value = nir_load_var(b, rs.selected.outputs[slot]);
+      assert(rast_state.selected.outputs[slot] != NULL);
+      nir_def *value = nir_load_var(b, rast_state.selected.outputs[slot]);
 
       /* We set NIR_COMPACT_ARRAYS so clip/cull distance needs to come all in
        * DIST0. Undo the offset if we need to.
@@ -698,9 +675,21 @@ agx_nir_create_gs_rast_shader(const nir_shader *gs, bool *side_effects_for_rast,
                        .src_type = nir_type_uint32);
    }
 
-   /* The geometry shader might not write point size - ensure it does. */
-   if (gs->info.gs.output_primitive == MESA_PRIM_POINTS) {
-      nir_lower_default_point_size(shader);
+   /* It is legal to omit the point size write from the geometry shader when
+    * drawing points. In this case, the point size is implicitly 1.0. To
+    * implement, insert a synthetic `gl_PointSize = 1.0` write into the GS copy
+    * shader, if the GS does not export a point size while drawing points.
+    */
+   bool is_points = gs->info.gs.output_primitive == MESA_PRIM_POINTS;
+
+   if (!(shader->info.outputs_written & VARYING_BIT_PSIZ) && is_points) {
+      nir_store_output(b, nir_imm_float(b, 1.0), nir_imm_int(b, 0),
+                       .io_semantics.location = VARYING_SLOT_PSIZ,
+                       .io_semantics.num_slots = 1,
+                       .write_mask = nir_component_mask(1),
+                       .src_type = nir_type_float32);
+
+      shader->info.outputs_written |= VARYING_BIT_PSIZ;
    }
 
    nir_opt_idiv_const(shader, 16);
@@ -721,10 +710,13 @@ previous_xfb_primitives(nir_builder *b, struct lower_gs_state *state,
        * we can calculate the base.
        */
       return nir_imul_imm(b, unrolled_id, static_count);
-   } else if (state->info->prefix_sum) {
-      /* If we prefix summed, load from the sum buffer. Note that the sums are
-       * inclusive, so index 0 is nonzero. This requires a little fixup here. We
-       * use a saturating unsigned subtraction so we don't read out-of-bounds.
+   } else if (state->prefix_summing) {
+      /* Otherwise, we need to load from the prefix sum buffer. Note that the
+       * sums are inclusive, so index 0 is nonzero. This requires a little
+       * fixup here. We use a saturating unsigned subtraction so we don't read
+       * out-of-bounds for zero.
+       *
+       * TODO: Optimize this.
        */
       nir_def *prim_minus_1 = nir_usub_sat(b, unrolled_id, nir_imm_int(b, 1));
       nir_def *addr = load_xfb_count_address(b, state, prim_minus_1, stream);
@@ -759,9 +751,15 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr,
    libagx_end_primitive(
       b, load_geometry_param(b, output_index_buffer), intr->src[0].ssa,
       intr->src[1].ssa, intr->src[2].ssa,
-      nir_imul_imm(b, calc_unrolled_id(b), state->info->max_indices),
+      nir_imul_imm(b, calc_unrolled_id(b), state->max_indices),
       calc_unrolled_index_id(b),
       nir_imm_bool(b, b->shader->info.gs.output_primitive != MESA_PRIM_POINTS));
+}
+
+static unsigned
+verts_in_output_prim(nir_shader *gs)
+{
+   return mesa_vertices_per_prim(gs->info.gs.output_primitive);
 }
 
 static void
@@ -769,7 +767,7 @@ write_xfb(nir_builder *b, struct lower_gs_state *state, unsigned stream,
           nir_def *index_in_strip, nir_def *prim_id_in_invocation)
 {
    struct nir_xfb_info *xfb = b->shader->xfb_info;
-   unsigned verts = nir_verts_in_output_prim(b->shader);
+   unsigned verts = verts_in_output_prim(b->shader);
 
    /* Get the index of this primitive in the XFB buffer. That is, the base for
     * this invocation for the stream plus the offset within this invocation.
@@ -851,7 +849,7 @@ lower_emit_vertex_xfb(nir_builder *b, nir_intrinsic_instr *intr,
     * we're writing strips, that means we output XFB for each vertex after the
     * first complete primitive is formed.
     */
-   unsigned first_prim = nir_verts_in_output_prim(b->shader) - 1;
+   unsigned first_prim = verts_in_output_prim(b->shader) - 1;
    nir_def *index_in_strip = intr->src[1].ssa;
 
    nir_push_if(b, nir_uge_imm(b, index_in_strip, first_prim));
@@ -876,11 +874,11 @@ lower_emit_vertex_xfb(nir_builder *b, nir_intrinsic_instr *intr,
     * vertex.
     */
    u_foreach_bit64(slot, b->shader->info.outputs_written) {
-      /* Note: if we're outputting points, nir_verts_in_output_prim will be 1,
-       * so this loop will not execute. This is intended: points are
-       * self-contained primitives and do not need these copies.
+      /* Note: if we're outputting points, verts_in_output_prim will be 1, so
+       * this loop will not execute. This is intended: points are self-contained
+       * primitives and do not need these copies.
        */
-      for (int v = nir_verts_in_output_prim(b->shader) - 1; v >= 1; --v) {
+      for (int v = verts_in_output_prim(b->shader) - 1; v >= 1; --v) {
          nir_def *value = nir_load_var(b, state->outputs[slot][v - 1]);
 
          nir_store_var(b, state->outputs[slot][v], value,
@@ -893,16 +891,13 @@ static bool
 lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *state)
 {
    b->cursor = nir_before_instr(&intr->instr);
-   struct lower_gs_state *state_ = state;
 
    switch (intr->intrinsic) {
    case nir_intrinsic_set_vertex_and_primitive_count: {
-      if (state_->info->shape != AGX_GS_SHAPE_DYNAMIC_INDEXED)
-         break;
-
       /* Points write their index buffer here, other primitives write on end. We
        * also pad the index buffer here for the rasterization stream.
        */
+      struct lower_gs_state *state_ = state;
       if (b->shader->info.gs.output_primitive == MESA_PRIM_POINTS) {
          lower_end_primitive(b, intr, state);
       }
@@ -911,17 +906,14 @@ lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *state)
          libagx_pad_index_gs(b, load_geometry_param(b, output_index_buffer),
                              intr->src[0].ssa, intr->src[1].ssa,
                              calc_unrolled_id(b),
-                             nir_imm_int(b, state_->info->max_indices));
+                             nir_imm_int(b, state_->max_indices));
       }
 
       break;
    }
 
    case nir_intrinsic_end_primitive_with_counter: {
-      if (state_->info->shape != AGX_GS_SHAPE_DYNAMIC_INDEXED)
-         break;
-
-      unsigned min = nir_verts_in_output_prim(b->shader);
+      unsigned min = verts_in_output_prim(b->shader);
 
       /* We only write out complete primitives */
       nir_push_if(b, nir_uge_imm(b, intr->src[1].ssa, min));
@@ -1116,8 +1108,8 @@ rewrite_invocation_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->intrinsic != nir_intrinsic_load_invocation_id)
       return false;
 
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def_replace(&intr->def, nir_u2uN(b, data, intr->def.bit_size));
+   b->cursor = nir_instr_remove(&intr->instr);
+   nir_def_rewrite_uses(&intr->def, nir_u2uN(b, data, intr->def.bit_size));
    return true;
 }
 
@@ -1204,164 +1196,6 @@ calculate_max_indices(enum mesa_prim prim, unsigned verts, signed static_verts,
       return verts + (verts / mesa_vertices_per_prim(prim));
 }
 
-struct topology_ctx {
-   struct agx_gs_info *info;
-   uint32_t topology[384];
-};
-
-static bool
-evaluate_topology(nir_builder *b, nir_intrinsic_instr *intr, void *data)
-{
-   bool points = b->shader->info.gs.output_primitive == MESA_PRIM_POINTS;
-   bool end_prim = intr->intrinsic == nir_intrinsic_end_primitive_with_counter;
-   bool set_prim =
-      intr->intrinsic == nir_intrinsic_set_vertex_and_primitive_count;
-
-   struct topology_ctx *ctx = data;
-   struct agx_gs_info *info = ctx->info;
-   if (!(set_prim && points) && !end_prim)
-      return false;
-
-   assert(!(end_prim && points) && "should have been deleted");
-
-   /* Only consider the rasterization stream. */
-   if (nir_intrinsic_stream_id(intr) != 0)
-      return false;
-
-   /* All end primitives must be executed exactly once. That happens if
-    * everything is in the start block.
-    *
-    * Strictly we could relax this (to handle if-statements interleaved with
-    * other stuff).
-    */
-   if (intr->instr.block != nir_start_block(b->impl)) {
-      info->shape = AGX_GS_SHAPE_DYNAMIC_INDEXED;
-      return false;
-   }
-
-   /* The topology must be static */
-   if (!nir_src_is_const(intr->src[0]) || !nir_src_is_const(intr->src[1]) ||
-       !nir_src_is_const(intr->src[2])) {
-
-      info->shape = AGX_GS_SHAPE_DYNAMIC_INDEXED;
-      return false;
-   }
-
-   unsigned min = nir_verts_in_output_prim(b->shader);
-
-   if (nir_src_as_uint(intr->src[1]) >= min) {
-      _libagx_end_primitive(ctx->topology, nir_src_as_uint(intr->src[0]),
-                            nir_src_as_uint(intr->src[1]),
-                            nir_src_as_uint(intr->src[2]), 0, 0, !points);
-   }
-
-   return false;
-}
-
-/*
- * Pattern match the index buffer with restart against a list topology:
- *
- *    0, 1, 2, -1, 3, 4, 5, -1, ...
- */
-static bool
-match_list_topology(struct agx_gs_info *info, uint32_t count,
-                    uint32_t *topology)
-{
-   unsigned count_with_restart = count + 1;
-
-   /* Must be an integer number of primitives */
-   if (info->max_indices % count_with_restart)
-      return false;
-
-   /* Must match the list topology */
-   for (unsigned i = 0; i < info->max_indices; ++i) {
-      bool restart = (i % count_with_restart) == count;
-      uint32_t expected = restart ? -1 : (i - (i / count_with_restart));
-
-      if (topology[i] != expected)
-         return false;
-   }
-
-   /* If we match, rewrite the topology and drop indexing */
-   info->shape = AGX_GS_SHAPE_STATIC_PER_INSTANCE;
-   info->mode = u_decomposed_prim(info->mode);
-   info->max_indices = (info->max_indices / count_with_restart) * count;
-   return true;
-}
-
-static bool
-is_strip_topology(uint32_t *indices, uint32_t index_count)
-{
-   for (unsigned i = 0; i < index_count; ++i) {
-      if (indices[i] != i)
-         return false;
-   }
-
-   return true;
-}
-
-/*
- * To handle the general case of geometry shaders generating dynamic topologies,
- * we translate geometry shaders into compute shaders that write an index
- * buffer. In practice, many geometry shaders have static topologies that can be
- * determined at compile-time. By identifying these, we can avoid the dynamic
- * index buffer allocation and writes. optimize_static_topology tries to
- * statically determine the topology, then translating it to one of:
- *
- * 1. Non-indexed line/triangle lists without instancing.
- * 2. Non-indexed line/triangle strips, instanced per input primitive.
- * 3. Static index buffer, instanced per input primitive.
- *
- * If the geometry shader has no side effect, the only job of the compute shader
- * is writing this index buffer, so this optimization effectively eliminates the
- * compute dispatch entirely. That means simple VS+GS pipelines turn into simple
- * VS(compute) + GS(vertex) sequences without auxiliary programs.
- */
-static void
-optimize_static_topology(struct agx_gs_info *info, nir_shader *gs)
-{
-   struct topology_ctx ctx = {.info = info};
-   nir_shader_intrinsics_pass(gs, evaluate_topology, nir_metadata_all, &ctx);
-   if (info->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED)
-      return;
-
-   /* Points are always lists */
-   if (gs->info.gs.output_primitive == MESA_PRIM_POINTS) {
-      info->shape = AGX_GS_SHAPE_STATIC_PER_INSTANCE;
-      return;
-   }
-
-   /* Try to pattern match a list topology */
-   unsigned count = nir_verts_in_output_prim(gs);
-   if (match_list_topology(info, count, ctx.topology))
-      return;
-
-   /* Instancing means we can always drop the trailing restart index */
-   info->max_indices--;
-
-   /* Try to pattern match a strip topology */
-   if (is_strip_topology(ctx.topology, info->max_indices)) {
-      info->shape = AGX_GS_SHAPE_STATIC_PER_PRIM;
-      return;
-   }
-
-   /* Otherwise, use a small static index buffer. There's no theoretical reason
-    * to bound this, but we want small serialized shader info structs. We assume
-    * that large static index buffers are rare and hence fall back to dynamic.
-    */
-   if (info->max_indices >= ARRAY_SIZE(info->topology)) {
-      info->shape = AGX_GS_SHAPE_DYNAMIC_INDEXED;
-      return;
-   }
-
-   for (unsigned i = 0; i < info->max_indices; ++i) {
-      assert((ctx.topology[i] < 0xFF || ctx.topology[i] == ~0) && "small");
-      info->topology[i] = ctx.topology[i];
-   }
-
-   info->shape = AGX_GS_SHAPE_STATIC_INDEXED;
-}
-
 bool
 agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
                  nir_shader **gs_copy, nir_shader **pre_gs,
@@ -1437,13 +1271,6 @@ agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
     */
    struct lower_gs_state gs_state = {
       .rasterizer_discard = rasterizer_discard,
-      .info = info,
-   };
-
-   *info = (struct agx_gs_info){
-      .mode = gs->info.gs.output_primitive,
-      .xfb = gs->xfb_info != NULL,
-      .shape = -1,
    };
 
    int static_vertices[4] = {0}, static_primitives[4] = {0};
@@ -1455,25 +1282,19 @@ agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
     */
    for (unsigned i = 0; i < MAX_VERTEX_STREAMS; ++i) {
       gs_state.count_index[i] =
-         (gs_state.static_count[i] < 0) ? info->count_words++ : -1;
+         (gs_state.static_count[i] < 0) ? gs_state.count_stride_el++ : -1;
    }
 
    /* Using the gathered static counts, choose the index buffer stride. */
-   info->max_indices = calculate_max_indices(
+   gs_state.max_indices = calculate_max_indices(
       gs->info.gs.output_primitive, gs->info.gs.vertices_out,
       static_vertices[0], static_primitives[0]);
 
-   info->prefix_sum = info->count_words > 0 && gs->xfb_info != NULL;
-
-   if (static_vertices[0] >= 0 && static_primitives[0] >= 0) {
-      optimize_static_topology(info, gs);
-   } else {
-      info->shape = AGX_GS_SHAPE_DYNAMIC_INDEXED;
-   }
+   gs_state.prefix_summing =
+      gs_state.count_stride_el > 0 && gs->xfb_info != NULL;
 
    bool side_effects_for_rast = false;
-   *gs_copy =
-      agx_nir_create_gs_rast_shader(gs, &side_effects_for_rast, &gs_state);
+   *gs_copy = agx_nir_create_gs_rast_shader(gs, &side_effects_for_rast);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
             nir_metadata_control_flow, NULL);
@@ -1485,13 +1306,13 @@ agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
    /* If there is any unknown count, we need a geometry count shader */
-   if (info->count_words > 0)
+   if (gs_state.count_stride_el > 0)
       *gs_count = agx_nir_create_geometry_count_shader(gs, &gs_state);
    else
       *gs_count = NULL;
 
    /* Geometry shader outputs are staged to temporaries */
-   struct lower_output_to_var_state state = {0};
+   struct agx_lower_output_to_var_state state = {0};
 
    u_foreach_bit64(slot, gs->info.outputs_written) {
       /* After enough optimizations, the shader metadata can go out of sync, fix
@@ -1515,7 +1336,7 @@ agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
       state.outputs[slot] = gs_state.outputs[slot][0];
    }
 
-   NIR_PASS(_, gs, nir_shader_instructions_pass, lower_output_to_var,
+   NIR_PASS(_, gs, nir_shader_instructions_pass, agx_lower_output_to_var,
             nir_metadata_control_flow, &state);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
@@ -1569,8 +1390,17 @@ agx_nir_lower_gs(nir_shader *gs, bool rasterizer_discard, nir_shader **gs_count,
 
    /* Create auxiliary programs */
    *pre_gs = agx_nir_create_pre_gs(
-      &gs_state, gs->xfb_info, nir_verts_in_output_prim(gs),
+      &gs_state, gs->xfb_info, verts_in_output_prim(gs),
       gs->info.gs.active_stream_mask, gs->info.gs.invocations);
+
+   /* Signal what primitive we want to draw the GS Copy VS with */
+   *info = (struct agx_gs_info){
+      .mode = gs->info.gs.output_primitive,
+      .count_words = gs_state.count_stride_el,
+      .prefix_sum = gs_state.prefix_summing,
+      .max_indices = gs_state.max_indices,
+      .xfb = gs->xfb_info != NULL,
+   };
 
    return true;
 }
@@ -1595,7 +1425,13 @@ lower_vs_before_gs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    nir_def *location = nir_iadd_imm(b, intr->src[1].ssa, sem.location);
 
-   nir_def *buffer, *nr_verts, *instance_id, *primitive_id;
+   /* We inline the outputs_written because it's known at compile-time, even
+    * with shader objects. This lets us constant fold a bit of address math.
+    */
+   nir_def *mask = nir_imm_int64(b, b->shader->info.outputs_written);
+
+   nir_def *buffer;
+   nir_def *nr_verts;
    if (b->shader->info.stage == MESA_SHADER_VERTEX) {
       buffer = nir_load_vs_output_buffer_agx(b);
       nr_verts =
@@ -1608,21 +1444,11 @@ lower_vs_before_gs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       buffer = libagx_tes_buffer(b, nir_load_tess_param_buffer_agx(b));
    }
 
-   if (b->shader->info.stage == MESA_SHADER_VERTEX &&
-       !b->shader->info.vs.tes_agx) {
-      primitive_id = nir_load_vertex_id_zero_base(b);
-      instance_id = nir_load_instance_id(b);
-   } else {
-      primitive_id = load_primitive_id(b);
-      instance_id = load_instance_id(b);
-   }
+   nir_def *linear_id = nir_iadd(b, nir_imul(b, load_instance_id(b), nr_verts),
+                                 load_primitive_id(b));
 
-   nir_def *linear_id =
-      nir_iadd(b, nir_imul(b, instance_id, nr_verts), primitive_id);
-
-   nir_def *addr = libagx_vertex_output_address(
-      b, buffer, nir_imm_int64(b, b->shader->info.outputs_written), linear_id,
-      location);
+   nir_def *addr =
+      libagx_vertex_output_address(b, buffer, mask, linear_id, location);
 
    assert(nir_src_bit_size(intr->src[0]) == 32);
    addr = nir_iadd_imm(b, addr, nir_intrinsic_component(intr) * 4);

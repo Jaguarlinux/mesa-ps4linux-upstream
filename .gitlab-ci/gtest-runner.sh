@@ -8,8 +8,6 @@ set -ex
 
 INSTALL=$PWD/install
 
-export PATH=/va/bin:$PATH
-
 # Set up the driver environment.
 export LD_LIBRARY_PATH=$INSTALL/lib/
 

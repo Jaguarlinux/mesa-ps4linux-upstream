@@ -29,7 +29,7 @@ static_assert(sizeof(struct libagx_tess_point) == 8);
 
 struct libagx_tess_args {
    /* Heap to allocate tessellator outputs in */
-   DEVICE(struct agx_heap) heap;
+   DEVICE(struct agx_geometry_state) heap;
 
    /* Patch coordinate buffer, indexed as:
     *

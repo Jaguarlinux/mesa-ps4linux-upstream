@@ -80,8 +80,6 @@ files_mesa_util = files(
   'os_misc.h',
   'os_socket.c',
   'os_socket.h',
-  'pb_slab.c',
-  'pb_slab.h',
   'ptralloc.h',
   'perf/u_trace.h',
   'perf/u_trace.c',
@@ -279,8 +277,8 @@ endif
 
 u_trace_py = files('perf/u_trace.py')
 
-libmesa_util_simd = static_library(
-  'mesa_util_simd',
+libmesa_util_sse41 = static_library(
+  'mesa_util_sse41',
   files('streaming-load-memcpy.c'),
   c_args : [c_msvc_compat_args, sse41_args],
   include_directories : [inc_util],
@@ -293,7 +291,7 @@ _libmesa_util = static_library(
   [files_mesa_util, files_debug_stack, format_srgb],
   include_directories : [inc_util, include_directories('format')],
   dependencies : deps_for_libmesa_util,
-  link_with: [libmesa_util_simd],
+  link_with: [libmesa_util_sse41],
   c_args : [c_msvc_compat_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false

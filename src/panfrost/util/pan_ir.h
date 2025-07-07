@@ -281,6 +281,9 @@ struct pan_shader_info {
    /* Floating point controls that the driver should try to honour */
    bool ftz_fp16, ftz_fp32;
 
+   /* True if the shader contains a shader_clock instruction. */
+   bool has_shader_clk_instr;
+
    unsigned sampler_count;
    unsigned texture_count;
    unsigned ubo_count;
@@ -296,9 +299,6 @@ struct pan_shader_info {
 
       /* Bitfield of noperspective varyings, starting at VARYING_SLOT_VAR0 */
       uint32_t noperspective;
-
-      /* Bitfield of special varyings. */
-      uint32_t fixed_varyings;
    } varyings;
 
    /* UBOs to push to Register Mapped Uniforms (Midgard) or Fast Access
@@ -316,7 +316,81 @@ struct pan_shader_info {
    };
 };
 
+typedef struct pan_block {
+   /* Link to next block. Must be first for mir_get_block */
+   struct list_head link;
+
+   /* List of instructions emitted for the current block */
+   struct list_head instructions;
+
+   /* Index of the block in source order */
+   unsigned name;
+
+   /* Control flow graph */
+   struct pan_block *successors[2];
+   struct set *predecessors;
+   bool unconditional_jumps;
+
+   /* In liveness analysis, these are live masks (per-component) for
+    * indices for the block. Scalar compilers have the luxury of using
+    * simple bit fields, but for us, liveness is a vector idea. */
+   uint16_t *live_in;
+   uint16_t *live_out;
+} pan_block;
+
+struct pan_instruction {
+   struct list_head link;
+};
+
+#define pan_foreach_instr_in_block_rev(block, v)                               \
+   list_for_each_entry_rev(struct pan_instruction, v, &block->instructions,    \
+                           link)
+
+#define pan_foreach_successor(blk, v)                                          \
+   pan_block *v;                                                               \
+   pan_block **_v;                                                             \
+   for (_v = (pan_block **)&blk->successors[0], v = *_v;                       \
+        v != NULL && _v < (pan_block **)&blk->successors[2]; _v++, v = *_v)
+
+#define pan_foreach_predecessor(blk, v)                                        \
+   struct set_entry *_entry_##v;                                               \
+   struct pan_block *v;                                                        \
+   for (_entry_##v = _mesa_set_next_entry(blk->predecessors, NULL),            \
+       v = (struct pan_block *)(_entry_##v ? _entry_##v->key : NULL);          \
+        _entry_##v != NULL;                                                    \
+        _entry_##v = _mesa_set_next_entry(blk->predecessors, _entry_##v),      \
+       v = (struct pan_block *)(_entry_##v ? _entry_##v->key : NULL))
+
+static inline pan_block *
+pan_exit_block(struct list_head *blocks)
+{
+   pan_block *last = list_last_entry(blocks, pan_block, link);
+   assert(!last->successors[0] && !last->successors[1]);
+   return last;
+}
+
+typedef void (*pan_liveness_update)(uint16_t *, void *, unsigned max);
+
+void pan_liveness_gen(uint16_t *live, unsigned node, unsigned max,
+                      uint16_t mask);
+void pan_liveness_kill(uint16_t *live, unsigned node, unsigned max,
+                       uint16_t mask);
+bool pan_liveness_get(uint16_t *live, unsigned node, uint16_t max);
+
+void pan_compute_liveness(struct list_head *blocks, unsigned temp_count,
+                          pan_liveness_update callback);
+
+void pan_free_liveness(struct list_head *blocks);
+
 uint16_t pan_to_bytemask(unsigned bytes, unsigned mask);
+
+void pan_block_add_successor(pan_block *block, pan_block *successor);
+
+/* IR indexing */
+#define PAN_IS_REG (1)
+
+/* IR printing helpers */
+void pan_print_alu_type(nir_alu_type t, FILE *fp);
 
 /* NIR passes to do some backend-specific lowering */
 

@@ -24,14 +24,8 @@
 #include "d3d12_blit.h"
 #include "d3d12_cmd_signature.h"
 #include "d3d12_context.h"
-#ifdef HAVE_GALLIUM_D3D12_GRAPHICS
 #include "d3d12_compiler.h"
 #include "d3d12_compute_transforms.h"
-#include "nir_to_dxil.h"
-#ifdef _WIN32
-#include "dxil_validator.h"
-#endif
-#endif // HAVE_GALLIUM_D3D12_GRAPHICS
 #include "d3d12_debug.h"
 #include "d3d12_fence.h"
 #include "d3d12_format.h"
@@ -58,8 +52,15 @@
 #include "util/u_pstipple.h"
 #include "util/u_sample_positions.h"
 #include "util/u_dl.h"
+#include "nir_to_dxil.h"
+
 #include <dxguids/dxguids.h>
+
 #include <string.h>
+
+#ifdef _WIN32
+#include "dxil_validator.h"
+#endif
 
 static void
 d3d12_context_destroy(struct pipe_context *pctx)
@@ -493,16 +494,12 @@ d3d12_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
       ctx->batches[i].ctx_index = i;
    }
 
-   if (flags & PIPE_CONTEXT_PREFER_THREADED) {
-      struct pipe_context *ret = threaded_context_create(&ctx->base,
+   if (flags & PIPE_CONTEXT_PREFER_THREADED)
+      return threaded_context_create(&ctx->base,
          &screen->transfer_pool,
          d3d12_replace_buffer_storage,
          NULL,
          &ctx->threaded_context);
-      ctx->threaded_context->bytes_replaced_limit = 1024 * 1024 * 1024; /* 1GiB */
-      threaded_context_init_bytes_mapped_limit(ctx->threaded_context, 4);
-      return ret;
-   }
 
    return &ctx->base;
 }

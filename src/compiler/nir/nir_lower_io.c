@@ -2663,65 +2663,6 @@ lower_vars_to_explicit(nir_shader *shader,
    return progress;
 }
 
-static unsigned
-nir_calculate_alignment_from_explicit_layout(const glsl_type *type,
-                                             glsl_type_size_align_func type_info)
-{
-   unsigned size, alignment;
-   glsl_get_explicit_type_for_size_align(type, type_info,
-                                         &size, &alignment);
-   return alignment;
-}
-
-static void
-nir_assign_shared_var_locations(nir_shader *shader, glsl_type_size_align_func type_info)
-{
-   assert(shader->info.shared_memory_explicit_layout);
-
-   /* Calculate region for Aliased shared memory at the beginning. */
-   unsigned aliased_size = 0;
-   unsigned aliased_alignment = 0;
-   nir_foreach_variable_with_modes(var, shader, nir_var_mem_shared) {
-      /* Per SPV_KHR_workgroup_storage_explicit_layout, if one shared variable is
-       * a Block, all of them will be and Blocks are explicitly laid out.
-       */
-      assert(glsl_type_is_interface(var->type));
-
-      if (var->data.aliased_shared_memory) {
-         const bool align_to_stride = false;
-         aliased_size = MAX2(aliased_size, glsl_get_explicit_size(var->type, align_to_stride));
-         aliased_alignment = MAX2(aliased_alignment,
-                                  nir_calculate_alignment_from_explicit_layout(var->type, type_info));
-      }
-   }
-
-   unsigned offset = shader->info.shared_size;
-
-   unsigned aliased_location = UINT_MAX;
-   if (aliased_size) {
-      aliased_location = align(offset, aliased_alignment);
-      offset = aliased_location + aliased_size;
-   }
-
-   /* Allocate Blocks either at the Aliased region or after it. */
-   nir_foreach_variable_with_modes(var, shader, nir_var_mem_shared) {
-      if (var->data.aliased_shared_memory) {
-         assert(aliased_location != UINT_MAX);
-         var->data.driver_location = aliased_location;
-      } else {
-         const bool align_to_stride = false;
-         const unsigned size = glsl_get_explicit_size(var->type, align_to_stride);
-         const unsigned alignment =
-            MAX2(nir_calculate_alignment_from_explicit_layout(var->type, type_info),
-                 var->data.alignment);
-         var->data.driver_location = align(offset, alignment);
-         offset = var->data.driver_location + size;
-      }
-   }
-
-   shader->info.shared_size = offset;
-}
-
 /* If nir_lower_vars_to_explicit_types is called on any shader that contains
  * generic pointers, it must either be used on all of the generic modes or
  * none.
@@ -2752,13 +2693,8 @@ nir_lower_vars_to_explicit_types(nir_shader *shader,
       progress |= lower_vars_to_explicit(shader, &shader->variables, nir_var_mem_global, type_info);
 
    if (modes & nir_var_mem_shared) {
-      if (shader->info.shared_memory_explicit_layout) {
-         nir_assign_shared_var_locations(shader, type_info);
-         /* Types don't change, so no further lowering is needed. */
-         modes &= ~nir_var_mem_shared;
-      } else {
-         progress |= lower_vars_to_explicit(shader, &shader->variables, nir_var_mem_shared, type_info);
-      }
+      assert(!shader->info.shared_memory_explicit_layout);
+      progress |= lower_vars_to_explicit(shader, &shader->variables, nir_var_mem_shared, type_info);
    }
 
    if (modes & nir_var_shader_temp)
@@ -2776,13 +2712,11 @@ nir_lower_vars_to_explicit_types(nir_shader *shader,
    if (modes & nir_var_mem_node_payload_in)
       progress |= lower_vars_to_explicit(shader, &shader->variables, nir_var_mem_node_payload_in, type_info);
 
-   if (modes) {
-      nir_foreach_function_impl(impl, shader) {
-         if (modes & nir_var_function_temp)
-            progress |= lower_vars_to_explicit(shader, &impl->locals, nir_var_function_temp, type_info);
+   nir_foreach_function_impl(impl, shader) {
+      if (modes & nir_var_function_temp)
+         progress |= lower_vars_to_explicit(shader, &impl->locals, nir_var_function_temp, type_info);
 
-         progress |= nir_lower_vars_to_explicit_types_impl(impl, modes, type_info);
-      }
+      progress |= nir_lower_vars_to_explicit_types_impl(impl, modes, type_info);
    }
 
    return progress;
@@ -3228,6 +3162,90 @@ nir_io_add_const_offset_to_base(nir_shader *nir, nir_variable_mode modes)
    }
 
    return progress;
+}
+
+bool
+nir_lower_color_inputs(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool progress = false;
+
+   /* Both flat and non-flat can occur with nir_io_mix_convergent_flat_with_interpolated,
+    * but we want to save only the non-flat interp mode in that case.
+    *
+    * Start with flat and set to non-flat only if it's present.
+    */
+   nir->info.fs.color0_interp = INTERP_MODE_FLAT;
+   nir->info.fs.color1_interp = INTERP_MODE_FLAT;
+
+   nir_builder b = nir_builder_create(impl);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+         if (intrin->intrinsic != nir_intrinsic_load_input &&
+             intrin->intrinsic != nir_intrinsic_load_interpolated_input)
+            continue;
+
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intrin);
+
+         if (sem.location != VARYING_SLOT_COL0 &&
+             sem.location != VARYING_SLOT_COL1)
+            continue;
+
+         /* Default to FLAT (for load_input) */
+         enum glsl_interp_mode interp = INTERP_MODE_FLAT;
+         bool sample = false;
+         bool centroid = false;
+
+         if (intrin->intrinsic == nir_intrinsic_load_interpolated_input) {
+            nir_intrinsic_instr *baryc =
+               nir_instr_as_intrinsic(intrin->src[0].ssa->parent_instr);
+
+            centroid =
+               baryc->intrinsic == nir_intrinsic_load_barycentric_centroid;
+            sample =
+               baryc->intrinsic == nir_intrinsic_load_barycentric_sample;
+            assert(centroid || sample ||
+                   baryc->intrinsic == nir_intrinsic_load_barycentric_pixel);
+
+            interp = nir_intrinsic_interp_mode(baryc);
+         }
+
+         b.cursor = nir_before_instr(instr);
+         nir_def *load = NULL;
+
+         if (sem.location == VARYING_SLOT_COL0) {
+            load = nir_load_color0(&b);
+            if (interp != INTERP_MODE_FLAT)
+               nir->info.fs.color0_interp = interp;
+            nir->info.fs.color0_sample = sample;
+            nir->info.fs.color0_centroid = centroid;
+         } else {
+            assert(sem.location == VARYING_SLOT_COL1);
+            load = nir_load_color1(&b);
+            if (interp != INTERP_MODE_FLAT)
+               nir->info.fs.color1_interp = interp;
+            nir->info.fs.color1_sample = sample;
+            nir->info.fs.color1_centroid = centroid;
+         }
+
+         if (intrin->num_components != 4) {
+            unsigned start = nir_intrinsic_component(intrin);
+            unsigned count = intrin->num_components;
+            load = nir_channels(&b, load, BITFIELD_RANGE(start, count));
+         }
+
+         nir_def_replace(&intrin->def, load);
+         progress = true;
+      }
+   }
+
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 bool

@@ -53,10 +53,7 @@ cl_args = [
   # Set the OpenCL standard to CL 2.0, enabling everything at a frontend.
   # Drivers may not actually support everything but that's ok.
   '-cl-std=cl2.0',
-  '-D__OPENCL_VERSION__=200',
-
-  # Declare supported clang builtins since we don't autodetect for OpenCL
-  '-DHAVE___BUILTIN_FFS',
+  '-D__OPENCL_VERSION__=200'
 ]
 
 if with_mesa_ndebug
@@ -289,6 +286,13 @@ if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedre
     system_has_kms_drm = false
   endif
 endif
+
+with_vdrm = [
+  with_amdgpu_virtio,
+  freedreno_kmds.contains('virtio'),
+  with_gallium_asahi,
+  with_asahi_vk,
+].contains(true)
 
 with_dri = false
 if with_gallium and system_has_kms_drm
@@ -600,14 +604,6 @@ if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk or with_gfxstre
   endif
 endif
 
-if dep_dxheaders.found()
-  if (dep_dxheaders.version().version_compare('>= 1.700.0'))
-    pre_args += '-DUSE_D3D12_PREVIEW_HEADERS=1'
-  else
-    pre_args += '-DUSE_D3D12_PREVIEW_HEADERS=0'
-  endif
-endif
-
 _with_gallium_d3d12_video = get_option('gallium-d3d12-video')
 with_gallium_d3d12_video = false
 if with_gallium_d3d12 and not _with_gallium_d3d12_video.disabled()
@@ -754,7 +750,24 @@ if get_option('vmware-mks-stats')
   pre_args += '-DVMX86_STATS=1'
 endif
 
+_opencl = get_option('gallium-opencl')
 _rtti = get_option('cpp_rtti')
+if _opencl != 'disabled'
+  warning('Clover will be removed in Mesa 25.2')
+
+  if not with_gallium
+    error('OpenCL Clover implementation requires at least one gallium driver.')
+  endif
+  if not _rtti
+    error('The Clover OpenCL state tracker requires rtti')
+  endif
+
+  with_gallium_clover = true
+  with_opencl_icd = _opencl == 'icd'
+else
+  with_gallium_clover = false
+  with_opencl_icd = false
+endif
 
 with_gallium_rusticl = get_option('gallium-rusticl')
 if with_gallium_rusticl
@@ -823,7 +836,7 @@ else
 endif
 
 dep_clc = null_dep
-if with_clc
+if with_gallium_clover or with_clc
   dep_clc = dependency('libclc')
 endif
 
@@ -1710,6 +1723,15 @@ if with_amd_vk or with_gallium_radeonsi or with_gallium_r600
     llvm_modules += 'asmparser'
   endif
 endif
+if with_gallium_clover
+  llvm_modules += [
+    'linker', 'coverage', 'instrumentation', 'ipo', 'irreader',
+    'lto', 'option', 'objcarcopts', 'profiledata'
+  ]
+  # all-targets is needed to support static linking LLVM build with multiple targets
+  # windowsdriver is needded with LLVM>=15, but we don't know what LLVM verrsion we are using yet
+  llvm_optional_modules += ['all-targets', 'frontendopenmp', 'windowsdriver']
+endif
 if with_clc
   llvm_modules += ['coverage', 'target', 'linker', 'irreader', 'option', 'libdriver', 'lto']
   # all-targets is needed to support static linking LLVM build with multiple targets.
@@ -1735,6 +1757,8 @@ if with_amd_vk or with_gallium_radeonsi
   _llvm_version = '>= 18.0.0'
 elif with_clc or llvm_with_orcjit
   _llvm_version = '>= 15.0.0'
+elif with_gallium_clover
+  _llvm_version = '>= 11.0.0'
 else
   _llvm_version = '>= 5.0.0'
 endif
@@ -1754,7 +1778,7 @@ if _llvm.allowed()
     modules : llvm_modules,
     optional_modules : llvm_optional_modules,
     required : (
-      with_amd_vk or with_gallium_radeonsi or with_clc
+      with_amd_vk or with_gallium_radeonsi or with_gallium_clover or with_clc
       or _llvm.enabled()
     ),
     static : not _shared_llvm,
@@ -1808,6 +1832,8 @@ elif with_swrast_vk
   error('lavapipe requires LLVM and is enabled, but LLVM is disabled.')
 elif with_any_llvmpipe
   error('llvmpipe requires LLVM and is enabled, but LLVM is disabled.')
+elif with_gallium_clover
+  error('The OpenCL "Clover" state tracker requires LLVM, but LLVM is disabled.')
 elif with_clc
   error('The CLC compiler requires LLVM, but LLVM is disabled.')
 else
@@ -1857,7 +1883,7 @@ if dep_spirv_tools.found()
 endif
 
 dep_clang = null_dep
-if with_clc
+if with_clc or with_gallium_clover
   llvm_libdir = dep_llvm.get_variable(cmake : 'LLVM_LIBRARY_DIR', configtool: 'libdir')
 
   dep_clang = cpp.find_library('clang-cpp', dirs : llvm_libdir, required : false)
@@ -1872,7 +1898,7 @@ if with_clc
     if dep_llvm.version().version_compare('>= 15.0')
       clang_modules += 'clangSupport'
     endif
-    if dep_llvm.version().version_compare('>= 16.0')
+    if dep_llvm.version().version_compare('>= 16.0') or with_gallium_clover
       clang_modules += 'clangASTMatchers'
     endif
     if dep_llvm.version().version_compare('>= 18.0')
@@ -2394,6 +2420,9 @@ if with_gallium
   endif
   if with_gallium_st_nine
     gallium_frontends += 'nine'
+  endif
+  if with_gallium_clover
+    gallium_frontends += 'clover'
   endif
   if with_gallium_rusticl
     gallium_frontends += 'rusticl'

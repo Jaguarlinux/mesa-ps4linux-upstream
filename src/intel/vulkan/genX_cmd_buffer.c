@@ -1019,13 +1019,6 @@ genX(set_fast_clear_state)(struct anv_cmd_buffer *cmd_buffer,
    }
 }
 
-static bool ATTRIBUTE_CONST
-queue_family_is_external(uint32_t index)
-{
-      return index == VK_QUEUE_FAMILY_FOREIGN_EXT ||
-             index == VK_QUEUE_FAMILY_EXTERNAL;
-}
-
 /**
  * @brief Transitions a color buffer from one layout to another.
  *
@@ -1036,9 +1029,6 @@ queue_family_is_external(uint32_t index)
  * @param layer_count VK_REMAINING_ARRAY_LAYERS isn't supported. For 3D images,
  *                    this represents the maximum layers to transition at each
  *                    specified miplevel.
- * @param acquire_unmodified True if
- *    VkExternalMemoryAcquireUnmodifiedEXT::acquireUnmodifiedMemory is set and
- *    relevant.
  */
 static void
 transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
@@ -1050,8 +1040,7 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
                         VkImageLayout final_layout,
                         uint32_t src_queue_family,
                         uint32_t dst_queue_family,
-                        bool will_full_fast_clear,
-                        bool acquire_unmodified)
+                        bool will_full_fast_clear)
 {
    struct anv_device *device = cmd_buffer->device;
    const struct intel_device_info *devinfo = device->info;
@@ -1078,18 +1067,13 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
       ? isl_drm_modifier_get_info(image->vk.drm_format_mod)
       : NULL;
 
-   /**
-    * Vulkan 1.4.313, 7.7.4. Queue Family Ownership Transfer:
-    *
-    *    If the values of srcQueueFamilyIndex and dstQueueFamilyIndex are equal,
-    *    no ownership transfer is performed, and the barrier operates as if they
-    *    were both set to VK_QUEUE_FAMILY_IGNORED.
-    */
-   if (src_queue_family == dst_queue_family)
-      src_queue_family = dst_queue_family = VK_QUEUE_FAMILY_IGNORED;
+   const bool src_queue_external =
+      src_queue_family == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+      src_queue_family == VK_QUEUE_FAMILY_EXTERNAL;
 
-   const bool src_queue_external = queue_family_is_external(src_queue_family);
-   const bool dst_queue_external = queue_family_is_external(dst_queue_family);
+   const bool dst_queue_external =
+      dst_queue_family == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+      dst_queue_family == VK_QUEUE_FAMILY_EXTERNAL;
 
    /* If the queues are external, consider the first queue family flags
     * (should be the most capable)
@@ -1106,16 +1090,18 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
    /* Simultaneous acquire and release on external queues is illegal. */
    assert(!src_queue_external || !dst_queue_external);
 
-   /* Ownership transition on an external queue requires special action if we
-    * store any image data in a driver-private bo that is inaccessible to the
-    * external queue.
+   /* Ownership transition on an external queue requires special action if the
+    * image has a DRM format modifier because we store image data in
+    * a driver-private bo which is inaccessible to the external queue.
     */
    const bool private_binding_acquire =
       src_queue_external &&
+      anv_image_is_externally_shared(image) &&
       anv_image_has_private_binding(image);
 
    const bool private_binding_release =
       dst_queue_external &&
+      anv_image_is_externally_shared(image) &&
       anv_image_has_private_binding(image);
 
    if (initial_layout == final_layout &&
@@ -1239,7 +1225,8 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
 
          must_init_aux_surface = false;
       }
-   } else if (private_binding_acquire && !acquire_unmodified) {
+
+   } else if (private_binding_acquire) {
       /* The fast clear state lives in a driver-private bo, and therefore the
        * external/foreign queue is unaware of it.
        *
@@ -1272,19 +1259,6 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
           */
          must_init_aux_surface = false;
       }
-   } else if (private_binding_acquire && acquire_unmodified) {
-      /* The Vulkan 1.3.302 spec ensures we have previously initialized the
-       * image memory, and therefore initialized the fast clear state and aux
-       * surface, because initial_layout_undefined is false and
-       * acquireUnmodifiedMemory is true.
-       *
-       * Since the time of our most recent image ownership release and up
-       * until the current ownership re-acquisition, the externally-shared
-       * image memory has remained unmodified. Therefore the fast clear state
-       * and aux surface are valid and consistent with the image content.
-       */
-      must_init_fast_clear_state = false;
-      must_init_aux_surface = false;
    }
 
    if (must_init_fast_clear_state) {
@@ -3144,6 +3118,14 @@ genX(cmd_buffer_update_color_aux_op)(struct anv_cmd_buffer *cmd_buffer,
    } else {
       cmd_buffer->state.color_aux_op = next_aux_op;
    }
+
+   if (next_aux_op == ISL_AUX_OP_FAST_CLEAR) {
+      if (aux_op_clears(last_aux_op)) {
+         cmd_buffer->num_dependent_clears++;
+      } else {
+         cmd_buffer->num_independent_clears++;
+      }
+   }
 }
 
 static void
@@ -3428,9 +3410,7 @@ end_command_buffer(struct anv_cmd_buffer *cmd_buffer)
 
    if (anv_cmd_buffer_is_video_queue(cmd_buffer) ||
        anv_cmd_buffer_is_blitter_queue(cmd_buffer)) {
-      trace_intel_end_cmd_buffer(&cmd_buffer->trace,
-                                 (uintptr_t)(vk_command_buffer_to_handle(&cmd_buffer->vk)),
-                                 cmd_buffer->vk.level);
+      trace_intel_end_cmd_buffer(&cmd_buffer->trace, cmd_buffer->vk.level);
       genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
       anv_cmd_buffer_end_batch_buffer(cmd_buffer);
       return VK_SUCCESS;
@@ -3477,9 +3457,7 @@ end_command_buffer(struct anv_cmd_buffer *cmd_buffer)
       genX(cmd_buffer_set_protected_memory)(cmd_buffer, false);
 #endif
 
-   trace_intel_end_cmd_buffer(&cmd_buffer->trace,
-                              (uintptr_t)(vk_command_buffer_to_handle(&cmd_buffer->vk)),
-                              cmd_buffer->vk.level);
+   trace_intel_end_cmd_buffer(&cmd_buffer->trace, cmd_buffer->vk.level);
 
    anv_cmd_buffer_end_batch_buffer(cmd_buffer);
 
@@ -4293,25 +4271,6 @@ cmd_buffer_has_pending_copy_query(struct anv_cmd_buffer *cmd_buffer)
            ANV_QUERY_WRITES_DATA_FLUSH) != 0;
 }
 
-static bool
-img_barrier_has_acquire_unmodified(const VkImageMemoryBarrier2 *img_barrier)
-{
-   /* The Vulkan 1.3.302 spec says:
-    *
-    *    This struct [VkExternalMemoryAcquireUnmodifiedEXT] is ignored if the
-    *    memory barrier's srcQueueFamilyIndex is not a special queue family
-    *    reserved for external memory ownership transfers.
-    */
-   if (!queue_family_is_external(img_barrier->srcQueueFamilyIndex))
-      return false;
-
-   const VkExternalMemoryAcquireUnmodifiedEXT *unmodified_info =
-      vk_find_struct_const(img_barrier->pNext,
-                           EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT);
-
-   return unmodified_info && unmodified_info->acquireUnmodifiedMemory;
-}
-
 static void
 cmd_buffer_accumulate_barrier_bits(struct anv_cmd_buffer *cmd_buffer,
                                    uint32_t n_dep_infos,
@@ -4505,8 +4464,6 @@ cmd_buffer_accumulate_barrier_bits(struct anv_cmd_buffer *cmd_buffer,
          }
 
          if (range->aspectMask & VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV) {
-            bool acquire_unmodified =
-               img_barrier_has_acquire_unmodified(img_barrier);
             VkImageAspectFlags color_aspects =
                vk_image_expand_aspect_mask(&image->vk, range->aspectMask);
             anv_foreach_image_aspect_bit(aspect_bit, image, color_aspects) {
@@ -4516,8 +4473,7 @@ cmd_buffer_accumulate_barrier_bits(struct anv_cmd_buffer *cmd_buffer,
                                        old_layout, new_layout,
                                        img_barrier->srcQueueFamilyIndex,
                                        img_barrier->dstQueueFamilyIndex,
-                                       false /* will_full_fast_clear */,
-                                       acquire_unmodified);
+                                       false /* will_full_fast_clear */);
             }
          }
 #if GFX_VER < 20
@@ -5434,7 +5390,7 @@ void genX(CmdBeginRendering)(
       enum isl_aux_usage aux_usage =
          anv_layout_to_aux_usage(cmd_buffer->device->info,
                                  iview->image,
-                                 VK_IMAGE_ASPECT_COLOR_BIT,
+                                 iview->vk.aspects,
                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                                  att->imageLayout,
                                  cmd_buffer->queue_family->queueFlags);
@@ -5464,6 +5420,7 @@ void genX(CmdBeginRendering)(
          const bool fast_clear =
             (!is_multiview || (gfx->view_mask & 1)) &&
             anv_can_fast_clear_color(cmd_buffer, iview->image,
+                                     iview->vk.aspects,
                                      iview->vk.base_mip_level,
                                      &clear_rect, att->imageLayout,
                                      iview->planes[0].isl.format,
@@ -5476,27 +5433,25 @@ void genX(CmdBeginRendering)(
             if (is_multiview) {
                u_foreach_bit(view, gfx->view_mask) {
                   transition_color_buffer(cmd_buffer, iview->image,
-                                          VK_IMAGE_ASPECT_COLOR_BIT,
+                                          iview->vk.aspects,
                                           iview->vk.base_mip_level, 1,
                                           iview->vk.base_array_layer + view,
                                           1, /* layer_count */
                                           initial_layout, att->imageLayout,
                                           VK_QUEUE_FAMILY_IGNORED,
                                           VK_QUEUE_FAMILY_IGNORED,
-                                          fast_clear,
-                                          false /* acquire_unmodified */);
+                                          fast_clear);
                }
             } else {
                transition_color_buffer(cmd_buffer, iview->image,
-                                       VK_IMAGE_ASPECT_COLOR_BIT,
+                                       iview->vk.aspects,
                                        iview->vk.base_mip_level, 1,
                                        iview->vk.base_array_layer,
                                        gfx->layer_count,
                                        initial_layout, att->imageLayout,
                                        VK_QUEUE_FAMILY_IGNORED,
                                        VK_QUEUE_FAMILY_IGNORED,
-                                       fast_clear,
-                                       false /* acquire_unmodified */);
+                                       fast_clear);
             }
          }
 
@@ -5511,7 +5466,7 @@ void genX(CmdBeginRendering)(
                anv_image_ccs_op(cmd_buffer, iview->image,
                                 iview->planes[0].isl.format,
                                 iview->planes[0].isl.swizzle,
-                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                iview->vk.aspects,
                                 0, 0, 1, ISL_AUX_OP_FAST_CLEAR,
                                 &fast_clear_color,
                                 false);
@@ -5519,7 +5474,7 @@ void genX(CmdBeginRendering)(
                anv_image_mcs_op(cmd_buffer, iview->image,
                                 iview->planes[0].isl.format,
                                 iview->planes[0].isl.swizzle,
-                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                iview->vk.aspects,
                                 0, 1, ISL_AUX_OP_FAST_CLEAR,
                                 &fast_clear_color,
                                 false);
@@ -5538,7 +5493,7 @@ void genX(CmdBeginRendering)(
          if (is_multiview) {
             u_foreach_bit(view, clear_view_mask) {
                anv_image_clear_color(cmd_buffer, iview->image,
-                                     VK_IMAGE_ASPECT_COLOR_BIT,
+                                     iview->vk.aspects,
                                      aux_usage,
                                      iview->planes[0].isl.format,
                                      iview->planes[0].isl.swizzle,
@@ -5548,7 +5503,7 @@ void genX(CmdBeginRendering)(
             }
          } else if (clear_rect.layerCount > 0) {
             anv_image_clear_color(cmd_buffer, iview->image,
-                                  VK_IMAGE_ASPECT_COLOR_BIT,
+                                  iview->vk.aspects,
                                   aux_usage,
                                   iview->planes[0].isl.format,
                                   iview->planes[0].isl.swizzle,
@@ -5573,7 +5528,7 @@ void genX(CmdBeginRendering)(
 
       anv_image_fill_surface_state(cmd_buffer->device,
                                    iview->image,
-                                   VK_IMAGE_ASPECT_COLOR_BIT,
+                                   iview->vk.aspects,
                                    &isl_view,
                                    ISL_SURF_USAGE_RENDER_TARGET_BIT,
                                    aux_usage, &fast_clear_color,
@@ -5876,6 +5831,9 @@ cmd_buffer_mark_attachment_written(struct anv_cmd_buffer *cmd_buffer,
    if (iview == NULL)
       return;
 
+   if (aspect == 0)
+      aspect = iview->vk.aspects;
+
    if (gfx->view_mask == 0) {
       genX(cmd_buffer_mark_image_written)(cmd_buffer, iview->image,
                                           aspect, att->aux_usage,
@@ -5912,8 +5870,7 @@ void genX(CmdEndRendering)(
       is_multiview ? util_last_bit(gfx->view_mask) : gfx->layer_count;
 
    for (uint32_t i = 0; i < gfx->color_att_count; i++) {
-      cmd_buffer_mark_attachment_written(cmd_buffer, &gfx->color_att[i],
-                                         VK_IMAGE_ASPECT_COLOR_BIT);
+      cmd_buffer_mark_attachment_written(cmd_buffer, &gfx->color_att[i], 0);
    }
 
    cmd_buffer_mark_attachment_written(cmd_buffer, &gfx->depth_att,
@@ -6040,7 +5997,6 @@ void genX(CmdEndRendering)(
    }
 
    trace_intel_end_render_pass(&cmd_buffer->trace,
-                               (uintptr_t)(vk_command_buffer_to_handle(&cmd_buffer->vk)),
                                gfx->render_area.extent.width,
                                gfx->render_area.extent.height,
                                gfx->color_att_count,

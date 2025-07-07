@@ -35,7 +35,6 @@ mod sm75_instr_latencies;
 mod sm80_instr_latencies;
 mod sph;
 mod spill_values;
-mod ssa_value;
 mod to_cssa;
 mod union_find;
 
@@ -44,6 +43,3 @@ mod hw_tests;
 
 #[cfg(test)]
 mod hw_runner;
-
-#[cfg(test)]
-mod nvdisasm_tests;

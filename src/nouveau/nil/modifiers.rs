@@ -276,7 +276,7 @@ pub fn drm_format_mod_is_supported(
         return false;
     }
 
-    true
+    return true;
 }
 
 fn score_drm_format_mod(modifier: u64) -> u32 {
@@ -316,7 +316,7 @@ pub fn select_best_drm_format_mod(
         }
     }
 
-    best
+    return best;
 }
 
 #[no_mangle]

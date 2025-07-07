@@ -599,11 +599,14 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
          .ThreadGroupIDZDimension        = 1,
          .ExecutionMask                  = dispatch.right_mask,
          .PostSync.MOCS                  = anv_mocs(device, NULL, 0),
+
+#if GFX_VERx10 >= 125
          .GenerateLocalID                = prog_data->generate_local_id != 0,
          .EmitLocal                      = prog_data->generate_local_id,
          .WalkOrder                      = prog_data->walk_order,
          .TileLayout = prog_data->walk_order == INTEL_WALK_ORDER_YXZ ?
                        TileY32bpe : Linear,
+#endif
 
          .InterfaceDescriptor = (struct GENX(INTERFACE_DESCRIPTOR_DATA)) {
             .KernelStartPointer                = state->kernel->kernel.offset +
@@ -625,7 +628,7 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
       anv_batch_emit(batch, GENX(COMPUTE_WALKER), cw) {
          cw.body = body;
       }
-#else /* GFX_VERx10 < 125 */
+#else
       const uint32_t vfe_curbe_allocation =
          ALIGN(prog_data->push.per_thread.regs * dispatch.threads +
                prog_data->push.cross_thread.regs, 2);
@@ -708,6 +711,9 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
          .ThreadPreemptionDisable               = true,
 #endif
          .NumberofThreadsinGPGPUThreadGroup     = dispatch.threads,
+#if GFX_VER >= 30
+         .RegistersPerThread = ptl_register_blocks(prog_data->base.grf_used),
+#endif
       };
       GENX(INTERFACE_DESCRIPTOR_DATA_pack)(batch, iface_desc_state.map, &iface_desc);
       anv_batch_emit(batch, GENX(MEDIA_INTERFACE_DESCRIPTOR_LOAD), mid) {

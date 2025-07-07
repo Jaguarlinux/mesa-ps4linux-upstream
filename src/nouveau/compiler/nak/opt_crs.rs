@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ir::*;
-
-use rustc_hash::FxHashSet;
+use std::collections::HashSet;
 
 fn opt_crs(f: &mut Function) {
-    let mut live_targets: FxHashSet<Label> = Default::default();
+    let mut live_targets = HashSet::new();
     for b in f.blocks.iter() {
         let Some(instr) = b.instrs.last() else {
             continue;

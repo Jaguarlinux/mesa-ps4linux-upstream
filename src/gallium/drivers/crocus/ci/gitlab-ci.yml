@@ -6,7 +6,6 @@ crocus-hsw:
     - .anholt-hsw-test
     - .test-gl
     - .deqp-test
-    - .test-piglit
     - .crocus-manual-rules
   variables:
     GPU_VERSION: crocus-hsw

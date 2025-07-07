@@ -76,7 +76,6 @@ elk_type_for_base_type(const struct glsl_type *type)
    case GLSL_TYPE_VOID:
    case GLSL_TYPE_ERROR:
    case GLSL_TYPE_COOPERATIVE_MATRIX:
-   case GLSL_TYPE_BFLOAT16:
       unreachable("not reached");
    }
 
@@ -1276,9 +1275,7 @@ elk_compile_tes(const struct elk_compiler *compiler,
 
    elk_compute_vue_map(devinfo, &prog_data->base.vue_map,
                        nir->info.outputs_written,
-                       nir->info.separate_shader ?
-                       INTEL_VUE_LAYOUT_SEPARATE :
-                       INTEL_VUE_LAYOUT_FIXED, 1);
+                       nir->info.separate_shader, 1);
 
    unsigned output_size_bytes = prog_data->base.vue_map.num_slots * 4 * 4;
 

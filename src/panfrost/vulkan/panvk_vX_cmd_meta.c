@@ -106,6 +106,8 @@ panvk_per_arch(cmd_meta_gfx_start)(
    cmdbuf->state.gfx.occlusion_query.ptr = 0;
    cmdbuf->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
    gfx_state_set_dirty(cmdbuf, OQ);
+
+   cmdbuf->state.gfx.vk_meta = true;
 }
 
 void
@@ -156,6 +158,8 @@ panvk_per_arch(cmd_meta_gfx_end)(
    gfx_state_set_dirty(cmdbuf, OQ);
    gfx_state_set_dirty(cmdbuf, DESC_STATE);
    gfx_state_set_dirty(cmdbuf, RENDER_STATE);
+
+   cmdbuf->state.gfx.vk_meta = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -192,15 +196,19 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
                                     const VkClearRect *pRects)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_cmd_meta_graphics_save_ctx save = {0};
    struct vk_meta_rendering_info render = {
       .view_mask = cmdbuf->state.gfx.render.view_mask,
-      .samples = cmdbuf->state.gfx.render.fb.nr_samples,
-      .color_attachment_count = cmdbuf->state.gfx.render.fb.info.rt_count,
+      .samples = fbinfo->nr_samples,
+      .color_attachment_count = fbinfo->rt_count,
       .depth_attachment_format = cmdbuf->state.gfx.render.z_attachment.fmt,
       .stencil_attachment_format = cmdbuf->state.gfx.render.s_attachment.fmt,
    };
+   /* Multiview is not supported pre-v10 */
+   assert(cmdbuf->state.gfx.render.view_mask == 0 || PAN_ARCH >= 10);
+
    for (uint32_t i = 0; i < render.color_attachment_count; i++) {
        render.color_attachment_formats[i] =
           cmdbuf->state.gfx.render.color_attachments.fmts[i];

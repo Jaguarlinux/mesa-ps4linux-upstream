@@ -357,9 +357,16 @@ tc_resource_batch_usage_test_busy(const struct threaded_context *tc, const struc
       return tc->last_completed >= tbuf->last_batch_usage;
 
    /* resource has been seen within one batch cycle: check for batch wrapping */
-   if (tc->last_completed >= tbuf->last_batch_usage)
+   if (tc->last_completed > tbuf->last_batch_usage)
       /* this or a subsequent pre-wrap batch was the last to definitely complete: resource is idle */
       return false;
+
+   if (tc->last_completed == tbuf->last_batch_usage)
+      /* diff==1 and last_completed==last_batch_usage usually means tc_sync was invoked,
+       * which will reuse the same batch immediately,
+       * which requires checking whether the batch generation has completed
+       */
+      return tbuf->batch_generation >= tc->last_generation_completed;
 
    /* batch execution has not definitely wrapped: resource is definitely not idle */
    if (tc->last_completed > tc->next)
@@ -508,6 +515,7 @@ tc_batch_flush(struct threaded_context *tc, bool full_copy)
       tc_batch_increment_renderpass_info(tc, next_id, full_copy);
    }
 
+   next->generation = tc->batch_generation;
    util_queue_add_job(&tc->queue, next, &next->fence, tc_batch_execute,
                       NULL, 0);
    tc->last = tc->next;
@@ -1468,7 +1476,7 @@ tc_set_framebuffer_state(struct pipe_context *_pipe,
       /* store existing zsbuf data for possible persistence */
       uint8_t zsbuf = tc->renderpass_info_recording->has_draw ?
                       0 :
-                      tc->renderpass_info_recording->data8[3];
+                      tc->renderpass_info_recording->data8[3] & BITFIELD_MASK(4);
       bool zsbuf_changed = tc->fb_resources[PIPE_MAX_COLOR_BUFS] !=
                            (fb->zsbuf ? fb->zsbuf->texture : NULL);
 
@@ -2219,6 +2227,17 @@ tc_set_stream_output_targets(struct pipe_context *_pipe,
    tc_unbind_buffers(&tc->streamout_buffers[count], PIPE_MAX_SO_BUFFERS - count);
    if (count)
       tc->seen_streamout_buffers = true;
+}
+
+static void
+tc_set_compute_resources(struct pipe_context *_pipe, unsigned start,
+                         unsigned count, struct pipe_surface **resources)
+{
+   struct threaded_context *tc = threaded_context(_pipe);
+   struct pipe_context *pipe = tc->pipe;
+
+   tc_sync(tc);
+   pipe->set_compute_resources(pipe, start, count, resources);
 }
 
 static void
@@ -4415,6 +4434,7 @@ tc_launch_grid(struct pipe_context *_pipe,
    struct threaded_context *tc = threaded_context(_pipe);
    struct tc_launch_grid_call *p = tc_add_call(tc, TC_CALL_launch_grid,
                                                tc_launch_grid_call);
+   assert(info->input == NULL);
 
    tc_set_resource_reference(&p->info.indirect, info->indirect);
    memcpy(&p->info, info, sizeof(*info));
@@ -5199,6 +5219,7 @@ tc_batch_execute(void *job, UNUSED void *gdata, int thread_index)
    batch->first_set_fb = false;
    batch->max_renderpass_info_idx = 0;
    batch->tc->last_completed = batch->batch_idx;
+   batch->tc->last_generation_completed = batch->generation;
 #if !defined(NDEBUG)
    batch->closed = false;
 #endif
@@ -5471,6 +5492,7 @@ threaded_context_create(struct pipe_context *pipe,
    CTX_INIT(resource_commit);
    CTX_INIT(create_video_codec);
    CTX_INIT(create_video_buffer);
+   CTX_INIT(set_compute_resources);
    CTX_INIT(set_global_binding);
    CTX_INIT(get_sample_position);
    CTX_INIT(invalidate_resource);

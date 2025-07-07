@@ -523,7 +523,7 @@ fn validate_image_desc(
     // host_ptr is not NULL and image_slice_pitch = 0, image_slice_pitch is calculated as
     // image_row_pitch × image_height for a 2D image array or 3D image and image_row_pitch for a 1D
     // image array. If image_slice_pitch is not 0, it must be a multiple of the image_row_pitch.
-    let has_buf_parent = parent.as_ref().is_some_and(|p| p.is_buffer());
+    let has_buf_parent = parent.as_ref().map_or(false, |p| p.is_buffer());
     if host_ptr.is_null() {
         if (desc.image_row_pitch != 0 || desc.image_slice_pitch != 0) && !has_buf_parent {
             return Err(err);
@@ -656,7 +656,7 @@ fn validate_buffer(
                                 let addr_alignment = dev.image_base_address_alignment();
                                 if addr_alignment == 0 {
                                     return Err(CL_INVALID_OPERATION);
-                                } else if !is_aligned_to(host_ptr, addr_alignment as usize) {
+                                } else if !is_alligned(host_ptr, addr_alignment as usize) {
                                     return Err(err);
                                 }
                             }
@@ -1020,16 +1020,10 @@ fn create_sampler_with_properties(
     let sampler_properties =
         unsafe { Properties::new(sampler_properties) }.ok_or(CL_INVALID_VALUE)?;
     for (&key, &val) in sampler_properties.iter() {
-        match u32::try_from(key).or(Err(CL_INVALID_VALUE))? {
-            CL_SAMPLER_ADDRESSING_MODE => {
-                addressing_mode = cl_addressing_mode::try_from(val).or(Err(CL_INVALID_VALUE))?
-            }
-            CL_SAMPLER_FILTER_MODE => {
-                filter_mode = cl_filter_mode::try_from(val).or(Err(CL_INVALID_VALUE))?
-            }
-            CL_SAMPLER_NORMALIZED_COORDS => {
-                normalized_coords = cl_bool::try_from(val).or(Err(CL_INVALID_VALUE))?
-            }
+        match key as u32 {
+            CL_SAMPLER_ADDRESSING_MODE => addressing_mode = val as u32,
+            CL_SAMPLER_FILTER_MODE => filter_mode = val as u32,
+            CL_SAMPLER_NORMALIZED_COORDS => normalized_coords = val as u32,
             // CL_INVALID_VALUE if the property name in sampler_properties is not a supported
             // property name
             _ => return Err(CL_INVALID_VALUE),

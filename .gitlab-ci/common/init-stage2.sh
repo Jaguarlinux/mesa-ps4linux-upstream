@@ -76,7 +76,9 @@ fi
 # - vmx for Intel VT
 # - svm for AMD-V
 #
-if [ -n "$HWCI_ENABLE_X86_KVM" ]; then
+# Additionally, download the kernel image to boot the VM via HWCI_TEST_SCRIPT.
+#
+if [ "$HWCI_KVM" = "true" ]; then
     unset KVM_KERNEL_MODULE
     {
       grep -qs '\bvmx\b' /proc/cpuinfo && KVM_KERNEL_MODULE=kvm_intel
@@ -89,6 +91,11 @@ if [ -n "$HWCI_ENABLE_X86_KVM" ]; then
       echo "WARNING: Failed to detect CPU virtualization extensions"
     } || \
         modprobe ${KVM_KERNEL_MODULE}
+
+    mkdir -p /kernel
+    curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
+	-o "/kernel/${KERNEL_IMAGE_NAME}" \
+        "${KERNEL_IMAGE_BASE}/amd64/${KERNEL_IMAGE_NAME}"
 fi
 
 # Fix prefix confusion: the build installs to $CI_PROJECT_DIR, but we expect
@@ -101,9 +108,6 @@ export LIBGL_DRIVERS_PATH=/install/lib/dri
 # The navi21 boards seem to have trouble with ld.so.cache, so try explicitly
 # telling it to look in /usr/local/lib.
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-
-# The Broadcom devices need /usr/local/bin unconditionally added to the path
-export PATH=/usr/local/bin:$PATH
 
 # Store Mesa's disk cache under /tmp, rather than sending it out over NFS.
 export XDG_CACHE_HOME=/tmp
@@ -226,7 +230,7 @@ cleanup
 # upload artifacts (lava jobs)
 if [ -n "$S3_RESULTS_UPLOAD" ]; then
   tar --zstd -cf results.tar.zst results/;
-  ci-fairy s3cp --token-file "${S3_JWT_FILE}" results.tar.zst https://"$S3_RESULTS_UPLOAD"/results.tar.zst
+  s3_upload results.tar.zst "https://${S3_RESULTS_UPLOAD}/"
 fi
 
 # We still need to echo the hwci: mesa message, as some scripts rely on it, such

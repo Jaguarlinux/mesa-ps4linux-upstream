@@ -4,7 +4,7 @@ include:
 .vmware-qemu-traces:x86_64:
   stage: software-renderer
   extends:
-    - .lava-x86_64-piglit-traces
+    - .lava-piglit-traces:x86_64
     - .vmware-manual-rules
   timeout: 30m
   variables:
@@ -23,11 +23,10 @@ include:
 vmware-vmx-piglit:x86_64:
   stage: layered-backends
   extends:
-    - .lava-x86_64-test-gl
-    - .test-piglit
-    - .vmware-manual-rules
+    - .lava-test-deqp:x86_64
+    - .vmware-rules
   timeout: 30m
-  parallel: 4
+  parallel: 2
   variables:
     VISIBILITY_GROUP: "mesa-ci"
     GALLIUM_DRIVER: svga
@@ -39,5 +38,5 @@ vmware-vmx-piglit:x86_64:
     DEVICE_TYPE: x86
     BOOT_METHOD: ipxe
     KERNEL_REPO: "blu/linux"
-    KERNEL_TAG: "1106ba88b"
+    EXTERNAL_KERNEL_TAG: "1106ba88b"
     FDO_CI_CONCURRENT: 1

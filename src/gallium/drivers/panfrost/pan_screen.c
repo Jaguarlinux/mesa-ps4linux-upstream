@@ -156,11 +156,6 @@ panfrost_is_format_supported(struct pipe_screen *screen,
    case 1:
    case 4:
       break;
-   case 2:
-      if (dev->arch >= 12)
-         break;
-      else
-         return false;
    case 8:
    case 16:
       if (dev->debug & PAN_DBG_MSAA16)
@@ -369,7 +364,7 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       caps->max_tex_indirections = 16384; /* arbitrary */
       caps->max_control_flow_depth = 1024; /* arbitrary */
       /* Used as ABI on Midgard */
-      caps->max_inputs = dev->arch >= 9 ? 32 : 16;
+      caps->max_inputs = 16;
       caps->max_outputs = i == PIPE_SHADER_FRAGMENT ? 8 : PIPE_MAX_ATTRIBS;
       caps->max_temps = 256; /* arbitrary */
       caps->max_const_buffer0_size = 16 * 1024 * sizeof(float);
@@ -460,8 +455,11 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
    caps->max_mem_alloc_size = MIN2(available_ram, user_va_end - user_va_start);
 
    caps->max_local_size = 32768;
+   caps->max_private_size =
+   caps->max_input_size = 4096;
    caps->max_clock_frequency = 800; /* MHz -- TODO */
    caps->max_compute_units = dev->core_count;
+   caps->images_supported = true;
    caps->subgroup_sizes = pan_subgroup_size(dev->arch);
    caps->max_variable_threads_per_block = 1024; // TODO
 }
@@ -515,11 +513,9 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->anisotropic_filter =
       panfrost_device_gpu_rev(dev) >= dev->model->min_rev_anisotropic;
 
-   /* Compile side is done for Bifrost, Midgard TODO. Needs some kernel
-    * work to turn on, since CYCLE_COUNT_START needs to be issued. In
-    * kbase, userspace requests this via BASE_JD_REQ_PERMON. There is not
-    * yet way to request this with mainline TODO */
-   caps->shader_clock = dev->arch >= 6;
+   /* Compile side is TODO for Midgard. */
+   caps->shader_clock = dev->arch >= 6 &&
+      dev->kmod.props.gpu_can_query_timestamp;
 
    caps->vs_instanceid = true;
    caps->texture_multisample = true;
@@ -640,7 +636,7 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->shader_buffer_offset_alignment = 4;
 
-   caps->max_varyings = 32;
+   caps->max_varyings = dev->arch >= 9 ? 16 : 32;
 
    /* Removed in v6 (Bifrost) */
    caps->gl_clamp =
@@ -727,6 +723,7 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
    panfrost_resource_screen_destroy(pscreen);
    panfrost_pool_cleanup(&screen->mempools.bin);
    panfrost_pool_cleanup(&screen->mempools.desc);
+   pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 
    if (screen->vtbl.screen_destroy)
       screen->vtbl.screen_destroy(pscreen);
@@ -744,7 +741,7 @@ panfrost_screen_get_compiler_options(struct pipe_screen *pscreen,
                                      enum pipe_shader_ir ir,
                                      enum pipe_shader_type shader)
 {
-   return pan_shader_get_compiler_options(pan_screen(pscreen)->dev.arch);
+   return pan_screen(pscreen)->vtbl.get_compiler_options();
 }
 
 static struct disk_cache *
@@ -906,6 +903,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       panfrost_query_compression_modifiers;
 
    panfrost_resource_screen_init(&screen->base);
+   pan_blend_shader_cache_init(&dev->blend_shaders,
+                               panfrost_device_gpu_id(dev));
 
    panfrost_init_shader_caps(screen);
    panfrost_init_compute_caps(screen);

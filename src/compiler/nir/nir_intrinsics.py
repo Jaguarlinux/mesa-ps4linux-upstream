@@ -223,12 +223,6 @@ index("nir_alu_type", "src_type")
 # The nir_alu_type of the data output from a load or conversion
 index("nir_alu_type", "dest_type")
 
-# Source and destination data types for dpas_intel.  Needed here to
-# represent types that won't have a nir_alu_type.
-index("enum glsl_base_type", "src_base_type")
-index("enum glsl_base_type", "src_base_type2")
-index("enum glsl_base_type", "dest_base_type")
-
 # The swizzle mask for quad_swizzle_amd & masked_swizzle_amd
 index("unsigned", "swizzle_mask")
 
@@ -328,8 +322,6 @@ index("struct glsl_cmat_description", "cmat_desc")
 index("enum glsl_matrix_layout", "matrix_layout")
 index("nir_cmat_signed", "cmat_signed_mask")
 index("nir_op", "alu_op")
-index("unsigned", "neg_lo_amd")
-index("unsigned", "neg_hi_amd")
 
 # For Intel DPAS instrinsic.
 index("unsigned", "systolic_depth")
@@ -1126,14 +1118,6 @@ barycentric("coord_at_offset", 3, [2])
 intrinsic("load_sample_pos_from_id", src_comp=[1], dest_comp=2,
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
-# Demote a subset of samples given by a specified sample mask. This acts like a
-# per-sample demote, or an inverted accumulating gl_SampleMask write.
-intrinsic("demote_samples", src_comp=[1])
-
-# Convert float value to coverage mask.
-intrinsic("alpha_to_coverage", src_comp=[1], dest_comp=1, indices=[],
-          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[16])
-
 intrinsic("load_persp_center_rhw_ir3", dest_comp=1,
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
@@ -1352,7 +1336,6 @@ intrinsic("cmat_load", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT])
 intrinsic("cmat_store", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT])
 intrinsic("cmat_length", src_comp=[], dest_comp=1, indices=[CMAT_DESC], bit_sizes=[32])
 intrinsic("cmat_muladd", src_comp=[-1, -1, -1, -1], indices=[SATURATE, CMAT_SIGNED_MASK])
-intrinsic("cmat_convert", src_comp=[-1, -1], indices=[CMAT_SIGNED_MASK])
 intrinsic("cmat_unary_op", src_comp=[-1, -1], indices=[ALU_OP])
 intrinsic("cmat_binary_op", src_comp=[-1, -1, -1], indices=[ALU_OP])
 intrinsic("cmat_scalar_op", src_comp=[-1, -1, -1], indices=[ALU_OP])
@@ -1622,10 +1605,6 @@ intrinsic("load_local_shared_r600", src_comp=[0], dest_comp=0, indices = [], fla
 store("local_shared_r600", [1], [WRITE_MASK])
 store("tf_r600", [])
 
-# these two definitions are aimed at r600 indirect per_vertex_input accesses
-intrinsic("r600_indirect_vertex_at_index", dest_comp=1, src_comp=[1], flags=[CAN_ELIMINATE, CAN_REORDER])
-load("r600_indirect_per_vertex_input", [1, 1], [BASE, RANGE, COMPONENT, DEST_TYPE, IO_SEMANTICS], [CAN_ELIMINATE, CAN_REORDER])
-
 # AMD GCN/RDNA specific intrinsics
 
 # This barrier is a hint that prevents moving the instruction that computes
@@ -1797,32 +1776,6 @@ system_value("sbt_base_amd", 1, bit_sizes=[64])
 # 6. inverse ray direction (componentwise 1.0/ray direction)
 intrinsic("bvh64_intersect_ray_amd", [4, 2, 1, 3, 3, 3], 4, flags=[CAN_ELIMINATE, CAN_REORDER])
 
-# 1. HW descriptor
-# 2. BVH base
-# 3. instance cull mask
-# 4. ray extent
-# 5. ray origin
-# 6. ray direction
-# 7. node ID
-#
-# dst:
-# | component | box node    | instance node        | triangle node                     | procedural node                   |
-# |-----------|-------------|----------------------|-----------------------------------|-----------------------------------|
-# | 0         | child_id[0] |                      | t[0]                              |                                   |
-# | 1         | child_id[1] |                      | u[0]                              |                                   |
-# | 2         | child_id[2] | blas_addr_lo         | v[0]                              |                                   |
-# | 3         | child_id[3] | blas_addr_hi         | primitive_index_hit_kind[0]       | primitive_index                   |
-# | 4         | child_id[4] |                      | t[1]                              |                                   |
-# | 5         | child_id[5] |                      | u[1]                              |                                   |
-# | 6         | child_id[6] | user_data            | v[1]                              |                                   |
-# | 7         | child_id[7] | next_node_ids        | primitive_index_hit_kind[1]       |                                   |
-# | 8         |             |                      | geometry_index_navigation_bits[0] | geometry_index_navigation_bits[0] |
-# | 9         |             |                      | geometry_index_navigation_bits[1] | geometry_index_navigation_bits[1] |
-# | [10,12]   |             | object_ray_origin    |                                   |                                   |
-# | [13,15]   |             | object_ray_direction |                                   |                                   |
-#
-intrinsic("bvh8_intersect_ray_amd", [4, 2, 1, 1, 3, 3, 1], 16, flags=[CAN_ELIMINATE, CAN_REORDER])
-
 # Return of a callable in raytracing pipelines
 intrinsic("rt_return_amd")
 
@@ -1987,7 +1940,7 @@ intrinsic("strict_wqm_coord_amd", src_comp=[0], dest_comp=0, bit_sizes=[32], ind
           flags=[CAN_ELIMINATE])
 
 intrinsic("cmat_muladd_amd", src_comp=[-1, -1, 0], dest_comp=0, bit_sizes=src2,
-          indices=[SATURATE, NEG_LO_AMD, NEG_HI_AMD, SRC_BASE_TYPE, SRC_BASE_TYPE2], flags=[CAN_ELIMINATE])
+          indices=[SATURATE, CMAT_SIGNED_MASK], flags=[CAN_ELIMINATE])
 
 # Get the debug log buffer descriptor.
 intrinsic("load_debug_log_desc_amd", bit_sizes=[32], dest_comp=4, flags=[CAN_ELIMINATE, CAN_REORDER])
@@ -2191,6 +2144,12 @@ load("sysval_agx", [], [DESC_SET, BINDING, FLAGS], [CAN_REORDER, CAN_ELIMINATE])
 # documented elsewhere as they are too complicated for this comment.
 intrinsic("sample_mask_agx", src_comp=[1, 1])
 
+# Discard a subset of samples given by a specified sample mask. This acts like a
+# per-sample discard, or an inverted accumulating gl_SampleMask write. The
+# compiler will lower to sample_mask_agx, but that lowering is nontrivial as
+# sample_mask_agx also triggers depth/stencil testing.
+intrinsic("discard_agx", src_comp=[1])
+
 # For a given row of the polygon stipple given as an integer source in [0, 31],
 # load the 32-bit stipple pattern for that row.
 intrinsic("load_polygon_stipple_agx", src_comp=[1], dest_comp=1, bit_sizes=[32],
@@ -2308,15 +2267,6 @@ image("load_raw_intel", src_comp=[1], dest_comp=0,
       flags=[CAN_ELIMINATE])
 image("store_raw_intel", src_comp=[1, 0])
 
-# Maximum number of polygons processed in the fragment shader
-system_value("max_polygon_intel", 1, bit_sizes=[32])
-
-# Read the attribute thread payload at a given offset
-# src[] = { offset }
-intrinsic("read_attribute_payload_intel", dest_comp=1, bit_sizes=[32],
-          src_comp=[1],
-          flags=[CAN_ELIMINATE, CAN_REORDER])
-
 # Number of data items being operated on for a SIMD program.
 system_value("simd_width_intel", 1)
 
@@ -2387,9 +2337,6 @@ intrinsic("load_inline_data_intel", [], dest_comp=0,
           indices=[BASE],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
-# Dynamic fragment shader parameters.
-system_value("fs_msaa_intel", 1)
-
 # Intrinsics for Intel bindless thread dispatch
 # BASE=brw_topoloy_id
 system_value("topology_id_intel", 1, indices=[BASE])
@@ -2443,7 +2390,7 @@ system_value("ray_query_global_intel", 1, bit_sizes=[64])
 # its value. Some supported configurations will have the component count of
 # that matrix different than the others.
 intrinsic("dpas_intel", dest_comp=0, src_comp=[0, -1, 0],
-          indices=[DEST_BASE_TYPE, SRC_BASE_TYPE, SATURATE, SYSTOLIC_DEPTH, REPEAT_COUNT],
+          indices=[DEST_TYPE, SRC_TYPE, SATURATE, SYSTOLIC_DEPTH, REPEAT_COUNT],
           flags=[CAN_ELIMINATE])
 
 # NVIDIA-specific intrinsics
@@ -2462,8 +2409,6 @@ intrinsic("ldcx_nv", dest_comp=0, src_comp=[1, 1],
 intrinsic("load_sysval_nv", dest_comp=1, src_comp=[], bit_sizes=[32, 64],
           indices=[ACCESS, BASE], flags=[CAN_ELIMINATE])
 intrinsic("isberd_nv", dest_comp=1, src_comp=[1], bit_sizes=[32],
-          flags=[CAN_ELIMINATE, CAN_REORDER])
-intrinsic("vild_nv", dest_comp=1, src_comp=[1], bit_sizes=[32],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 intrinsic("al2p_nv", dest_comp=1, src_comp=[1], bit_sizes=[32],
           indices=[BASE, FLAGS], flags=[CAN_ELIMINATE, CAN_REORDER])

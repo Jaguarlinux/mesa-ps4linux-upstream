@@ -260,9 +260,6 @@ cmd_buffer_free_resources(struct v3dv_cmd_buffer *cmd_buffer)
 {
    list_for_each_entry_safe(struct v3dv_job, job,
                             &cmd_buffer->jobs, list_link) {
-      if (job->type == V3DV_JOB_TYPE_CPU_CSD_INDIRECT &&
-          cmd_buffer->device->pdevice->caps.cpu_queue)
-         v3dv_job_destroy(job->cpu.csd_indirect.csd_job);
       v3dv_job_destroy(job);
    }
 
@@ -412,7 +409,6 @@ job_compute_frame_tiling(struct v3dv_job *job,
    tiling->draw_tiles_y = DIV_ROUND_UP(height, tiling->tile_height);
 
    /* Size up our supertiles until we get under the limit */
-   const uint32_t max_supertiles = 256;
    tiling->supertile_width = 1;
    tiling->supertile_height = 1;
    for (;;) {
@@ -422,8 +418,16 @@ job_compute_frame_tiling(struct v3dv_job *job,
          DIV_ROUND_UP(tiling->draw_tiles_y, tiling->supertile_height);
       const uint32_t num_supertiles = tiling->frame_width_in_supertiles *
                                       tiling->frame_height_in_supertiles;
-      if (num_supertiles < max_supertiles)
+
+      /* While the hardware allows up to V3D_MAX_SUPERTILES, it doesn't allow
+       * 1xV3D_MAX_SUPERTILES or V3D_MAX_SUPERTILESx1 frame configurations; in
+       * these cases we need to increase the supertile size.
+       */
+      if (tiling->frame_width_in_supertiles < V3D_MAX_SUPERTILES &&
+          tiling->frame_height_in_supertiles < V3D_MAX_SUPERTILES &&
+          num_supertiles <= V3D_MAX_SUPERTILES) {
          break;
+      }
 
       if (tiling->supertile_width < tiling->supertile_height)
          tiling->supertile_width++;
@@ -1781,9 +1785,14 @@ cmd_buffer_subpass_create_job(struct v3dv_cmd_buffer *cmd_buffer,
          layers = util_last_bit(subpass->view_mask);
       }
 
+      uint32_t width =
+         state->render_area.offset.x + state->render_area.extent.width;
+      uint32_t height =
+         state->render_area.offset.y + state->render_area.extent.height;
+
       v3dv_job_start_frame(job,
-                           framebuffer->width,
-                           framebuffer->height,
+                           width,
+                           height,
                            layers,
                            true, false,
                            subpass->color_count,
@@ -2403,9 +2412,7 @@ update_gfx_uniform_state(struct v3dv_cmd_buffer *cmd_buffer)
                 V3DV_CMD_DIRTY_DESCRIPTOR_SETS |
                 V3DV_CMD_DIRTY_VIEW_INDEX |
                 V3DV_CMD_DIRTY_DRAW_ID)) ||
-      BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORTS) ||
-      (pipeline->blend.use_software &&
-       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS));
+      BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORTS);
 
    if (!dirty_uniform_state)
       return false;
@@ -2416,8 +2423,6 @@ update_gfx_uniform_state(struct v3dv_cmd_buffer *cmd_buffer)
    const bool has_new_descriptors = dirty & V3DV_CMD_DIRTY_DESCRIPTOR_SETS;
    const bool has_new_view_index = dirty & V3DV_CMD_DIRTY_VIEW_INDEX;
    const bool has_new_draw_id = dirty & V3DV_CMD_DIRTY_DRAW_ID;
-   const bool has_new_blend_constants = (pipeline->blend.use_software &&
-      BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS));
 
    /* VK_SHADER_STAGE_FRAGMENT_BIT */
    const bool has_new_descriptors_fs =
@@ -2431,8 +2436,7 @@ update_gfx_uniform_state(struct v3dv_cmd_buffer *cmd_buffer)
    const bool needs_fs_update = has_new_pipeline ||
                                 has_new_view_index ||
                                 has_new_push_constants_fs ||
-                                has_new_descriptors_fs ||
-                                has_new_blend_constants;
+                                has_new_descriptors_fs;
 
    if (needs_fs_update) {
       struct v3dv_shader_variant *fs_variant =

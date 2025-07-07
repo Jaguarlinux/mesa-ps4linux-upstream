@@ -76,31 +76,7 @@ nir_intrinsics_c = custom_target(
   depend_files : files('nir_intrinsics.py'),
 )
 
-with_nir_headers_only = (
-  gallium_drivers == ['d3d12'] and
-  get_option('gallium-d3d12-graphics').disabled() and
-  not [
-    with_gallium_vdpau,
-    with_gallium_va,
-    with_any_vk,
-    with_gallium_xa,
-    with_gallium_st_nine,
-    with_gallium_st_d3d10umd,
-    with_gallium_rusticl,
-    with_microsoft_clc,
-    with_spirv_to_dxil,
-    with_intel_clc,
-    with_clc,
-    with_drivers_clc,
-    get_option('intel-elk'),
-    with_tools.length() != 0,
-  ].contains(true))
-
-files_libnir = []
-if with_nir_headers_only
-  files_libnir += files('nir_stub.c')
-else
-  files_libnir += files(
+files_libnir = files(
   'nir.c',
   'nir.h',
   'nir_builder.c',
@@ -123,7 +99,6 @@ else
   'nir_from_ssa.c',
   'nir_functions.c',
   'nir_gather_info.c',
-  'nir_gather_output_deps.c',
   'nir_gather_tcs_info.c',
   'nir_gather_types.c',
   'nir_gather_xfb_info.c',
@@ -140,7 +115,6 @@ else
   'nir_loop_analyze.h',
   'nir_lower_alu.c',
   'nir_lower_alu_width.c',
-  'nir_lower_alpha.c',
   'nir_lower_alpha_test.c',
   'nir_lower_amul.c',
   'nir_lower_array_deref_of_vec.c',
@@ -333,8 +307,7 @@ else
   'nir_worklist.h',
   'nir_xfb_info.h',
   'nir_lower_atomics.c'
-  )
-endif
+)
 
 # When a file is too large, -Wmisleading-indentation will give a note about
 # not being able to process it, however that is not suppressable by a #pragma
@@ -346,17 +319,11 @@ if cc.get_id() == 'gcc'
   no_misleading_indentation += cc.get_supported_arguments('-Wno-misleading-indentation')
 endif
 
-custom_targets_libnir = []
-if not with_nir_headers_only
-  custom_targets_libnir += [nir_opt_algebraic_c, nir_opcodes_c,
-    nir_opcodes_h, nir_constant_expressions_c, nir_builder_opcodes_h,
-    nir_intrinsics_c, nir_intrinsics_h, nir_intrinsics_indices_h
-]
-endif
-
 _libnir = static_library(
   'nir',
-  [files_libnir, custom_targets_libnir],
+  [files_libnir, nir_opt_algebraic_c, nir_opcodes_c,
+   nir_opcodes_h, nir_constant_expressions_c, nir_builder_opcodes_h,
+   nir_intrinsics_c, nir_intrinsics_h, nir_intrinsics_indices_h],
   include_directories : [inc_include, inc_src],
   c_args : [c_msvc_compat_args, no_override_init_args, no_misleading_indentation],
   gnu_symbol_visibility : 'hidden',
@@ -407,7 +374,6 @@ if with_tests
         'tests/loop_analyze_tests.cpp',
         'tests/loop_unroll_tests.cpp',
         'tests/lower_alu_width_tests.cpp',
-        'tests/lower_discard_if_tests.cpp',
         'tests/minimize_call_live_states_test.cpp',
         'tests/mod_analysis_tests.cpp',
         'tests/negative_equal_tests.cpp',

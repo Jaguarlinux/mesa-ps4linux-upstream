@@ -37,7 +37,7 @@
 #include "pipe/p_state.h"
 
 #include "pipebuffer/pb_cache.h"
-#include "util/pb_slab.h"
+#include "pipebuffer/pb_slab.h"
 
 #include "util/blob.h"
 #include "util/disk_cache.h"
@@ -1544,7 +1544,6 @@ struct zink_screen {
       bool needs_sanitised_layer;
       bool io_opt;
       bool broken_const;
-      bool broken_demote;
    } driver_compiler_workarounds;
    struct {
       bool broken_l4a4;

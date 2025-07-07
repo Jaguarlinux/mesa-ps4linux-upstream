@@ -63,58 +63,32 @@
     FDO_DISTRIBUTION_EXEC: 'bash .gitlab-ci/container/container_job_trampoline.sh "${CI_JOB_NAME}"'
     # no need to pull the whole repo to build the container image
     GIT_STRATEGY: none
-    CI_BUILD_COMPONENTS: "$CI_BUILD_COMPONENTS_ANGLE $CI_BUILD_COMPONENTS_CROSVM $CI_BUILD_COMPONENTS_FLUSTER $CI_BUILD_COMPONENTS_PIGLIT"
 
 .container-builds-angle:
   variables:
     ANGLE_TAG: "${CONDITIONAL_BUILD_ANGLE_TAG}"
-    CI_BUILD_COMPONENTS_ANGLE: angle
-
-.container-builds-crosvm:
-  variables:
-    CROSVM_TAG: "${CONDITIONAL_BUILD_CROSVM_TAG}"
-    CI_BUILD_COMPONENTS_CROSVM: crosvm
-
-.container-builds-fluster:
-  variables:
-    FLUSTER_TAG: "${CONDITIONAL_BUILD_FLUSTER_TAG}"
-    CI_BUILD_COMPONENTS_FLUSTER: fluster
-
-.container-builds-piglit:
-  variables:
-    PIGLIT_TAG: "${CONDITIONAL_BUILD_PIGLIT_TAG}"
-    CI_BUILD_COMPONENTS_PIGLIT: piglit
 
 .container-builds-android:
   extends:
     - .container-builds-angle
+  variables:
+    # CI_BUILD_COMPONENTS is a space-separated list of components used during early tag checks
+    # If this job inherits from multiple .container-builds-*, it needs to combine them
+    # e.g: inherits from .container-builds-angle and .container-builds-piglit
+    # should make CI_BUILD_COMPONENTS="angle piglit"
+    CI_BUILD_COMPONENTS: "angle"
 
-.container-builds-arm32:
-  extends:
-    - .container-builds-piglit
-
-.container-builds-base:
-  extends:
-    - .container-builds-crosvm
-
-.container-builds-gl:
+.container-builds-x86_64:
   extends:
     - .container-builds-angle
-    - .container-builds-piglit
-
-.container-builds-video:
-  extends:
-    - .container-builds-fluster
-
-.container-builds-vk:
-  extends:
-    - .container-builds-piglit
-
-# Export the container rootfs and upload it to S3
-.export-container:
   variables:
-    FDO_DISTRIBUTION_PACKAGES: zstd
-    FDO_DISTRIBUTION_POST_EXEC: 'bash .gitlab-ci/container/fdo_cntr_export.sh'
+    CI_BUILD_COMPONENTS: "angle"
+
+.container-builds-arm64:
+  extends:
+    - .container-builds-angle
+  variables:
+    CI_BUILD_COMPONENTS: "angle"
 
 .use-base-image:
   extends:
@@ -139,6 +113,7 @@ debian/x86_64_build-base:
   variables:
     MESA_BASE_IMAGE: "debian/x86_64_build-base"
     MESA_BASE_TAG: *debian-x86_64_build-base
+    MESA_ARTIFACTS_BASE_TAG: *debian-x86_64_build-base
     LLVM_VERSION: *debian-x86_64-llvm
   needs:
     - debian/x86_64_build-base
@@ -228,15 +203,14 @@ debian/s390x_build:
 
 # Android NDK cross-build image
 .android-variables:
+  extends:
+    - .container-builds-android
   variables:
     ANDROID_VERSION: 14
     ANDROID_NDK_VERSION: "r27c"
     ANDROID_SDK_VERSION: 34
     # Space-separated list of interesting CTS modules
-    ANDROID_CTS_MODULES: >-
-      CtsGraphicsTestCases
-      CtsNativeHardwareTestCases
-      CtsSkQPTestCases
+    ANDROID_CTS_MODULES: CtsGraphicsTestCases
     ANDROID_LLVM_VERSION: llvmorg-19.1.7
     ANDROID_LLVM_ARTIFACT_NAME: android-x86_64-llvm-20250324
     # This can be confusing: LLVM_VERSION refers to the host LLVM toolchain
@@ -247,6 +221,7 @@ debian/s390x_build:
 debian/android_build:
   extends:
     - .android-variables
+    - .container-builds-android
     - .use-debian/x86_64_build-base
   variables:
     MESA_IMAGE_TAG: &debian-android_build ${DEBIAN_BUILD_TAG}
@@ -273,7 +248,7 @@ debian/arm64_build:
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
   variables:
-    MESA_IMAGE_TAG: &debian-arm64_build "${DEBIAN_BUILD_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
+    MESA_IMAGE_TAG: &debian-arm64_build "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
     LLVM_VERSION: &debian-arm64-llvm 19
 
 .use-debian/arm64_build:
@@ -339,9 +314,9 @@ fedora/x86_64_build:
     - .fdo.container-build@fedora
     - .container
   variables:
-    FDO_DISTRIBUTION_VERSION: 42
+    FDO_DISTRIBUTION_VERSION: 41
     MESA_IMAGE_TAG: &fedora-x86_64_build ${FEDORA_X86_64_BUILD_TAG}
-    LLVM_VERSION: &fedora-x86_64-llvm 20
+    LLVM_VERSION: &fedora-x86_64-llvm 19
 
 .use-fedora/x86_64_build:
   tags:
@@ -359,10 +334,8 @@ fedora/x86_64_build:
 debian/x86_64_test-base:
   extends:
     - .debian-container
-    - .firmware_x86_64
-    - .container-builds-base
   variables:
-    MESA_IMAGE_TAG: &debian-x86_64_test-base "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
+    MESA_IMAGE_TAG: &debian-x86_64_test-base "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${KERNEL_TAG}"
     LLVM_VERSION: *debian-x86_64-llvm
 
 .use-debian/x86_64_test-base:
@@ -386,7 +359,6 @@ debian/arm32_test-base:
   extends:
     - .debian-container
     - .firmware_arm32
-    - .container-builds-base
   variables:
     MESA_IMAGE_TAG: &debian-arm32_test-base "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
     LLVM_VERSION: *debian-arm64-llvm
@@ -413,8 +385,6 @@ debian/arm64_test-base:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
   extends:
     - .debian-container
-    - .firmware_arm64
-    - .container-builds-base
   variables:
     MESA_IMAGE_TAG: &debian-arm64_test-base "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
     LLVM_VERSION: *debian-arm64-llvm
@@ -435,13 +405,9 @@ debian/arm64_test-base:
 
 # Debian based x86_64 test image for GL
 debian/x86_64_test-gl:
-  extends:
-    - .use-debian/x86_64_test-base
-    - .container-builds-gl
-    - .export-container
+  extends: .use-debian/x86_64_test-base
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-gl ${DEBIAN_TEST_GL_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/x86_64_test-gl:${DEBIAN_TEST_GL_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
 
 .use-debian/x86_64_test-gl:
   tags:
@@ -457,13 +423,9 @@ debian/x86_64_test-gl:
 
 # Debian based x86_64 test image for VK
 debian/x86_64_test-vk:
-  extends:
-    - .use-debian/x86_64_test-base
-    - .container-builds-vk
-    - .export-container
+  extends: .use-debian/x86_64_test-base
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-vk ${DEBIAN_TEST_VK_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/x86_64_test-vk:${DEBIAN_TEST_VK_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
 
 .use-debian/x86_64_test-vk:
   tags:
@@ -482,7 +444,6 @@ debian/x86_64_test-android:
   extends:
     - .android-variables
     - .use-debian/x86_64_test-base
-    - .container-builds-android
   variables:
     MESA_IMAGE_TAG: &debian-x86_64_test-android ${DEBIAN_TEST_ANDROID_TAG}
 
@@ -498,28 +459,6 @@ debian/x86_64_test-android:
     MESA_IMAGE_TAG: *debian-x86_64_test-android
   needs:
     - debian/x86_64_test-android
-
-# Debian based x86_64 test image for video
-debian/x86_64_test-video:
-  extends:
-    - .use-debian/x86_64_test-base
-    - .container-builds-video
-    - .export-container
-  variables:
-    MESA_IMAGE_TAG: &debian-x86_64_test-video ${DEBIAN_TEST_VIDEO_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/x86_64_test-video:${DEBIAN_TEST_VIDEO_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
-
-.use-debian/x86_64_test-video:
-  tags:
-    - $FDO_RUNNER_JOB_PRIORITY_TAG_X86_64
-  extends:
-    - .set-image-base-tag
-  variables:
-    MESA_BASE_TAG: *debian-x86_64_test-base
-    MESA_IMAGE_PATH: "debian/x86_64_test-video"
-    MESA_IMAGE_TAG: *debian-x86_64_test-video
-  needs:
-    - debian/x86_64_test-video
 
 # Debian-based x86_64 image to run Python utilities
 debian/x86_64_pyutils:
@@ -545,13 +484,9 @@ debian/x86_64_pyutils:
 debian/arm32_test-gl:
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends:
-    - .use-debian/arm32_test-base
-    - .container-builds-arm32
-    - .export-container
+  extends: .use-debian/arm32_test-base
   variables:
     MESA_IMAGE_TAG: &debian-arm32_test-gl ${DEBIAN_TEST_GL_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/arm32_test-gl:${DEBIAN_TEST_GL_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
 
 .use-debian/arm32_test-gl:
   tags:
@@ -571,9 +506,7 @@ debian/arm32_test-vk:
     - when: never # There are currently no arm32 VK jobs
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends:
-    - .use-debian/arm32_test-base
-    - .container-builds-arm32
+  extends: .use-debian/arm32_test-base
   variables:
     MESA_IMAGE_TAG: &debian-arm32_test-vk ${DEBIAN_TEST_VK_TAG}
 
@@ -595,11 +528,9 @@ debian/arm64_test-gl:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
   extends:
     - .use-debian/arm64_test-base
-    - .container-builds-gl
-    - .export-container
+    - .container-builds-arm64
   variables:
     MESA_IMAGE_TAG: &debian-arm64_test-gl ${DEBIAN_TEST_GL_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/arm64_test-gl:${DEBIAN_TEST_GL_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
 
 .use-debian/arm64_test-gl:
   tags:
@@ -617,13 +548,9 @@ debian/arm64_test-gl:
 debian/arm64_test-vk:
   tags:
     - $FDO_RUNNER_JOB_PRIORITY_TAG_AARCH64
-  extends:
-    - .use-debian/arm64_test-base
-    - .container-builds-vk
-    - .export-container
+  extends: .use-debian/arm64_test-base
   variables:
     MESA_IMAGE_TAG: &debian-arm64_test-vk ${DEBIAN_TEST_VK_TAG}
-    LAVA_DISTRIBUTION_TAG: "debian/arm64_test-vk:${DEBIAN_TEST_VK_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
 
 .use-debian/arm64_test-vk:
   tags:
@@ -638,7 +565,7 @@ debian/arm64_test-vk:
     - debian/arm64_test-vk
 
 # Get firmware directly rather than using package versions.
-# Change DEBIAN_BASE_TAG to add firmware changes.
+# Change KERNEL_ROOTFS_TAG to add firmware changes.
 # FIRMWARE_FILES is a list of json files arranged by vendor in .gitlab-ci/firmware/*
 .firmware_x86_64:
   variables:
@@ -655,6 +582,60 @@ debian/arm64_test-vk:
   variables:
     FIRMWARE_FILES: |
 
+.kernel+rootfs:
+  extends:
+    - .container+build-rules
+    - .debian-container-version
+  stage: container
+  timeout: 120m
+  variables:
+    GIT_STRATEGY: fetch
+    MESA_ROOTFS_TAG: &kernel-rootfs ${KERNEL_ROOTFS_TAG}
+    DISTRIBUTION_TAG: &distribution-tag-arm "${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_ARTIFACTS_TAG}--${MESA_TEMPLATES_COMMIT}"
+  script:
+    - .gitlab-ci/container/lava_build.sh
+
+kernel+rootfs_x86_64:
+  extends:
+    - .use-debian/x86_64_build-base
+    - .kernel+rootfs
+    - .firmware_x86_64
+    - .container-builds-x86_64
+  image: "$FDO_BASE_IMAGE"
+  variables:
+    DEBIAN_ARCH: "amd64"
+    DISTRIBUTION_TAG: &distribution-tag-x86_64 "${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_ARTIFACTS_BASE_TAG}--${MESA_TEMPLATES_COMMIT}"
+    LLVM_VERSION: *debian-x86_64-llvm
+
+kernel+rootfs_arm64:
+  extends:
+    - .use-debian/arm64_build
+    - .kernel+rootfs
+    - .firmware_arm64
+    - .container-builds-arm64
+  variables:
+    DEBIAN_ARCH: "arm64"
+    LLVM_VERSION: *debian-arm64-llvm
+
+kernel+rootfs_arm32:
+  extends:
+    - kernel+rootfs_arm64
+    - .firmware_arm32
+  variables:
+    DEBIAN_ARCH: "armhf"
+    LLVM_VERSION: &debian-arm32-llvm 15 # no armhf builds for LLVM
+
+# Cannot use anchors defined here from included files, so use extends: instead
+.use-kernel+rootfs-arm:
+  variables:
+    DISTRIBUTION_TAG: *distribution-tag-arm
+    MESA_ROOTFS_TAG: *kernel-rootfs
+
+.use-kernel+rootfs-x86_64:
+  variables:
+    DISTRIBUTION_TAG: *distribution-tag-x86_64
+    MESA_ROOTFS_TAG: *kernel-rootfs
+
 # x86_64 image with ARM64 & ARM32 kernel & rootfs for baremetal testing
 .debian/baremetal_arm_test:
   extends:
@@ -664,57 +645,49 @@ debian/arm64_test-vk:
     # Don't want the .container rules
     - .container+build-rules
   variables:
-    FDO_DISTRIBUTION_TAG: "${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+    FDO_DISTRIBUTION_TAG: "${MESA_IMAGE_TAG}--${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+    ARTIFACTS_PREFIX: "https://${S3_HOST}/${S3_KERNEL_BUCKET}"
+    ARTIFACTS_SUFFIX: "${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_ARTIFACTS_TAG}--${MESA_TEMPLATES_COMMIT}"
     MESA_ARTIFACTS_TAG: *debian-arm64_build
+    MESA_ROOTFS_TAG: *kernel-rootfs
 
-debian/baremetal_arm32_test-gl:
+debian/baremetal_arm32_test:
   extends:
     - .debian/baremetal_arm_test
   needs:
-    - debian/arm32_test-gl
+    - kernel+rootfs_arm32
   variables:
-    MESA_IMAGE_TAG: &baremetal-arm32_test-gl "${DEBIAN_TEST_GL_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
-    LAVA_DISTRIBUTION_TAG: !reference [debian/arm32_test-gl, variables, LAVA_DISTRIBUTION_TAG]
+    MESA_IMAGE_TAG: &debian-arm32_test "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
 
-debian/baremetal_arm64_test-gl:
+debian/baremetal_arm64_test:
   extends:
     - .debian/baremetal_arm_test
   needs:
-    - debian/arm64_test-gl
+    - kernel+rootfs_arm64
   variables:
-    MESA_IMAGE_TAG: &baremetal-arm64_test-gl "${DEBIAN_TEST_GL_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
-    LAVA_DISTRIBUTION_TAG: !reference [debian/arm64_test-gl, variables, LAVA_DISTRIBUTION_TAG]
+    MESA_IMAGE_TAG: &debian-arm64_test "${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
 
-debian/baremetal_arm64_test-vk:
+.use-debian/baremetal_arm_test:
+  variables:
+    MESA_ROOTFS_TAG: *kernel-rootfs
+
+.use-debian/baremetal_arm32_test:
+  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
   extends:
-    - .debian/baremetal_arm_test
-  needs:
-    - debian/arm64_test-vk
+    - .use-debian/baremetal_arm_test
   variables:
-    MESA_IMAGE_TAG: &baremetal-arm64_test-vk "${DEBIAN_TEST_VK_TAG}--${DEBIAN_BASE_TAG}--${PKG_REPO_REV}"
-    LAVA_DISTRIBUTION_TAG: !reference [debian/arm64_test-vk, variables, LAVA_DISTRIBUTION_TAG]
-
-.use-debian/baremetal_arm32_test-gl:
-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
-  variables:
-    MESA_IMAGE_PATH: "debian/baremetal_arm32_test-gl"
-    MESA_IMAGE_TAG: *baremetal-arm32_test-gl
+    MESA_IMAGE_PATH: "debian/baremetal_arm32_test"
+    MESA_IMAGE_TAG: *debian-arm32_test
   needs:
     - debian/baremetal_arm_test
 
-.use-debian/baremetal_arm64_test-gl:
-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+.use-debian/baremetal_arm64_test:
+  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${MESA_ROOTFS_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+  extends:
+    - .use-debian/baremetal_arm_test
   variables:
-    MESA_IMAGE_PATH: "debian/baremetal_arm64_test-gl"
-    MESA_IMAGE_TAG: *baremetal-arm64_test-gl
-  needs:
-    - debian/baremetal_arm_test
-
-.use-debian/baremetal_arm64_test-vk:
-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
-  variables:
-    MESA_IMAGE_PATH: "debian/baremetal_arm64_test-vk"
-    MESA_IMAGE_TAG: *baremetal-arm64_test-vk
+    MESA_IMAGE_PATH: "debian/baremetal_arm64_test"
+    MESA_IMAGE_TAG: *debian-arm64_test
   needs:
     - debian/baremetal_arm_test
 

@@ -15,6 +15,7 @@ Contents:
    context
    cso
    buffermapping
+   distro
    postprocess
    glossary
 

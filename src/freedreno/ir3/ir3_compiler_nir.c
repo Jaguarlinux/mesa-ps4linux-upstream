@@ -2216,11 +2216,47 @@ get_barycentric(struct ir3_context *ctx, enum ir3_bary bary)
    return ctx->ij[bary];
 }
 
+/* TODO: make this a common NIR helper?
+ * there is a nir_system_value_from_intrinsic but it takes nir_intrinsic_op so
+ * it can't be extended to work with this
+ */
+static gl_system_value
+nir_intrinsic_barycentric_sysval(nir_intrinsic_instr *intr)
+{
+   enum glsl_interp_mode interp_mode = nir_intrinsic_interp_mode(intr);
+   gl_system_value sysval;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_barycentric_pixel:
+      if (interp_mode == INTERP_MODE_NOPERSPECTIVE)
+         sysval = SYSTEM_VALUE_BARYCENTRIC_LINEAR_PIXEL;
+      else
+         sysval = SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL;
+      break;
+   case nir_intrinsic_load_barycentric_centroid:
+      if (interp_mode == INTERP_MODE_NOPERSPECTIVE)
+         sysval = SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID;
+      else
+         sysval = SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID;
+      break;
+   case nir_intrinsic_load_barycentric_sample:
+      if (interp_mode == INTERP_MODE_NOPERSPECTIVE)
+         sysval = SYSTEM_VALUE_BARYCENTRIC_LINEAR_SAMPLE;
+      else
+         sysval = SYSTEM_VALUE_BARYCENTRIC_PERSP_SAMPLE;
+      break;
+   default:
+      unreachable("invalid barycentric intrinsic");
+   }
+
+   return sysval;
+}
+
 static void
 emit_intrinsic_barycentric(struct ir3_context *ctx, nir_intrinsic_instr *intr,
                            struct ir3_instruction **dst)
 {
-   gl_system_value sysval = ir3_nir_intrinsic_barycentric_sysval(intr);
+   gl_system_value sysval = nir_intrinsic_barycentric_sysval(intr);
 
    if (!ctx->so->key.msaa && ctx->compiler->gen < 6) {
       switch (sysval) {
@@ -3854,7 +3890,7 @@ emit_tex(struct ir3_context *ctx, nir_tex_instr *tex)
          ir3_builder_at(ir3_before_terminator(ctx->in_block));
       sam = ir3_SAM(&build, opc, type, MASK(ncomp), 0, NULL,
                     get_barycentric(ctx, IJ_PERSP_PIXEL), 0);
-      sam->prefetch.input_offset = ir3_nir_coord_offset(tex->src[idx].src.ssa, NULL);
+      sam->prefetch.input_offset = ir3_nir_coord_offset(tex->src[idx].src.ssa);
       /* make sure not to add irrelevant flags like S2EN */
       sam->flags = flags | (info.flags & IR3_INSTR_B);
       sam->prefetch.tex = info.tex_idx;
@@ -5770,7 +5806,24 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    ir3_debug_print(ir, "AFTER: ir3_sched");
 
-   if (ctx->tcs_header) {
+   /* Pre-assign VS inputs on a6xx+ binning pass shader, to align
+    * with draw pass VS, so binning and draw pass can both use the
+    * same VBO state.
+    *
+    * Note that VS inputs are expected to be full precision.
+    */
+   bool pre_assign_inputs = (ir->compiler->gen >= 6) &&
+                            (ir->type == MESA_SHADER_VERTEX) &&
+                            so->binning_pass;
+
+   if (pre_assign_inputs) {
+      foreach_input (in, ir) {
+         assert(in->opc == OPC_META_INPUT);
+         unsigned inidx = in->input.inidx;
+
+         in->dsts[0]->num = so->nonbinning->inputs[inidx].regid;
+      }
+   } else if (ctx->tcs_header) {
       /* We need to have these values in the same registers between VS and TCS
        * since the VS chains to TCS and doesn't get the sysvals redelivered.
        */
@@ -5793,8 +5846,7 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       int idx = 0;
 
       foreach_input (instr, ir) {
-         if (instr->input.sysval !=
-             (SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL + so->prefetch_bary_type))
+         if (instr->input.sysval != SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL)
             continue;
 
          assert(idx < 2);
@@ -5852,8 +5904,20 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    foreach_input (in, ir) {
       assert(in->opc == OPC_META_INPUT);
       unsigned inidx = in->input.inidx;
-      so->inputs[inidx].regid = in->dsts[0]->num;
-      so->inputs[inidx].half = !!(in->dsts[0]->flags & IR3_REG_HALF);
+
+      if (pre_assign_inputs && !so->inputs[inidx].sysval) {
+         if (VALIDREG(so->nonbinning->inputs[inidx].regid)) {
+            compile_assert(
+               ctx, in->dsts[0]->num == so->nonbinning->inputs[inidx].regid);
+            compile_assert(ctx, !!(in->dsts[0]->flags & IR3_REG_HALF) ==
+                                   so->nonbinning->inputs[inidx].half);
+         }
+         so->inputs[inidx].regid = so->nonbinning->inputs[inidx].regid;
+         so->inputs[inidx].half = so->nonbinning->inputs[inidx].half;
+      } else {
+         so->inputs[inidx].regid = in->dsts[0]->num;
+         so->inputs[inidx].half = !!(in->dsts[0]->flags & IR3_REG_HALF);
+      }
    }
 
    uint8_t clip_cull_mask = ctx->so->clip_mask | ctx->so->cull_mask;
@@ -5922,10 +5986,6 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    if ((ctx->so->type == MESA_SHADER_FRAGMENT) &&
        ctx->s->info.fs.post_depth_coverage)
       so->post_depth_coverage = true;
-
-   if (ctx->so->type == MESA_SHADER_FRAGMENT) {
-      so->fs.depth_layout = ctx->s->info.fs.depth_layout;
-   }
 
    ctx->so->per_samp = ctx->s->info.fs.uses_sample_shading;
 

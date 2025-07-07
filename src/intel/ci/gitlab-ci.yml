@@ -3,12 +3,13 @@ include:
 
 anv-jsl-vk:
   extends:
-    - .lava-x86_64-test-vk
     - .anv-test
     - .lava-acer-cb317-1h-c3z6-dedede:x86_64
   variables:
     DEQP_SUITE: anv-jsl
     VK_DRIVER: intel
+    # force fixed kernel, since too many flakes and unexpected results seen with 6.13-rc4 and 6.11-rc7
+    EXTERNAL_KERNEL_TAG: "v6.6.21-mesa-f8ea"
   parallel: 5
 
 anv-jsl-vk-full:
@@ -22,7 +23,6 @@ anv-jsl-vk-full:
 
 anv-adl-vk:
   extends:
-    - .lava-x86_64-test-vk
     - .anv-test
     - .lava-acer-cbv514-1h-34uz-brya:x86_64
   variables:
@@ -42,7 +42,6 @@ anv-adl-vk-full:
 
 anv-tgl-vk:
   extends:
-    - .lava-x86_64-test-vk
     - .anv-test
     - .lava-acer-cp514-2h-1160g7-volteer:x86_64
   variables:
@@ -207,7 +206,6 @@ iris-amly-egl:
 iris-kbl-piglit:
   extends:
     - .iris-kbl-test
-    - .test-piglit
   parallel: 2
   variables:
     HWCI_START_XORG: 1
@@ -284,7 +282,6 @@ intel-adl-cl:
     - .intel-adl-test
     - .lava-acer-n20q11-r856ltn-p1s2-nissa:x86_64
     - .intel-rules
-    - .test-piglit
   rules:
     - !reference [.intel-adl-test, rules]
     - !reference [.intel-rules, rules]

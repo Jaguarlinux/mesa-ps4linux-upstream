@@ -12,9 +12,6 @@ set -ex
 # Our rootfs may not have "less", which apitrace uses during apitrace dump
 export PAGER=cat  # FIXME: export everywhere
 
-# Check we're using the version of Piglit we think we are
-ci_tag_test_time_check "PIGLIT_TAG"
-
 INSTALL=$(realpath -s "$PWD"/install)
 
 export PIGLIT_REPLAY_DESCRIPTION_FILE="$INSTALL/$PIGLIT_TRACES_FILE"
@@ -130,8 +127,7 @@ replay_s3_upload_images() {
             __DESTINATION_FILE_PATH="$__S3_TRACES_PREFIX/${line##*-}"
         fi
 
-        ci-fairy s3cp --token-file "${S3_JWT_FILE}" "$RESULTS_DIR/$__PREFIX/$line" \
-            "https://${__S3_PATH}/${__DESTINATION_FILE_PATH}"
+        s3_upload "$RESULTS_DIR/$__PREFIX/$line" "https://${__S3_PATH}/${__DESTINATION_FILE_PATH%/*}/"
     done
 }
 

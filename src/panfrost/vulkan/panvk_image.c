@@ -326,7 +326,7 @@ panvk_image_get_total_size(const struct panvk_image *image)
 }
 
 static bool
-is_disjoint(const struct panvk_image *image)
+is_disjoint(struct panvk_image *image)
 {
    assert((image->plane_count > 1 &&
            image->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
@@ -336,7 +336,7 @@ is_disjoint(const struct panvk_image *image)
 }
 
 static void
-panvk_image_init(struct panvk_image *image,
+panvk_image_init(struct panvk_device *dev, struct panvk_image *image,
                  const VkImageCreateInfo *pCreateInfo)
 {
    /* Add any create/usage flags that might be needed for meta operations.
@@ -372,7 +372,7 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    if (!image)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   panvk_image_init(image, pCreateInfo);
+   panvk_image_init(dev, image, pCreateInfo);
 
    /*
     * From the Vulkan spec:
@@ -405,18 +405,19 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
 
-static void
-get_image_subresource_layout(const struct panvk_image *image,
-                             const VkImageSubresource2 *subres2,
-                             VkSubresourceLayout2 *layout2)
+VKAPI_ATTR void VKAPI_CALL
+panvk_GetImageSubresourceLayout(VkDevice _device, VkImage _image,
+                                const VkImageSubresource *pSubresource,
+                                VkSubresourceLayout *pLayout)
 {
-   const VkImageSubresource *subres = &subres2->imageSubresource;
-   VkSubresourceLayout *layout = &layout2->subresourceLayout;
-   unsigned plane = panvk_plane_index(image->vk.format, subres->aspectMask);
+   VK_FROM_HANDLE(panvk_image, image, _image);
+
+   unsigned plane =
+      panvk_plane_index(image->vk.format, pSubresource->aspectMask);
    assert(plane < PANVK_MAX_PLANES);
 
    const struct pan_image_slice_layout *slice_layout =
-      &image->planes[plane].layout.slices[subres->mipLevel];
+      &image->planes[plane].layout.slices[pSubresource->mipLevel];
 
    uint64_t base_offset = 0;
    if (!is_disjoint(image)) {
@@ -424,37 +425,13 @@ get_image_subresource_layout(const struct panvk_image *image,
          base_offset += image->planes[plane_idx].layout.data_size;
    }
 
-   layout->offset = base_offset +
-      slice_layout->offset + (subres->arrayLayer *
+   pLayout->offset = base_offset +
+      slice_layout->offset + (pSubresource->arrayLayer *
                               image->planes[plane].layout.array_stride);
-   layout->size = slice_layout->size;
-   layout->rowPitch = slice_layout->row_stride;
-   layout->arrayPitch = image->planes[plane].layout.array_stride;
-   layout->depthPitch = slice_layout->surface_stride;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-panvk_GetImageSubresourceLayout2(VkDevice device, VkImage image,
-                                 const VkImageSubresource2 *pSubresource,
-                                 VkSubresourceLayout2 *pLayout)
-{
-   VK_FROM_HANDLE(panvk_image, img, image);
-
-   get_image_subresource_layout(img, pSubresource, pLayout);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-panvk_GetDeviceImageSubresourceLayoutKHR(
-   VkDevice device, const VkDeviceImageSubresourceInfoKHR *pInfo,
-   VkSubresourceLayout2KHR *pLayout)
-{
-   VK_FROM_HANDLE(panvk_device, dev, device);
-   struct panvk_image image = {0};
-
-   vk_image_init(&dev->vk, &image.vk, pInfo->pCreateInfo);
-   panvk_image_init(&image, pInfo->pCreateInfo);
-   get_image_subresource_layout(&image, pInfo->pSubresource, pLayout);
-   vk_image_finish(&image.vk);
+   pLayout->size = slice_layout->size;
+   pLayout->rowPitch = slice_layout->row_stride;
+   pLayout->arrayPitch = image->planes[plane].layout.array_stride;
+   pLayout->depthPitch = slice_layout->surface_stride;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -503,14 +480,13 @@ panvk_GetDeviceImageMemoryRequirements(VkDevice device,
 
    struct panvk_image image;
    vk_image_init(&dev->vk, &image.vk, pInfo->pCreateInfo);
-   panvk_image_init(&image, pInfo->pCreateInfo);
+   panvk_image_init(dev, &image, pInfo->pCreateInfo);
 
    VkImageMemoryRequirementsInfo2 info2 = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
       .image = panvk_image_to_handle(&image),
    };
    panvk_GetImageMemoryRequirements2(device, &info2, pMemoryRequirements);
-   vk_image_finish(&image.vk);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -533,8 +509,9 @@ panvk_GetDeviceImageSparseMemoryRequirements(VkDevice device,
    *pSparseMemoryRequirementCount = 0;
 }
 
-static void
-panvk_image_plane_bind(struct pan_image *plane, struct pan_kmod_bo *bo,
+static VkResult
+panvk_image_plane_bind(struct panvk_device *dev,
+                       struct pan_image *plane, struct pan_kmod_bo *bo,
                        uint64_t base, uint64_t offset)
 {
    plane->data.base = base;
@@ -545,7 +522,9 @@ panvk_image_plane_bind(struct pan_image *plane, struct pan_kmod_bo *bo,
       void *bo_base = pan_kmod_bo_mmap(bo, 0, pan_kmod_bo_size(bo),
                                        PROT_WRITE, MAP_SHARED, NULL);
 
-      assert(bo_base != MAP_FAILED);
+      if (bo_base == MAP_FAILED)
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "Failed to CPU map AFBC image plane");
 
       for (unsigned layer = 0; layer < plane->layout.array_size;
            layer++) {
@@ -562,18 +541,22 @@ panvk_image_plane_bind(struct pan_image *plane, struct pan_kmod_bo *bo,
       ASSERTED int ret = os_munmap(bo_base, pan_kmod_bo_size(bo));
       assert(!ret);
    }
+
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
                        const VkBindImageMemoryInfo *pBindInfos)
 {
-   const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
-      vk_find_struct_const(pBindInfos->pNext, BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+   VK_FROM_HANDLE(panvk_device, dev, device);
 
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
       VK_FROM_HANDLE(panvk_image, image, pBindInfos[i].image);
       struct pan_kmod_bo *old_bo = image->bo;
+      const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
+         vk_find_struct_const(pBindInfos[i].pNext,
+                              BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
 
       if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
          VkImage wsi_vk_image = wsi_common_get_image(swapchain_info->swapchain,
@@ -584,9 +567,11 @@ panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(wsi_image->plane_count == 1);
 
          image->bo = pan_kmod_bo_get(wsi_image->bo);
-         panvk_image_plane_bind(&image->planes[0], image->bo,
-                                wsi_image->planes[0].data.base,
-                                wsi_image->planes[0].data.offset);
+         VkResult result = panvk_image_plane_bind(
+            dev, &image->planes[0], image->bo, wsi_image->planes[0].data.base,
+            wsi_image->planes[0].data.offset);
+         if (result != VK_SUCCESS)
+            return result;
       } else {
          VK_FROM_HANDLE(panvk_device_memory, mem, pBindInfos[i].memory);
          assert(mem);
@@ -598,12 +583,18 @@ panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
                                     BIND_IMAGE_PLANE_MEMORY_INFO);
             uint8_t plane =
                panvk_plane_index(image->vk.format, plane_info->planeAspect);
-            panvk_image_plane_bind(&image->planes[plane], image->bo,
-                                   mem->addr.dev, offset);
+            VkResult result = panvk_image_plane_bind(
+               dev, &image->planes[plane], image->bo, mem->addr.dev,
+               offset);
+            if (result != VK_SUCCESS)
+               return result;
          } else {
             for (unsigned plane = 0; plane < image->plane_count; plane++) {
-               panvk_image_plane_bind(&image->planes[plane], image->bo,
-                                      mem->addr.dev, offset);
+               VkResult result = panvk_image_plane_bind(
+                 dev, &image->planes[plane], image->bo, mem->addr.dev,
+                 offset);
+               if (result != VK_SUCCESS)
+                  return result;
                offset += image->planes[plane].layout.data_size;
             }
          }

@@ -7,7 +7,7 @@ use std::ops::{Index, IndexMut, Range};
 
 pub struct RegTracker<T> {
     reg: [T; 255],
-    ureg: [T; 80],
+    ureg: [T; 63],
     pred: [T; 7],
     upred: [T; 7],
     carry: [T; 1],

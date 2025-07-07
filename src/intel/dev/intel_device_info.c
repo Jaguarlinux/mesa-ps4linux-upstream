@@ -521,36 +521,17 @@ static const struct intel_device_info intel_device_info_chv = {
    .simulator_id = 13,
 };
 
-#define CMAT_PRE_XEHP_CONFIGURATIONS                                                                                            \
-   .cooperative_matrix_configurations = {                                                                                       \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 },    \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },          \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },          \
-   }
-
-#define CMAT_XEHP_CONFIGURATIONS                                                                                                \
-   .cooperative_matrix_configurations = {                                                                                       \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 },    \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_BFLOAT16, INTEL_CMAT_BFLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 },  \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },          \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },          \
-   }
-
-#define CMAT_XE2_CONFIGURATIONS                                                                                                 \
-   .cooperative_matrix_configurations = {                                                                                       \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 },   \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 16, INTEL_CMAT_BFLOAT16, INTEL_CMAT_BFLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },         \
-    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },         \
-   }
-
 #define GFX9_FEATURES                               \
    GFX8_FEATURES,                                   \
-   CMAT_PRE_XEHP_CONFIGURATIONS,                    \
    .ver = 9,                                        \
    .has_sample_with_hiz = true,                     \
    .has_illegal_ccs_values = true,                  \
-   .timestamp_frequency = 12000000
+   .timestamp_frequency = 12000000,                 \
+   .cooperative_matrix_configurations = {           \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
+   }
 
 #define GFX9_MAX_THREADS                            \
    .max_vs_threads = 336,                           \
@@ -1053,7 +1034,6 @@ static const struct intel_device_info intel_device_info_sg1 = {
 
 #define XEHP_FEATURES                                           \
    GFX12_FEATURES,                                              \
-   CMAT_XEHP_CONFIGURATIONS,                                    \
    .verx10 = 125,                                               \
    .has_lsc = true,                                             \
    .has_llc = false,                                            \
@@ -1122,7 +1102,6 @@ static const struct intel_device_info intel_device_info_atsm_g11 = {
 
 #define MTL_CONFIG(platform_suffix)                             \
    XEHP_FEATURES, XEHP_PLACEHOLDER_THREADS_AND_URB,             \
-   CMAT_PRE_XEHP_CONFIGURATIONS,                                \
    .platform = INTEL_PLATFORM_ ## platform_suffix,              \
    .has_64bit_float = true,                                     \
    .has_64bit_float_via_math_pipe = true,                       \
@@ -1158,12 +1137,10 @@ static const struct intel_device_info intel_device_info_arl_h = {
    .has_bfloat16 = true,
    /* BSpec 55414 (r53716). */
    .has_systolic = true,
-   CMAT_XEHP_CONFIGURATIONS,
 };
 
 #define XE2_FEATURES                                            \
    XEHP_FEATURES,                                               \
-   CMAT_XE2_CONFIGURATIONS,                                     \
    .ver = 20,                                                   \
    .verx10 = 200,                                               \
    .grf_size = 64,                                              \
@@ -1172,14 +1149,13 @@ static const struct intel_device_info intel_device_info_arl_h = {
    .has_64bit_int = true,                                       \
    .has_indirect_unroll = true,                                 \
    .has_aux_map = false,                                        \
-   .has_flat_ccs = true
+   .has_flat_ccs = true,                                        \
+   .cooperative_matrix_configurations = {                       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 16, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
+   }
 
-/* Note, do not enable PAT 10 or 12 on BMG, according to
- * Wa_18038669374 we should not not use any MOCS/PAT settings
- * that has "Compressible UC policy"
- *
- * (both 10 and 12 map to different compressed L3UC entries)
- */
 #define XE2_PAT_ENTRIES                                         \
    /* BSpec 71582 (r59285) */                                   \
    .pat = {                                                     \
@@ -1190,9 +1166,7 @@ static const struct intel_device_info intel_device_info_arl_h = {
       /* CPU: WC, GPU: PAT 0 => WB */                           \
       .writecombining = PAT_ENTRY(0, WC),                       \
       /* CPU: WC, GPU: PAT 11 => XD, compressed */              \
-      .compressed_scanout = PAT_ENTRY(11, WC),                  \
-      /* CPU: WC, GPU: PAT 9 => WB, compressed */               \
-      .compressed = PAT_ENTRY(9, WC)                            \
+      .compressed = PAT_ENTRY(11, WC)                           \
    }
 
 #define XE2_CONFIG(platform_suffix)                             \

@@ -321,6 +321,7 @@ static void
 finish_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
 {
    panvk_pool_free_mem(&queue->subqueues[subqueue].context);
+   panvk_pool_free_mem(&queue->subqueues[subqueue].regs_save);
    finish_subqueue_tracing(queue, subqueue);
 }
 
@@ -362,10 +363,20 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
    if (result != VK_SUCCESS)
       return result;
 
-   struct panvk_pool_alloc_info alloc_info = {
-      .size = sizeof(struct panvk_cs_subqueue_context),
-      .alignment = 64,
-   };
+   struct panvk_pool_alloc_info alloc_info;
+
+   if (dev->dump_region_size[subqueue]) {
+      alloc_info.size = dev->dump_region_size[subqueue];
+      alloc_info.alignment = sizeof(uint32_t);
+      subq->regs_save = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+      if (!panvk_priv_mem_host_addr(subq->regs_save)) {
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to allocate register save area");
+      }
+   }
+
+   alloc_info.size = sizeof(struct panvk_cs_subqueue_context);
+   alloc_info.alignment = 64;
 
    /* When tracing is enabled, we want to use a non-cached pool, so can get
     * up-to-date context even if the CS crashed in the middle. */
@@ -385,8 +396,7 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
       .debug.syncobjs = panvk_priv_mem_dev_addr(queue->debug_syncobjs),
       .debug.tracebuf.cs = subq->tracebuf.addr.dev,
       .iter_sb = 0,
-      .tiler_oom_ctx.reg_dump_addr =
-         panvk_priv_mem_dev_addr(queue->tiler_oom_regs_save),
+      .reg_dump_addr = panvk_priv_mem_dev_addr(subq->regs_save),
    };
 
    /* We use the geometry buffer for our temporary CS buffer. */
@@ -400,7 +410,6 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
    const struct cs_builder_conf conf = {
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
-      .ls_sb_slot = SB_ID(LS),
    };
    struct cs_builder b;
 
@@ -445,23 +454,6 @@ init_subqueue(struct panvk_queue *queue, enum panvk_subqueue_id subqueue)
       /* Pre-set the heap context on the vertex-tiler/fragment queues. */
       cs_move64_to(&b, heap_ctx_addr, queue->tiler_heap.context.dev_addr);
       cs_heap_set(&b, heap_ctx_addr);
-   }
-
-   /* Request resources for each subqueue during initialization, as the req_res
-    * is an expensive operation which should be called sparingly. */
-   switch (subqueue) {
-   case PANVK_SUBQUEUE_VERTEX_TILER:
-      cs_req_res(&b, CS_IDVS_RES | CS_TILER_RES);
-      break;
-   case PANVK_SUBQUEUE_FRAGMENT:
-      cs_req_res(&b, CS_FRAG_RES);
-      break;
-   case PANVK_SUBQUEUE_COMPUTE:
-      cs_req_res(&b, CS_COMPUTE_RES);
-      break;
-   default:
-      unreachable("Unknown subqueue");
-      break;
    }
 
    cs_finish(&b);
@@ -524,7 +516,6 @@ cleanup_queue(struct panvk_queue *queue)
 
    finish_render_desc_ringbuf(queue);
 
-   panvk_pool_free_mem(&queue->tiler_oom_regs_save);
    panvk_pool_free_mem(&queue->debug_syncobjs);
    panvk_pool_free_mem(&queue->syncobjs);
 }
@@ -559,16 +550,6 @@ init_queue(struct panvk_queue *queue)
                                "Failed to allocate subqueue sync objects");
          goto err_cleanup_queue;
       }
-   }
-
-   alloc_info.size = dev->tiler_oom.dump_region_size;
-   alloc_info.alignment = sizeof(uint32_t);
-   queue->tiler_oom_regs_save =
-      panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
-   if (!panvk_priv_mem_host_addr(queue->tiler_oom_regs_save)) {
-      result = panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "Failed to allocate tiler oom register save area");
-      goto err_cleanup_queue;
    }
 
    result = init_render_desc_ringbuf(queue);

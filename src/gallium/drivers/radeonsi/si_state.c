@@ -1387,12 +1387,8 @@ static void si_bind_rs_state(struct pipe_context *ctx, void *state)
       si_vs_ps_key_update_rast_prim_smooth_stipple(sctx);
 
    /* Used by si_get_vs_key_outputs in si_update_shaders: */
-   if (old_rs->clip_plane_enable != rs->clip_plane_enable) {
-      sctx->dirty_shaders_mask |=
-         BITFIELD_BIT(PIPE_SHADER_VERTEX) |
-         BITFIELD_BIT(PIPE_SHADER_TESS_EVAL) |
-         BITFIELD_BIT(PIPE_SHADER_GEOMETRY);
-   }
+   if (old_rs->clip_plane_enable != rs->clip_plane_enable)
+      sctx->do_update_shaders = true;
 
    if (old_rs->line_smooth != rs->line_smooth ||
        old_rs->poly_smooth != rs->poly_smooth ||
@@ -1734,17 +1730,13 @@ static void si_bind_dsa_state(struct pipe_context *ctx, void *state)
    if (old_dsa->alpha_func != dsa->alpha_func) {
       si_ps_key_update_dsa(sctx);
       si_update_ps_inputs_read_or_disabled(sctx);
-      sctx->dirty_shaders_mask |=
-         BITFIELD_BIT(PIPE_SHADER_VERTEX) |
-         BITFIELD_BIT(PIPE_SHADER_TESS_EVAL) |
-         BITFIELD_BIT(PIPE_SHADER_GEOMETRY) |
-         BITFIELD_BIT(PIPE_SHADER_FRAGMENT);
+      sctx->do_update_shaders = true;
    }
 
    if (old_dsa->depth_enabled != dsa->depth_enabled ||
        old_dsa->stencil_enabled != dsa->stencil_enabled) {
       si_ps_key_update_framebuffer_blend_dsa_rasterizer(sctx);
-      sctx->dirty_shaders_mask |= BITFIELD_BIT(PIPE_SHADER_FRAGMENT);
+      sctx->do_update_shaders = true;
    }
 
    if (sctx->occlusion_query_mode == SI_OCCLUSION_QUERY_MODE_PRECISE_BOOLEAN &&
@@ -2777,11 +2769,7 @@ static void si_set_framebuffer_state(struct pipe_context *ctx,
    si_vs_ps_key_update_rast_prim_smooth_stipple(sctx);
    si_update_ps_inputs_read_or_disabled(sctx);
    si_update_vrs_flat_shading(sctx);
-   sctx->dirty_shaders_mask |=
-      BITFIELD_BIT(PIPE_SHADER_VERTEX) |
-      BITFIELD_BIT(PIPE_SHADER_TESS_EVAL) |
-      BITFIELD_BIT(PIPE_SHADER_GEOMETRY) |
-      BITFIELD_BIT(PIPE_SHADER_FRAGMENT);
+   sctx->do_update_shaders = true;
 
    if (sctx->gfx_level < GFX12 && !sctx->decompression_enabled) {
       /* Prevent textures decompression when the framebuffer state
@@ -3623,7 +3611,7 @@ static void si_set_min_samples(struct pipe_context *ctx, unsigned min_samples)
    sctx->ps_iter_samples = min_samples;
 
    si_ps_key_update_framebuffer_rasterizer_sample_shading(sctx);
-   sctx->dirty_shaders_mask |= BITFIELD_BIT(PIPE_SHADER_FRAGMENT);
+   sctx->do_update_shaders = true;
 
    si_update_ps_iter_samples(sctx);
 }
@@ -4662,7 +4650,7 @@ static void si_bind_vertex_elements(struct pipe_context *ctx, void *state)
        memcmp(old->fix_fetch, v->fix_fetch, sizeof(v->fix_fetch[0]) *
               MAX2(old->count, v->count))) {
       si_vs_key_update_inputs(sctx);
-      sctx->dirty_shaders_mask |= BITFIELD_BIT(PIPE_SHADER_VERTEX);
+      sctx->do_update_shaders = true;
    }
 
    if (v->instance_divisor_is_fetched) {
@@ -4742,7 +4730,7 @@ static void si_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
     */
    if (sctx->vertex_elements->vb_alignment_check_mask & unaligned) {
       si_vs_key_update_inputs(sctx);
-      sctx->dirty_shaders_mask |= BITFIELD_BIT(PIPE_SHADER_VERTEX);
+      sctx->do_update_shaders = true;
    }
 }
 
@@ -5135,10 +5123,8 @@ static void gfx10_init_gfx_preamble_state(struct si_context *sctx)
          ac_pm4_cmd_add(&pm4->base, EVENT_TYPE(V_028A90_BREAK_BATCH) | EVENT_INDEX(0));
       }
 
-      if (sctx->gfx_level < GFX11) {
-         ac_pm4_cmd_add(&pm4->base, PKT3(PKT3_CLEAR_STATE, 0, 0));
-         ac_pm4_cmd_add(&pm4->base, 0);
-      }
+      ac_pm4_cmd_add(&pm4->base, PKT3(PKT3_CLEAR_STATE, 0, 0));
+      ac_pm4_cmd_add(&pm4->base, 0);
    }
 
    si_init_compute_preamble_state(sctx, pm4);
@@ -5165,19 +5151,6 @@ static void gfx10_init_gfx_preamble_state(struct si_context *sctx)
       ac_pm4_set_reg(&pm4->base, R_028848_PA_CL_VRS_CNTL,
                      S_028848_VERTEX_RATE_COMBINER_MODE(V_028848_SC_VRS_COMB_MODE_OVERRIDE) |
                      S_028848_SAMPLE_ITER_COMBINER_MODE(V_028848_SC_VRS_COMB_MODE_OVERRIDE));
-   }
-
-   if (sctx->gfx_level >= GFX11) {
-      /* These are set by CLEAR_STATE on gfx10. We don't use CLEAR_STATE on gfx11. */
-      ac_pm4_set_reg(&pm4->base, R_028034_PA_SC_SCREEN_SCISSOR_BR,
-                     S_028034_BR_X(16384) | S_028034_BR_Y(16384));
-      ac_pm4_set_reg(&pm4->base, R_028204_PA_SC_WINDOW_SCISSOR_TL, S_028204_WINDOW_OFFSET_DISABLE(1));
-      ac_pm4_set_reg(&pm4->base, R_0286E0_SPI_BARYC_CNTL, 0);
-      ac_pm4_set_reg(&pm4->base, R_028828_PA_SU_LINE_STIPPLE_SCALE, 0);
-      ac_pm4_set_reg(&pm4->base, R_028A98_VGT_DRAW_PAYLOAD_CNTL, 0);
-      ac_pm4_set_reg(&pm4->base, R_028B28_VGT_STRMOUT_DRAW_OPAQUE_OFFSET, 0);
-      ac_pm4_set_reg(&pm4->base, R_028C4C_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
-                     S_028C4C_NULL_SQUAD_AA_MASK_ENABLE(1));
    }
 
 done:

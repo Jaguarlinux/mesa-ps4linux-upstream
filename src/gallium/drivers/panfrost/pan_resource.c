@@ -46,7 +46,6 @@
 #include "util/u_transfer.h"
 #include "util/u_transfer_helper.h"
 #include "util/perf/cpu_trace.h"
-#include "util/streaming-load-memcpy.h"
 
 #include "decode.h"
 #include "pan_bo.h"
@@ -68,6 +67,11 @@ panfrost_clear_depth_stencil(struct pipe_context *pipe,
    if (render_condition_enabled && !panfrost_render_condition_check(ctx))
       return;
 
+   /* Legalize here because it could trigger a recursive blit otherwise */
+   struct panfrost_resource *rdst = pan_resource(dst->texture);
+   enum pipe_format dst_view_format = util_format_linear(dst->format);
+   pan_legalize_format(ctx, rdst, dst_view_format, true, false);
+
    panfrost_blitter_save(
       ctx, render_condition_enabled ? PAN_RENDER_COND : PAN_RENDER_BASE);
    util_blitter_clear_depth_stencil(ctx->blitter, dst, clear_flags, depth,
@@ -86,10 +90,40 @@ panfrost_clear_render_target(struct pipe_context *pipe,
    if (render_condition_enabled && !panfrost_render_condition_check(ctx))
       return;
 
+   /* Legalize here because it could trigger a recursive blit otherwise */
+   struct panfrost_resource *rdst = pan_resource(dst->texture);
+   enum pipe_format dst_view_format = util_format_linear(dst->format);
+   pan_legalize_format(ctx, rdst, dst_view_format, true, false);
+
    panfrost_blitter_save(
       ctx, (render_condition_enabled ? PAN_RENDER_COND : PAN_RENDER_BASE) | PAN_SAVE_FRAGMENT_CONSTANT);
    util_blitter_clear_render_target(ctx->blitter, dst, color, dstx, dsty, width,
                                     height);
+}
+
+static void
+panfrost_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
+{
+   MESA_TRACE_FUNC();
+
+   struct panfrost_device *dev = pan_device(screen);
+   struct panfrost_resource *rsrc = (struct panfrost_resource *)pt;
+
+   if (rsrc->scanout)
+      renderonly_scanout_destroy(rsrc->scanout, dev->ro);
+
+   if (rsrc->shadow_image)
+      pipe_resource_reference(
+         (struct pipe_resource **)&rsrc->shadow_image, NULL);
+
+   if (rsrc->bo)
+      panfrost_bo_unreference(rsrc->bo);
+
+   free(rsrc->index_cache);
+   free(rsrc->damage.tile_map.data);
+
+   util_range_destroy(&rsrc->valid_buffer_range);
+   free(rsrc);
 }
 
 static struct pipe_resource *
@@ -112,6 +146,7 @@ panfrost_resource_from_handle(struct pipe_screen *pscreen,
    *prsc = *templat;
 
    pipe_reference_init(&prsc->reference, 1);
+   util_range_init(&rsc->valid_buffer_range);
    prsc->screen = pscreen;
 
    uint64_t mod = whandle->modifier == DRM_FORMAT_MOD_INVALID
@@ -141,7 +176,7 @@ panfrost_resource_from_handle(struct pipe_screen *pscreen,
       pan_image_layout_init(dev->arch, &rsc->image.layout, &explicit_layout);
 
    if (!valid) {
-      FREE(rsc);
+      panfrost_resource_destroy(pscreen, &rsc->base);
       return NULL;
    }
 
@@ -150,7 +185,7 @@ panfrost_resource_from_handle(struct pipe_screen *pscreen,
     * memory space to mmap it etc.
     */
    if (!rsc->bo) {
-      FREE(rsc);
+      panfrost_resource_destroy(pscreen, &rsc->base);
       return NULL;
    }
 
@@ -821,7 +856,7 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 
       if (!so->scanout) {
          mesa_loge("Failed to create scanout resource\n");
-         FREE(so);
+         panfrost_resource_destroy(screen, &so->base);
          return NULL;
       }
       assert(handle.type == WINSYS_HANDLE_TYPE_FD);
@@ -829,7 +864,7 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
       close(handle.handle);
 
       if (!so->bo) {
-         FREE(so);
+         panfrost_resource_destroy(screen, &so->base);
          return NULL;
       }
 
@@ -847,7 +882,7 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
          panfrost_bo_create(dev, so->image.layout.data_size, flags, label);
 
       if (!so->bo) {
-         FREE(so);
+         panfrost_resource_destroy(screen, &so->base);
          return NULL;
       }
 
@@ -858,7 +893,7 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 
    if (drm_is_afbc(so->image.layout.modifier)) {
       if (panfrost_resource_init_afbc_headers(so)) {
-         FREE(so);
+         panfrost_resource_destroy(screen, &so->base);
          return NULL;
       }
    }
@@ -899,31 +934,6 @@ panfrost_resource_create_with_modifiers(struct pipe_screen *screen,
    /* If we didn't find one, app specified invalid */
    assert(count == 1 && modifiers[0] == DRM_FORMAT_MOD_INVALID);
    return panfrost_resource_create(screen, template);
-}
-
-static void
-panfrost_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
-{
-   MESA_TRACE_FUNC();
-
-   struct panfrost_device *dev = pan_device(screen);
-   struct panfrost_resource *rsrc = (struct panfrost_resource *)pt;
-
-   if (rsrc->scanout)
-      renderonly_scanout_destroy(rsrc->scanout, dev->ro);
-
-   if (rsrc->shadow_image)
-         pipe_resource_reference(
-            (struct pipe_resource **)&rsrc->shadow_image, NULL);
-
-   if (rsrc->bo)
-      panfrost_bo_unreference(rsrc->bo);
-
-   free(rsrc->index_cache);
-   free(rsrc->damage.tile_map.data);
-
-   util_range_destroy(&rsrc->valid_buffer_range);
-   free(rsrc);
 }
 
 /* Most of the time we can do CPU-side transfers, but sometimes we need to use
@@ -1731,50 +1741,31 @@ panfrost_pack_afbc(struct panfrost_context *ctx,
       struct pan_image_slice_layout *src_slice =
          &prsrc->image.layout.slices[level];
       struct pan_image_slice_layout *dst_slice = &slice_infos[level];
+
+      unsigned width = u_minify(prsrc->base.width0, level);
+      unsigned height = u_minify(prsrc->base.height0, level);
       unsigned src_stride =
          pan_afbc_stride_blocks(src_modifier, src_slice->row_stride);
+      unsigned dst_stride =
+         DIV_ROUND_UP(width, panfrost_afbc_superblock_width(dst_modifier));
+      unsigned dst_height =
+         DIV_ROUND_UP(height, panfrost_afbc_superblock_height(dst_modifier));
+
       uint32_t offset = 0;
       struct pan_afbc_block_info *meta =
          metadata_bo->ptr.cpu + metadata_offsets[level];
 
-      /* Stack allocated chunk used to copy AFBC block info from non-cacheable
-       * memory to cacheable memory. Each iteration of the offset computation
-       * loop below otherwise forces a flush of the write combining buffer
-       * because of the 32-bit read interleaved with the 32-bit write. A tile
-       * is composed of 8x8 header blocks. A chunk is made of 16 tiles so that
-       * at most 8 kB can be copied at each iteration (smaller values tend to
-       * increase latency). */
-      alignas(16) struct pan_afbc_block_info meta_chunk[64 * 16];
-      unsigned nr_blocks_per_chunk = ARRAY_SIZE(meta_chunk);
-
-      for (unsigned i = 0; i < src_slice->afbc.nr_blocks;
-           i += nr_blocks_per_chunk) {
-         unsigned nr_blocks = MIN2(nr_blocks_per_chunk,
-                                   src_slice->afbc.nr_blocks - i);
-
-         util_streaming_load_memcpy(meta_chunk, &meta[i], nr_blocks
-                                    * sizeof(struct pan_afbc_block_info));
-
-         for (unsigned j = 0; j < nr_blocks; j++) {
-            unsigned idx = j;
-            if (is_tiled) {
-               idx &= ~63;
-               idx += get_morton_index(j & 7, (j & 63) >> 3, src_stride);
-            }
-            meta[i + idx].offset = offset;
-            offset += meta_chunk[idx].size;
+      for (unsigned y = 0, i = 0; y < dst_height; ++y) {
+         for (unsigned x = 0; x < dst_stride; ++x, ++i) {
+            unsigned idx = is_tiled ? get_morton_index(x, y, src_stride) : i;
+            uint32_t size = meta[idx].size;
+            meta[idx].offset = offset; /* write the start offset */
+            offset += size;
          }
       }
 
       total_size = ALIGN_POT(total_size, pan_slice_align(dst_modifier));
       {
-         unsigned width = u_minify(prsrc->base.width0, level);
-         unsigned height = u_minify(prsrc->base.height0, level);
-         unsigned dst_stride =
-            DIV_ROUND_UP(width, panfrost_afbc_superblock_width(dst_modifier));
-         unsigned dst_height =
-            DIV_ROUND_UP(height, panfrost_afbc_superblock_height(dst_modifier));
-
          dst_slice->afbc.stride = dst_stride;
          dst_slice->afbc.nr_blocks = dst_stride * dst_height;
          dst_slice->afbc.header_size =

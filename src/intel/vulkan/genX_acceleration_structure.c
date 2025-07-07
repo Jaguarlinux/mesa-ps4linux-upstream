@@ -229,23 +229,16 @@ debug_record_as_to_bvh_dump(struct anv_cmd_buffer *cmd_buffer,
    }
 }
 
-#define STRINGIFY_HELPER(x) #x
-#define STRINGIFY(x) STRINGIFY_HELPER(x)
-
-#define ENCODE_SPV_PATH STRINGIFY(bvh/genX(encode).spv.h)
-#define HEADER_SPV_PATH STRINGIFY(bvh/genX(header).spv.h)
-#define COPY_SPV_PATH STRINGIFY(bvh/genX(copy).spv.h)
-
 static const uint32_t encode_spv[] = {
-#include ENCODE_SPV_PATH
+#include "bvh/encode.spv.h"
 };
 
 static const uint32_t header_spv[] = {
-#include HEADER_SPV_PATH
+#include "bvh/header.spv.h"
 };
 
 static const uint32_t copy_spv[] = {
-#include COPY_SPV_PATH
+#include "bvh/copy.spv.h"
 };
 
 static VkResult
@@ -357,7 +350,7 @@ anv_get_as_size(VkDevice device,
 }
 
 static uint32_t
-anv_get_encode_key(struct vk_device *device, VkAccelerationStructureTypeKHR type,
+anv_get_encode_key(VkAccelerationStructureTypeKHR type,
                    VkBuildAccelerationStructureFlagBitsKHR flags)
 {
    return 0;
@@ -444,7 +437,7 @@ anv_encode_as(VkCommandBuffer commandBuffer,
 }
 
 static uint32_t
-anv_get_header_key(struct vk_device *device, VkAccelerationStructureTypeKHR type,
+anv_get_header_key(VkAccelerationStructureTypeKHR type,
                    VkBuildAccelerationStructureFlagBitsKHR flags)
 {
    return (flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) ?
@@ -558,12 +551,6 @@ anv_init_header(VkCommandBuffer commandBuffer,
 
       header.size = header.compacted_size;
 
-#if GFX_VERx10 >= 300
-      header.enable_64b_rt = 1;
-#else
-      header.enable_64b_rt = 0;
-#endif
-
       size_t header_size = sizeof(struct anv_accel_struct_header) - base;
       assert(base % sizeof(uint32_t) == 0);
       assert(header_size % sizeof(uint32_t) == 0);
@@ -573,7 +560,7 @@ anv_init_header(VkCommandBuffer commandBuffer,
       anv_cmd_buffer_update_addr(cmd_buffer, addr, header_size, header_ptr);
    }
 
-   if (INTEL_DEBUG_BVH_ANY) {
+   if (INTEL_DEBUG(DEBUG_BVH_ANY)) {
       genx_batch_emit_pipe_control(&cmd_buffer->batch, cmd_buffer->device->info,
                                    cmd_buffer->state.current_pipeline,
                                    ANV_PIPE_END_OF_PIPE_SYNC_BIT |

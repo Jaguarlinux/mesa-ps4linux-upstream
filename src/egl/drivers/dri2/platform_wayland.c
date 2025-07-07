@@ -2313,7 +2313,10 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
    }
 
    dri2_dpy->loader_extensions = dri2_loader_extensions;
-   dri2_detect_swrast(disp);
+   if (!dri2_load_driver(disp)) {
+      _eglError(EGL_BAD_ALLOC, "DRI2: failed to load driver");
+      goto cleanup;
+   }
 
    if (!dri2_create_screen(disp))
       goto cleanup;
@@ -3063,7 +3066,8 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
    }
 
    dri2_dpy->driver_name = strdup(disp->Options.Zink ? "zink" : "swrast");
-   dri2_detect_swrast(disp);
+   if (!dri2_load_driver(disp))
+      goto cleanup;
 
    dri2_dpy->loader_extensions = disp->Options.Zink ? kopper_swrast_loader_extensions : swrast_loader_extensions;
 

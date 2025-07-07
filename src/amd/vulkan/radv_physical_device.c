@@ -109,8 +109,7 @@ radv_compute_queue_enabled(const struct radv_physical_device *pdev)
 static bool
 radv_vrs_attachment_enabled(const struct radv_physical_device *pdev)
 {
-   const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   return pdev->info.gfx_level >= GFX11 || !(instance->debug_flags & RADV_DEBUG_NO_HIZ);
+   return pdev->info.gfx_level >= GFX11 || pdev->use_hiz;
 }
 
 static bool
@@ -157,13 +156,6 @@ radv_emulate_rt(const struct radv_physical_device *pdev)
    return !pdev->info.has_image_bvh_intersect_ray && instance->drirc.emulate_rt;
 }
 
-bool
-radv_use_bvh8(const struct radv_physical_device *pdev)
-{
-   const struct radv_instance *instance = radv_physical_device_instance(pdev);
-   return pdev->info.gfx_level >= GFX12 && !radv_emulate_rt(pdev) && !(instance->debug_flags & RADV_DEBUG_BVH4);
-}
-
 static void
 parse_hex(char *out, const char *in, unsigned length)
 {
@@ -193,7 +185,6 @@ radv_physical_device_init_cache_key(struct radv_physical_device *pdev)
    key->disable_sinking_load_input_fs = instance->drirc.disable_sinking_load_input_fs;
    key->disable_trunc_coord = instance->drirc.disable_trunc_coord;
    key->emulate_rt = radv_emulate_rt(pdev);
-   key->bvh8 = radv_use_bvh8(pdev);
    key->ge_wave32 = pdev->ge_wave_size == 32;
    key->invariant_geom = !!(instance->debug_flags & RADV_DEBUG_INVARIANT_GEOM);
    key->no_fmask = !!(instance->debug_flags & RADV_DEBUG_NO_FMASK);
@@ -574,12 +565,10 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_ray_tracing_pipeline = radv_enable_rt(pdev),
       .KHR_ray_tracing_position_fetch = radv_enable_rt(pdev),
       .KHR_relaxed_block_layout = true,
-      .KHR_robustness2 = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_atomic_int64 = true,
-      .KHR_shader_bfloat16 = pdev->info.gfx_level >= GFX12, /* GFX11 has precision issues. */
       .KHR_shader_clock = true,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
@@ -719,7 +708,6 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = !pdev->use_llvm,
       .EXT_ycbcr_image_arrays = true,
-      .EXT_zero_initialize_device_memory = pdev->info.has_zerovram_support,
       .AMD_buffer_marker = true,
       .AMD_device_coherent_memory = true,
       .AMD_draw_indirect_count = true,
@@ -865,7 +853,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
 
-      .samplerFilterMinmax = true,
+      .samplerFilterMinmax = radv_filter_minmax_enabled(pdev),
       .scalarBlockLayout = pdev->info.gfx_level >= GFX7,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
@@ -972,7 +960,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .stippledBresenhamLines = true,
       .stippledSmoothLines = false,
 
-      /* VK_KHR_robustness2 */
+      /* VK_EXT_robustness2 */
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
@@ -1307,14 +1295,6 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
 
       /* VK_EXT_device_memory_report */
       .deviceMemoryReport = true,
-
-      /* VK_KHR_shader_bfloat16 */
-      .shaderBFloat16Type = true,
-      .shaderBFloat16DotProduct = true,
-      .shaderBFloat16CooperativeMatrix = radv_cooperative_matrix_enabled(pdev),
-
-      /* VK_EXT_zero_initialize_device_memory */
-      .zeroInitializeDeviceMemory = true,
    };
 }
 
@@ -1753,7 +1733,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .sampleLocationSubPixelBits = 4,
       .variableSampleLocations = true,
 
-      /* VK_KHR_robustness2 */
+      /* VK_EXT_robustness2 */
       .robustStorageBufferAccessSizeAlignment = 4,
       .robustUniformBufferAccessSizeAlignment = 4,
 
@@ -1792,7 +1772,10 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .maxPerStageDescriptorUpdateAfterBindAccelerationStructures = max_descriptor_set_size,
       .maxDescriptorSetAccelerationStructures = max_descriptor_set_size,
       .maxDescriptorSetUpdateAfterBindAccelerationStructures = max_descriptor_set_size,
-      .minAccelerationStructureScratchOffsetAlignment = 128,
+      /* Technically we can work with 128-byte alignment, but DOOM: The Dark Ages breaks if
+       * the alignment is lower than this.
+       */
+      .minAccelerationStructureScratchOffsetAlignment = 256,
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = 2048,
@@ -1861,9 +1844,11 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .maxSamplerDescriptorBufferBindings = MAX_SETS,
       .maxEmbeddedImmutableSamplerBindings = MAX_SETS,
       .maxEmbeddedImmutableSamplers = radv_max_descriptor_set_size(),
-      /* No data required for capture/replay but these values need to be non-zero. */
+      /* No data required for capture/replay (except for sparse images) but these values need to be
+       * non-zero.
+       */
       .bufferCaptureReplayDescriptorDataSize = 1,
-      .imageCaptureReplayDescriptorDataSize = 1,
+      .imageCaptureReplayDescriptorDataSize = 8,
       .imageViewCaptureReplayDescriptorDataSize = 1,
       .samplerCaptureReplayDescriptorDataSize = 1,
       .accelerationStructureCaptureReplayDescriptorDataSize = 1,
@@ -2175,6 +2160,10 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    pdev->use_fmask = pdev->info.gfx_level < GFX11 && !(instance->debug_flags & RADV_DEBUG_NO_FMASK);
 
+   pdev->use_hiz = !(instance->debug_flags & RADV_DEBUG_NO_HIZ);
+   if (pdev->info.gfx_level == GFX12 && instance->drirc.disable_hiz_his_gfx12)
+      pdev->use_hiz = false;
+
    pdev->use_ngg = (pdev->info.gfx_level >= GFX10 && pdev->info.family != CHIP_NAVI14 &&
                     !(instance->debug_flags & RADV_DEBUG_NO_NGG)) ||
                    pdev->info.gfx_level >= GFX11;
@@ -2300,6 +2289,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    pdev->gs_table_depth = ac_get_gs_table_depth(pdev->info.gfx_level, pdev->info.family);
 
+   ac_get_hs_info(&pdev->info, &pdev->hs);
    ac_get_task_info(&pdev->info, &pdev->task_info);
    radv_get_binning_settings(pdev, &pdev->binning_settings);
 
@@ -2495,7 +2485,7 @@ radv_get_physical_device_queue_family_properties(struct radv_physical_device *pd
          *pQueueFamilyProperties[idx] = (VkQueueFamilyProperties){
             .queueFlags = VK_QUEUE_SPARSE_BINDING_BIT,
             .queueCount = 1,
-            .timestampValidBits = 64,
+            .timestampValidBits = 0,
             .minImageTransferGranularity = (VkExtent3D){1, 1, 1},
          };
          idx++;
@@ -2855,31 +2845,34 @@ VKAPI_ATTR VkResult VKAPI_CALL
 radv_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
                                                      VkCooperativeMatrixPropertiesKHR *pProperties)
 {
-   VK_FROM_HANDLE(radv_physical_device, pdev, physicalDevice);
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties, pPropertyCount);
 
-   for (unsigned bfloat = 0; bfloat < 2; bfloat++) {
-      for (unsigned fp32 = 0; fp32 < 2; fp32++) {
-         VkComponentTypeKHR ab_type = bfloat ? VK_COMPONENT_TYPE_BFLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT16_KHR;
-         VkComponentTypeKHR cd_type = fp32 ? VK_COMPONENT_TYPE_FLOAT32_KHR : ab_type;
+   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+   {
+      *p = (struct VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+                                                     .MSize = 16,
+                                                     .NSize = 16,
+                                                     .KSize = 16,
+                                                     .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .CType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .ResultType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .saturatingAccumulation = false,
+                                                     .scope = VK_SCOPE_SUBGROUP_KHR};
+   }
 
-         if (pdev->info.gfx_level < GFX12 && bfloat)
-            continue; /* BF16 isn't working precisely on GFX11. */
-
-         vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
-         {
-            *p = (struct VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
-                                                           .MSize = 16,
-                                                           .NSize = 16,
-                                                           .KSize = 16,
-                                                           .AType = ab_type,
-                                                           .BType = ab_type,
-                                                           .CType = cd_type,
-                                                           .ResultType = cd_type,
-                                                           .saturatingAccumulation = false,
-                                                           .scope = VK_SCOPE_SUBGROUP_KHR};
-         }
-      }
+   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+   {
+      *p = (struct VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+                                                     .MSize = 16,
+                                                     .NSize = 16,
+                                                     .KSize = 16,
+                                                     .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                                     .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+                                                     .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+                                                     .saturatingAccumulation = false,
+                                                     .scope = VK_SCOPE_SUBGROUP_KHR};
    }
 
    for (unsigned asigned = 0; asigned < 2; asigned++) {

@@ -98,8 +98,7 @@ public:
       OR_RTN,
       XOR_RTN,
       MSKOR_RTN,
-      WRAP_INC_RTN,
-      WRAP_DEC_RTN,
+      UINT_RTN,
       UNSUPPORTED
    };
 

@@ -568,15 +568,21 @@ impl Device {
         }
 
         if !exts.contains(&"cl_khr_byte_addressable_store")
-         || !exts.contains(&"cl_khr_global_int32_base_atomics")
-         || !exts.contains(&"cl_khr_global_int32_extended_atomics")
-         || !exts.contains(&"cl_khr_local_int32_base_atomics")
-         || !exts.contains(&"cl_khr_local_int32_extended_atomics")
-         // The following modifications are made to the OpenCL 1.1 platform layer and runtime (sections 4 and 5):
-         // The minimum FULL_PROFILE value for CL_DEVICE_MAX_PARAMETER_SIZE increased from 256 to 1024 bytes
-         || self.param_max_size() < 1024
-         // The minimum FULL_PROFILE value for CL_DEVICE_LOCAL_MEM_SIZE increased from 16 KB to 32 KB.
-         || self.local_mem_size() < 32 * 1024
+            || !exts.contains(&"cl_khr_global_int32_base_atomics")
+            || !exts.contains(&"cl_khr_global_int32_extended_atomics")
+            || !exts.contains(&"cl_khr_local_int32_base_atomics")
+            || !exts.contains(&"cl_khr_local_int32_extended_atomics")
+        {
+            res = CLVersion::Cl1_0;
+        }
+
+        if !self.embedded &&
+            // Quoting OpenCL 1.1:
+            // The following modifications are made to the OpenCL platform layer and runtime (sections 4 and 5):
+            // The minimum FULL_PROFILE value for CL_DEVICE_MAX_PARAMETER_SIZE increased from 256 to 1024 bytes
+            (self.param_max_size() < 1024
+             // The minimum FULL_PROFILE value for CL_DEVICE_LOCAL_MEM_SIZE increased from 16 KB to 32 KB.
+             || self.local_mem_size() < 32 * 1024)
         {
             res = CLVersion::Cl1_0;
         }
@@ -785,7 +791,7 @@ impl Device {
             1 << 26,
             min(
                 self.max_mem_alloc(),
-                self.screen.caps().max_shader_buffer_size.into(),
+                self.screen.caps().max_shader_buffer_size as u64,
             ),
         )
     }
@@ -923,7 +929,7 @@ impl Device {
     }
 
     pub fn global_mem_size(&self) -> cl_ulong {
-        if let Some(memory_info) = self.screen.query_memory_info() {
+        if let Some(memory_info) = self.screen().query_memory_info() {
             let memory: cl_ulong = if memory_info.total_device_memory != 0 {
                 memory_info.total_device_memory.into()
             } else {
@@ -1003,20 +1009,17 @@ impl Device {
         self.screen.compute_caps().max_local_size as cl_ulong
     }
 
-    pub fn max_block_sizes(&self) -> [usize; 3] {
-        self.screen
-            .compute_caps()
-            .max_block_size
-            .map(|value| value as usize)
+    pub fn max_block_sizes(&self) -> Vec<usize> {
+        let v: [u32; 3] = self.screen.compute_caps().max_block_size;
+        v.into_iter().map(|v| v as usize).collect()
     }
 
-    pub fn max_grid_size(&self) -> [usize; 3] {
-        self.screen
-            .compute_caps()
-            .max_grid_size
-            .map(|screen_max_grid_size| {
-                min(screen_max_grid_size, Platform::dbg().max_grid_size) as usize
-            })
+    pub fn max_grid_size(&self) -> Vec<usize> {
+        let v: [u32; 3] = self.screen.compute_caps().max_grid_size;
+        v.into_iter()
+            .map(|a| min(a, Platform::dbg().max_grid_size))
+            .map(|v| v as usize)
+            .collect()
     }
 
     pub fn max_clock_freq(&self) -> cl_uint {
@@ -1028,12 +1031,7 @@ impl Device {
     }
 
     pub fn max_grid_dimensions(&self) -> cl_uint {
-        // Much of the kernel code assumes three-dimensional grids, implicitly
-        // capping this value. The OpenCL spec requires a minimum value of 3 for
-        // devices not of type CL_DEVICE_TYPE_CUSTOM.
-        const MAX_GRID_DIM: cl_uint = 3;
-
-        MAX_GRID_DIM
+        self.screen.compute_caps().grid_dimension
     }
 
     /// Returns the maximum size in bytes of a memory allocation for this
@@ -1104,10 +1102,12 @@ impl Device {
         }
     }
 
-    pub fn subgroup_sizes(&self) -> impl ExactSizeIterator<Item = usize> {
+    pub fn subgroup_sizes(&self) -> Vec<usize> {
         let subgroup_size = self.screen.compute_caps().subgroup_sizes;
 
-        SetBitIndices::from_msb(subgroup_size).map(|bit| 1 << bit)
+        SetBitIndices::from_msb(subgroup_size)
+            .map(|bit| 1 << bit)
+            .collect()
     }
 
     pub fn max_subgroups(&self) -> u32 {
@@ -1180,7 +1180,7 @@ impl Device {
     }
 }
 
-pub fn devs() -> &'static [Device] {
+pub fn devs() -> &'static Vec<Device> {
     &Platform::get().devs
 }
 

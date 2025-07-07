@@ -218,12 +218,16 @@ v3d_init_compute_caps(struct v3d_screen *screen)
         /* GL_MAX_COMPUTE_SHARED_MEMORY_SIZE */
         caps->max_local_size = 32768;
 
+        caps->max_private_size =
+        caps->max_input_size = 4096;
+
         struct sysinfo si;
         sysinfo(&si);
         caps->max_global_size = si.totalram;
         caps->max_mem_alloc_size = MIN2(V3D_MAX_BUFFER_RANGE, si.totalram);
 
         caps->max_compute_units = 1;
+        caps->images_supported = true;
         caps->subgroup_sizes = 16;
 }
 
@@ -334,7 +338,6 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->max_render_targets = V3D_MAX_RENDER_TARGETS(screen->devinfo.ver);
         caps->fbfetch = caps->max_render_targets;
         caps->fbfetch_coherent = true;
-        caps->max_dual_source_render_targets = 1;
 
         caps->vendor_id = 0x14E4;
 

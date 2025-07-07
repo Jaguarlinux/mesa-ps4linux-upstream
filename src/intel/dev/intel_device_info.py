@@ -169,8 +169,7 @@ Enum("intel_cooperative_matrix_component_type",
       "INTEL_CMAT_SINT32",
       "INTEL_CMAT_SINT8",
       "INTEL_CMAT_UINT32",
-      "INTEL_CMAT_UINT8",
-      "INTEL_CMAT_BFLOAT16"])
+      "INTEL_CMAT_UINT8"])
 
 Enum("intel_engine_class",
      ["INTEL_ENGINE_CLASS_RENDER",
@@ -230,11 +229,8 @@ Struct("intel_device_info_pat_desc",
         Member("intel_device_info_pat_entry", "scanout",
                comment="scanout and external BOs"),
 
-        Member("intel_device_info_pat_entry", "compressed_scanout",
-               comment="Only supported in Xe2, compressed + WC for displayable resources"),
-
         Member("intel_device_info_pat_entry", "compressed",
-               comment="Only supported in Xe2, compressed + WC for non-displayable resources"),
+               comment="Only supported in Xe2, compressed + WC"),
 
         Member("intel_device_info_pat_entry", "writeback_incoherent",
                comment=("BOs without special needs, can be WB not coherent "
@@ -304,7 +300,6 @@ Struct("intel_device_info",
         Member("bool", "has_lsc", compiler_field=True),
         Member("bool", "has_mesh_shading"),
         Member("bool", "has_mmap_offset"),
-        Member("bool", "has_partial_mmap_offset"),
         Member("bool", "has_userptr_probe"),
         Member("bool", "has_context_isolation"),
         Member("bool", "has_set_pat_uapi"),

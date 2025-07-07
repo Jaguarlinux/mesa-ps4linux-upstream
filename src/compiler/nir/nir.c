@@ -92,8 +92,6 @@ static const struct debug_named_value nir_debug_control[] = {
      "Print shaders even if they are marked as internal" },
    { "print_pass_flags", NIR_DEBUG_PRINT_PASS_FLAGS,
      "Print pass_flags for every instruction when pass_flags are non-zero" },
-   { "print_struct_decls", NIR_DEBUG_PRINT_STRUCT_DECLS,
-     "Print information about members of struct types used by variables" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -2903,7 +2901,6 @@ nir_get_nir_type_for_glsl_base_type(enum glsl_base_type base_type)
    case GLSL_TYPE_INT64:   return nir_type_int64;
    case GLSL_TYPE_FLOAT:   return nir_type_float32;
    case GLSL_TYPE_FLOAT16: return nir_type_float16;
-   case GLSL_TYPE_BFLOAT16: return nir_type_uint16;
    case GLSL_TYPE_DOUBLE:  return nir_type_float64;
       /* clang-format on */
 

@@ -255,6 +255,10 @@ vk_pipeline_hash_shader_stage(VkPipelineCreateFlags2KHR pipeline_flags,
       _mesa_sha1_update(&ctx, &rstate->uniform_buffers, sizeof(rstate->uniform_buffers));
       _mesa_sha1_update(&ctx, &rstate->vertex_inputs, sizeof(rstate->vertex_inputs));
       _mesa_sha1_update(&ctx, &rstate->images, sizeof(rstate->images));
+      _mesa_sha1_update(&ctx, &rstate->null_uniform_buffer_descriptor,
+                        sizeof(rstate->null_uniform_buffer_descriptor));
+      _mesa_sha1_update(&ctx, &rstate->null_storage_buffer_descriptor,
+                        sizeof(rstate->null_storage_buffer_descriptor));
    }
 
    _mesa_sha1_update(&ctx, info->pName, strlen(info->pName));
@@ -346,17 +350,6 @@ vk_pipeline_robustness_state_fill(const struct vk_device *device,
       rs->images = vk_device_default_robust_image_behavior(device);
 }
 
-static void
-vk_pipeline_init(struct vk_pipeline *pipeline,
-                 const struct vk_pipeline_ops *ops,
-                 VkPipelineBindPoint bind_point,
-                 VkPipelineCreateFlags2KHR flags)
-{
-   pipeline->ops = ops;
-   pipeline->bind_point = bind_point;
-   pipeline->flags = flags;
-}
-
 void *
 vk_pipeline_zalloc(struct vk_device *device,
                    const struct vk_pipeline_ops *ops,
@@ -365,29 +358,15 @@ vk_pipeline_zalloc(struct vk_device *device,
                    const VkAllocationCallbacks *alloc,
                    size_t size)
 {
-   struct vk_pipeline *pipeline =
-      vk_object_zalloc(device, alloc, size, VK_OBJECT_TYPE_PIPELINE);
+   struct vk_pipeline *pipeline;
+
+   pipeline = vk_object_zalloc(device, alloc, size, VK_OBJECT_TYPE_PIPELINE);
    if (pipeline == NULL)
       return NULL;
 
-   vk_pipeline_init(pipeline, ops, bind_point, flags);
-
-   return pipeline;
-}
-
-void *vk_pipeline_multizalloc(struct vk_device *device,
-                              struct vk_multialloc *ma,
-                              const struct vk_pipeline_ops *ops,
-                              VkPipelineBindPoint bind_point,
-                              VkPipelineCreateFlags2KHR flags,
-                              const VkAllocationCallbacks *alloc)
-{
-   struct vk_pipeline *pipeline =
-      vk_object_multizalloc(device, ma, alloc, VK_OBJECT_TYPE_PIPELINE);
-   if (!pipeline)
-      return NULL;
-
-   vk_pipeline_init(pipeline, ops, bind_point, flags);
+   pipeline->ops = ops;
+   pipeline->bind_point = bind_point;
+   pipeline->flags = flags;
 
    return pipeline;
 }

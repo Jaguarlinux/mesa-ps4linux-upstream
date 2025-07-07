@@ -107,12 +107,7 @@ u_prims_for_vertices(enum mesa_prim prim, unsigned num)
    if (num < info->min)
       return 0;
 
-   unsigned num_prims = 1 + ((num - info->min) / info->incr);
-   /* For LINE_LOOP we need to close the shape */
-   if (num_prims > 1 && prim == MESA_PRIM_LINE_LOOP)
-      num_prims++;
-
-   return num_prims;
+   return 1 + ((num - info->min) / info->incr);
 }
 
 static inline bool

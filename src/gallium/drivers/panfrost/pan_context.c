@@ -170,7 +170,8 @@ panfrost_set_blend_color(struct pipe_context *pipe,
 /* Create a final blend given the context */
 
 uint64_t
-panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
+panfrost_get_blend(struct panfrost_batch *batch, unsigned rti,
+                   struct panfrost_bo **bo, unsigned *shader_offset)
 {
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_device *dev = pan_device(ctx->base.screen);
@@ -211,6 +212,16 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
    memcpy(pan_blend.constants, ctx->blend_color.color,
           sizeof(pan_blend.constants));
 
+   /* Upload the shader, sharing a BO */
+   if (!(*bo)) {
+      *bo = panfrost_batch_create_bo(batch, 4096, PAN_BO_EXECUTE,
+                                     PIPE_SHADER_FRAGMENT, "Blend shader");
+      if (!(*bo)) {
+         mesa_loge("failed to allocate blend-shader");
+         return 0;
+      }
+   }
+
    struct panfrost_compiled_shader *ss = ctx->prog[PIPE_SHADER_FRAGMENT];
 
    /* Default for Midgard */
@@ -224,14 +235,19 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
    }
 
    pthread_mutex_lock(&dev->blend_shaders.lock);
-   struct pan_blend_shader *shader =
+   struct pan_blend_shader_variant *shader =
       pan_screen(ctx->base.screen)
          ->vtbl.get_blend_shader(&dev->blend_shaders, &pan_blend, col0_type,
                                  col1_type, rti);
-   uint64_t address = shader->address;
+
+   /* Size check and upload */
+   unsigned offset = *shader_offset;
+   assert((offset + shader->binary.size) < 4096);
+   memcpy((*bo)->ptr.cpu + offset, shader->binary.data, shader->binary.size);
+   *shader_offset += shader->binary.size;
    pthread_mutex_unlock(&dev->blend_shaders.lock);
 
-   return address;
+   return ((*bo)->ptr.gpu + offset) | shader->first_tag;
 }
 
 static void

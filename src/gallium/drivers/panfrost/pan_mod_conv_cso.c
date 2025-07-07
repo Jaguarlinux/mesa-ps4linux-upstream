@@ -219,7 +219,7 @@ panfrost_create_afbc_size_shader(struct panfrost_screen *screen, unsigned bpp,
    struct panfrost_device *dev = pan_device(&screen->base);
 
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_shader_get_compiler_options(dev->arch),
+      MESA_SHADER_COMPUTE, screen->vtbl.get_compiler_options(),
       "panfrost_afbc_size(bpp=%d)", bpp);
 
    panfrost_afbc_add_info_ubo(size, b);
@@ -252,9 +252,8 @@ static nir_shader *
 panfrost_create_afbc_pack_shader(struct panfrost_screen *screen, unsigned align,
                                  bool tiled)
 {
-   struct panfrost_device *dev = pan_device(&screen->base);
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_shader_get_compiler_options(dev->arch),
+      MESA_SHADER_COMPUTE, screen->vtbl.get_compiler_options(),
       "panfrost_afbc_pack");
 
    panfrost_afbc_add_info_ubo(pack, b);
@@ -338,7 +337,7 @@ panfrost_create_mtk_detile_shader(struct panfrost_screen *screen, unsigned align
    const struct panfrost_device *device = &screen->dev;
    bool tint_yuv = (device->debug & PAN_DBG_YUV) != 0;
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_shader_get_compiler_options(device->arch),
+      MESA_SHADER_COMPUTE, screen->vtbl.get_compiler_options(),
       "panfrost_mtk_detile");
    b.shader->info.workgroup_size[0] = 4;
    b.shader->info.workgroup_size[1] = 16;
@@ -466,13 +465,15 @@ panfrost_get_mod_convert_shaders(struct panfrost_context *ctx,
 
    shader = rzalloc(ctx->mod_convert_shaders.shaders, struct pan_mod_convert_shader_data);
    shader->key = key;
-   _mesa_hash_table_insert(ctx->mod_convert_shaders.shaders, &shader->key, shader);
 
 #define COMPILE_SHADER(name, ...)                                              \
    {                                                                           \
       nir_shader *nir =                                                        \
          panfrost_create_##name##_shader(screen, __VA_ARGS__);            \
       nir->info.num_ubos = 1;                                                  \
+      /* "default" UBO is maybe not correct here, but in panfrost we're */     \
+      /* using this as an indicator for whether UBO0 is a user UBO */          \
+      nir->info.first_ubo_is_default_ubo = true;                               \
       shader->name##_cso = pipe_shader_from_nir(pctx, nir);                    \
    }
 
@@ -501,6 +502,14 @@ panfrost_afbc_context_init(struct panfrost_context *ctx)
 void
 panfrost_afbc_context_destroy(struct panfrost_context *ctx)
 {
+   hash_table_foreach(ctx->mod_convert_shaders.shaders, he) {
+      assert(he->data);
+      struct pan_mod_convert_shader_data *shader = he->data;
+      ctx->base.delete_compute_state(&ctx->base, shader->afbc_size_cso);
+      ctx->base.delete_compute_state(&ctx->base, shader->afbc_pack_cso);
+      ctx->base.delete_compute_state(&ctx->base, shader->mtk_detile_cso);
+   }
+
    _mesa_hash_table_destroy(ctx->mod_convert_shaders.shaders, NULL);
    pthread_mutex_destroy(&ctx->mod_convert_shaders.lock);
 }

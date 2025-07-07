@@ -335,11 +335,16 @@ fd_init_compute_caps(struct fd_screen *screen)
 
    caps->max_local_size = screen->info->cs_shared_mem_size;
 
+   caps->max_private_size =
+   caps->max_input_size = 4096;
+
    caps->max_mem_alloc_size = screen->ram_size;
 
    caps->max_clock_frequency = screen->max_freq / 1000000;
 
    caps->max_compute_units = 9999; // TODO
+
+   caps->images_supported = true;
 
    caps->subgroup_sizes = 32; // TODO
 

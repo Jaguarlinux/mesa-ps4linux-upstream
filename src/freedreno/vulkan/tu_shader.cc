@@ -743,7 +743,7 @@ lower_inline_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
       val = nir_load_global_ir3(b, intrin->num_components,
                                 intrin->def.bit_size,
                                 base_addr, nir_ishr_imm(b, offset, 2),
-                                .access =
+                                .access = 
                                  (enum gl_access_qualifier)(
                                     (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER) |
                                     ACCESS_CAN_SPECULATE),
@@ -1589,7 +1589,7 @@ tu6_emit_cs_config(struct tu_cs *cs,
       tu_cs_emit_regs(
          cs, HLSQ_CS_CNTL_1(CHIP,
                    .linearlocalidregid = regid(63, 0), .threadsize = thrsz_cs,
-                   .workgrouprastorderzfirsten = true,
+                   .workgrouprastorderzfirsten = true, 
                    .wgtilewidth = 4, .wgtileheight = tile_height));
 
       tu_cs_emit_regs(cs, HLSQ_FS_CNTL_0(CHIP, .threadsize = THREAD64));
@@ -1689,9 +1689,9 @@ tu6_emit_fs_inputs(struct tu_cs *cs, const struct ir3_shader_variant *fs)
       ij_regid[i] = ir3_find_sysval_regid(fs, SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL + i);
 
    if (fs->num_sampler_prefetch > 0) {
-      /* FS prefetch reads coordinates from r0.x */
-      assert(!VALIDREG(ij_regid[fs->prefetch_bary_type]) ||
-             ij_regid[fs->prefetch_bary_type] == regid(0, 0));
+      /* It seems like ij_pix is *required* to be r0.x */
+      assert(!VALIDREG(ij_regid[IJ_PERSP_PIXEL]) ||
+             ij_regid[IJ_PERSP_PIXEL] == regid(0, 0));
    }
 
    tu_cs_emit_pkt4(cs, REG_A6XX_SP_FS_PREFETCH_CNTL, 1 + fs->num_sampler_prefetch);
@@ -2373,6 +2373,13 @@ tu_upload_shader(struct tu_device *dev,
       tu_cs_begin_sub_stream(&shader->cs, vpc_size, &sub_cs);
       TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, NULL, NULL, NULL, v, NULL);
       shader->binning_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+
+      if (safe_const) {
+         tu_cs_begin_sub_stream(&shader->cs, vpc_size, &sub_cs);
+         TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, NULL, NULL, NULL, safe_const, NULL);
+         shader->safe_const_binning_state =
+            tu_cs_end_draw_state(&shader->cs, &sub_cs);
+      }
    }
 
    return VK_SUCCESS;
@@ -2591,8 +2598,10 @@ tu_shader_create(struct tu_device *dev,
             nir_address_format_64bit_global);
 
    if (nir->info.stage == MESA_SHADER_COMPUTE) {
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
-               nir_var_mem_shared, shared_type_info);
+      if (!nir->info.shared_memory_explicit_layout) {
+         NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
+                  nir_var_mem_shared, shared_type_info);
+      }
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
 
@@ -2737,7 +2746,7 @@ tu_shader_create(struct tu_device *dev,
       shader->fs.has_fdm = key->fragment_density_map;
       if (fs->has_kill)
          shader->fs.lrz.status |= TU_LRZ_FORCE_DISABLE_WRITE;
-      if (fs->no_earlyz)
+      if (fs->no_earlyz || (fs->writes_pos && !fs->fs.early_fragment_tests))
          shader->fs.lrz.status = TU_LRZ_FORCE_DISABLE_LRZ;
       /* FDM isn't compatible with LRZ, because the LRZ image uses the original
        * resolution and we would need to use the low resolution.
@@ -2747,7 +2756,7 @@ tu_shader_create(struct tu_device *dev,
       if (key->fragment_density_map)
          shader->fs.lrz.status = TU_LRZ_FORCE_DISABLE_LRZ;
       if (!fs->fs.early_fragment_tests &&
-          (fs->no_earlyz || fs->writes_stencilref)) {
+          (fs->no_earlyz || fs->writes_pos || fs->writes_stencilref || fs->writes_smask)) {
          shader->fs.lrz.force_late_z = true;
       }
       break;
@@ -2767,45 +2776,6 @@ tu_shader_create(struct tu_device *dev,
 }
 
 static void
-lower_io_to_scalar_early(nir_shader *nir, nir_variable_mode mask)
-{
-   bool progress = false;
-   NIR_PASS(progress, nir, nir_lower_io_to_scalar_early, mask);
-
-   if (progress) {
-      /* Optimize the new vector code and then remove dead vars. */
-      NIR_PASS(_, nir, nir_copy_prop);
-
-      if (mask & nir_var_shader_out) {
-         /* Optimize swizzled movs of load_const for nir_link_opt_varyings's
-          * constant propagation.
-          */
-         NIR_PASS(_, nir, nir_opt_constant_folding);
-
-         /* For nir_link_opt_varyings's duplicate input opt. */
-         NIR_PASS(_, nir, nir_opt_cse);
-      }
-
-      /* Run copy-propagation to help remove dead output variables (some
-       * shaders have useless copies to/from an output), so compaction later
-       * will be more effective.
-       *
-       * This will have been done earlier but it might not have worked because
-       * the outputs were vector.
-       */
-      NIR_PASS(_, nir, nir_opt_copy_prop_vars);
-
-      NIR_PASS(_, nir, nir_opt_dce);
-
-      const nir_remove_dead_variables_options var_opts = {
-         .can_remove_var =
-            (mask & nir_var_shader_out) ? nir_vk_is_not_xfb_output : NULL,
-      };
-      NIR_PASS(_, nir, nir_remove_dead_variables, mask, &var_opts);
-   }
-}
-
-static void
 tu_link_shaders(nir_shader **shaders, unsigned shaders_count)
 {
    nir_shader *consumer = NULL;
@@ -2819,9 +2789,6 @@ tu_link_shaders(nir_shader **shaders, unsigned shaders_count)
          consumer = producer;
          continue;
       }
-
-      lower_io_to_scalar_early(producer, nir_var_shader_out);
-      lower_io_to_scalar_early(consumer, nir_var_shader_in);
 
       if (nir_link_opt_varyings(producer, consumer)) {
          NIR_PASS(_, consumer, nir_opt_constant_folding);
@@ -2851,8 +2818,6 @@ tu_link_shaders(nir_shader **shaders, unsigned shaders_count)
          nir_lower_global_vars_to_local(consumer);
       }
 
-      NIR_PASS(_, producer, nir_lower_io_to_vector, nir_var_shader_out);
-      NIR_PASS(_, consumer, nir_lower_io_to_vector, nir_var_shader_in);
       consumer = producer;
    }
 

@@ -221,6 +221,8 @@ struct radeon_encoder {
    void (*mq_encode)(struct radeon_encoder *enc);
    void (*mq_destroy)(struct radeon_encoder *enc);
 
+   unsigned stream_handle;
+
    struct pipe_screen *screen;
    struct radeon_winsys *ws;
    struct radeon_cmdbuf cs;

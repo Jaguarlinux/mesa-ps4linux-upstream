@@ -210,7 +210,6 @@ get_device_extensions(const struct panvk_physical_device *device,
    const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
 
    bool has_vk1_1 = arch >= 10;
-   bool has_vk1_2 = arch >= 10;
 
    *ext = (struct vk_device_extension_table){
       .KHR_8bit_storage = true,
@@ -223,7 +222,6 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_descriptor_update_template = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_device_group = true,
-      .KHR_draw_indirect_count = arch >= 10,
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
       .KHR_dynamic_rendering_local_read = true,
@@ -243,10 +241,8 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
-      .KHR_maintenance4 = has_vk1_1,
-      .KHR_maintenance5 = has_vk1_1,
       .KHR_map_memory2 = true,
-      .KHR_multiview = true,
+      .KHR_multiview = arch >= 10,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
@@ -259,15 +255,13 @@ get_device_extensions(const struct panvk_physical_device *device,
       .KHR_shader_float_controls = true,
       .KHR_shader_float_controls2 = has_vk1_1,
       .KHR_shader_float16_int8 = true,
-      .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = has_vk1_1,
       .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = has_vk1_2,
+      .KHR_shader_quad_control = false,
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = has_vk1_1,
       .KHR_shader_subgroup_rotate = true,
       .KHR_shader_subgroup_uniform_control_flow = has_vk1_1,
-      .KHR_shader_terminate_invocation = true,
       .KHR_spirv_1_4 = arch >= 10,
       .KHR_storage_buffer_storage_class = true,
 #ifdef PANVK_USE_WSI_PLATFORM
@@ -283,13 +277,10 @@ get_device_extensions(const struct panvk_physical_device *device,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_custom_border_color = true,
-      .EXT_depth_bias_control = true,
       .EXT_depth_clip_enable = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
-      .EXT_extended_dynamic_state = true,
-      .EXT_extended_dynamic_state2 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -312,12 +303,8 @@ get_device_extensions(const struct panvk_physical_device *device,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
       .EXT_shader_module_identifier = true,
-      .EXT_shader_demote_to_helper_invocation = true,
-      .EXT_shader_replicated_composites = true,
       .EXT_subgroup_size_control = has_vk1_1,
       .EXT_tooling_info = true,
-      .EXT_vertex_attribute_divisor = true,
-      .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = arch >= 10,
       .EXT_ycbcr_image_arrays = arch >= 10,
       .GOOGLE_decorate_string = true,
@@ -380,7 +367,6 @@ get_features(const struct panvk_physical_device *device,
       .independentBlend = true,
       .sampleRateShading = true,
       .logicOp = true,
-      .multiDrawIndirect = arch >= 10,
       .wideLines = true,
       .largePoints = true,
       .occlusionQueryPrecise = true,
@@ -406,7 +392,7 @@ get_features(const struct panvk_physical_device *device,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
       .storageInputOutput16 = true,
-      .multiview = true,
+      .multiview = arch >= 10,
       .multiviewGeometryShader = false,
       .multiviewTessellationShader = false,
       .variablePointersStorageBuffer = true,
@@ -417,7 +403,7 @@ get_features(const struct panvk_physical_device *device,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
-      .drawIndirectCount = arch >= 10,
+      .drawIndirectCount = false,
       .storageBuffer8BitAccess = true,
       .uniformAndStorageBuffer8BitAccess = true,
       .storagePushConstant8 = true,
@@ -470,14 +456,10 @@ get_features(const struct panvk_physical_device *device,
       .robustImageAccess = true,
       .inlineUniformBlock = false,
       .descriptorBindingInlineUniformBlockUpdateAfterBind = false,
-      .extendedDynamicState = true,
-      .extendedDynamicState2 = true,
-      .extendedDynamicState2LogicOp = true,
-      .extendedDynamicState2PatchControlPoints = false,
       .pipelineCreationCacheControl = true,
       .privateData = true,
-      .shaderDemoteToHelperInvocation = true,
-      .shaderTerminateInvocation = true,
+      .shaderDemoteToHelperInvocation = false,
+      .shaderTerminateInvocation = false,
       .subgroupSizeControl = true,
       .computeFullSubgroups = true,
       .synchronization2 = true,
@@ -485,9 +467,8 @@ get_features(const struct panvk_physical_device *device,
       .shaderZeroInitializeWorkgroupMemory = true,
       .dynamicRendering = true,
       .dynamicRenderingLocalRead = true,
-      .shaderIntegerDotProduct = true,
-      .maintenance4 = true,
-      .maintenance5 = true,
+      .shaderIntegerDotProduct = false,
+      .maintenance4 = false,
 
       /* Vulkan 1.4 */
       .shaderSubgroupRotate = true,
@@ -509,15 +490,6 @@ get_features(const struct panvk_physical_device *device,
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
-
-      /* VK_EXT_vertex_input_dynamic_state */
-      .vertexInputDynamicState = true,
-
-      /* VK_EXT_depth_bias_control */
-      .depthBiasControl = true,
-      .leastRepresentableValueForceUnormRepresentation = false,
-      .floatRepresentation = false,
-      .depthBiasExact = true,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -554,7 +526,7 @@ get_features(const struct panvk_physical_device *device,
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_quad_control */
-      .shaderQuadControl = true,
+      .shaderQuadControl = false,
 
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
@@ -571,17 +543,11 @@ get_features(const struct panvk_physical_device *device,
       /* VK_EXT_shader_module_identifier */
       .shaderModuleIdentifier = true,
 
-      /* VK_EXT_shader_replicated_composites */
-      .shaderReplicatedComposites = true,
-
       /* VK_EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = arch >= 10,
 
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = arch >= 10,
-
-      /* VK_KHR_push_descriptor */
-      .pushDescriptor = true,
    };
 }
 
@@ -618,9 +584,6 @@ get_sample_counts(unsigned arch, unsigned max_tib_size,
       pan_get_max_msaa(arch, max_tib_size, max_cbuf_atts, format_size);
 
    assert(max_msaa >= 4);
-
-   if (arch >= 12)
-      sample_counts |= VK_SAMPLE_COUNT_2_BIT;
 
    if (max_msaa >= 8)
       sample_counts |= VK_SAMPLE_COUNT_8_BIT;
@@ -828,7 +791,8 @@ get_device_properties(const struct panvk_instance *instance,
       .mipmapPrecisionBits = 8,
       /* Software limit. */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = arch >= 10 ? UINT32_MAX : 1,
+      /* Make it one for now. */
+      .maxDrawIndirectCount = 1,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
       .maxViewports = 1,
@@ -915,8 +879,8 @@ get_device_properties(const struct panvk_instance *instance,
          VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT,
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
-      .maxMultiviewViewCount = 8,
-      .maxMultiviewInstanceIndex = UINT32_MAX,
+      .maxMultiviewViewCount = arch >= 10 ? 8 : 0,
+      .maxMultiviewInstanceIndex = arch >= 10 ? UINT32_MAX : 0,
       .protectedNoFault = false,
       .maxPerSetDescriptors = UINT16_MAX,
       /* Our buffer size fields allow only this much */
@@ -1044,7 +1008,7 @@ get_device_properties(const struct panvk_instance *instance,
       /* VK_KHR_vertex_attribute_divisor */
       /* We will have to restrict this a bit for multiview */
       .maxVertexAttribDivisor = UINT32_MAX,
-      .supportsNonZeroFirstInstance = true,
+      .supportsNonZeroFirstInstance = false,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = MAX_PUSH_DESCRIPTORS,

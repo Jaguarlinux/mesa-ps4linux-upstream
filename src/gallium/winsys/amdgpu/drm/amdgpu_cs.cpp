@@ -212,6 +212,10 @@ bool amdgpu_fence_wait(struct pipe_fence_handle *fence, uint64_t timeout,
                               abs_timeout, 0, NULL))
       return false;
 
+   /* Check that guest-side syncobj agrees with the user fence. */
+   if (user_fence_cpu && afence->aws->info.is_virtio)
+      assert(afence->seq_no <= *user_fence_cpu);
+
    afence->signalled = true;
    return true;
 }
@@ -974,7 +978,8 @@ amdgpu_cs_create(struct radeon_cmdbuf *rcs,
    if (!amdgpu_get_new_ib(ctx->aws, rcs, &acs->main_ib, acs))
       goto fail;
 
-   if (acs->aws->info.userq_ip_mask & BITFIELD_BIT(acs->ip_type)) {
+   /* Currently only gfx, compute and sdma queues supports user queue. */
+   if (acs->aws->info.use_userq && ip_type <= AMD_IP_SDMA) {
       if (!amdgpu_userq_init(acs->aws, &acs->aws->queues[acs->queue_index].userq, ip_type))
          goto fail;
    }
@@ -1197,8 +1202,7 @@ static void amdgpu_cs_add_fence_dependency(struct radeon_cmdbuf *rcs,
    util_queue_fence_wait(&fence->submitted);
 
    if (!fence->imported) {
-      if (!(aws->info.userq_ip_mask & BITFIELD_BIT(acs->ip_type)) ||
-          fence->ip_type != acs->ip_type) {
+      if (!aws->info.use_userq || fence->ip_type != acs->ip_type || acs->ip_type > AMD_IP_SDMA) {
          /* Ignore idle fences. This will only check the user fence in memory. */
          if (!amdgpu_fence_wait((struct pipe_fence_handle *)fence, 0, false)) {
             add_seq_no_to_list(acs->aws, &csc->seq_no_dependencies, fence->queue_index,
@@ -1491,7 +1495,6 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
 
    struct drm_amdgpu_userq_fence_info *fence_info;
    struct drm_amdgpu_userq_wait userq_wait_data = {
-      .waitq_id = userq->userq_handle,
       .syncobj_handles = (uintptr_t)syncobj_dependencies_list,
       .syncobj_timeline_handles = (uintptr_t)&syncobj_timeline_dependency,
       .syncobj_timeline_points = (uintptr_t)&syncobj_timeline_dependency_point,
@@ -2159,7 +2162,8 @@ static int amdgpu_cs_flush(struct radeon_cmdbuf *rcs,
       csc_current = amdgpu_csc_get_current(acs);
       struct amdgpu_cs_context *csc_submitted = amdgpu_csc_get_submitted(acs);
 
-      if (aws->info.userq_ip_mask & BITFIELD_BIT(acs->ip_type)) {
+      /* only gfx, compute and sdma queues are supported in userqueues. */
+      if (aws->info.use_userq && acs->ip_type <= AMD_IP_SDMA) {
          util_queue_add_job(&aws->cs_queue, acs, &acs->flush_completed,
                             amdgpu_cs_submit_ib<USERQ>, NULL, 0);
       } else {

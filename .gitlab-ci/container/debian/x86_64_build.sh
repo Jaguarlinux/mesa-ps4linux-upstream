@@ -48,10 +48,13 @@ DEPS=(
     "llvm-${LLVM_VERSION}-dev"
     ocl-icd-opencl-dev
     python3-pip
+    python3-venv
     procps
     spirv-tools
+    shellcheck
     strace
     time
+    yamllint
     zstd
 )
 
@@ -83,6 +86,8 @@ rm -rf $XORGMACROS_VERSION
 . .gitlab-ci/container/build-directx-headers.sh
 
 . .gitlab-ci/container/build-bindgen.sh
+
+python3 -m pip install --break-system-packages -r bin/ci/requirements.txt
 
 ############### Uninstall the build software
 

@@ -97,6 +97,8 @@ void v3d_job_add_bo(struct v3d_job *job, struct v3d_bo *bo);
 #define V3D_MAX_FS_INPUTS 64
 
 #define MAX_JOB_SCISSORS 16
+#define V3D_JOB_MAX_BO_HANDLE_COUNT 2048
+#define V3D_JOB_MAX_BO_REFERENCED_SIZE (768 * 1024 * 1024)
 
 enum v3d_sampler_state_variant {
         V3D_SAMPLER_STATE_BORDER_0000,
@@ -635,6 +637,13 @@ struct v3d_context {
         unsigned sample_mask;
         struct pipe_framebuffer_state framebuffer;
 
+        /* Flags if we have submitted any jobs for the current framebuffer so
+         * we can make skip framebuffer invalidation for cases where we had to
+         * split the command list into multiple jobs for the same frame (i.e.
+         * queries, reaching CL size limits of any kind, etc.).
+         */
+        bool submitted_any_jobs_for_current_fbo;
+
         /* Per render target, whether we should swap the R and B fields in the
          * shader's color output and in blending.  If render targets disagree
          * on the R/B swap and use the constant color, then we would need to
@@ -711,8 +720,6 @@ struct v3d_depth_stencil_alpha_state {
 
 struct v3d_blend_state {
         struct pipe_blend_state base;
-
-        bool use_software;
 
         /* Per-RT mask of whether blending is enabled. */
         uint8_t blend_enables;

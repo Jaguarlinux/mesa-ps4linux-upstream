@@ -75,8 +75,6 @@ struct amdgpu_userq {
    uint32_t userq_handle;
    enum amd_ip_type ip_type;
    simple_mtx_t lock;
-   /* flags used for queue priority level */
-   uint32_t flags;
 
    union {
       struct amdgpu_userq_gfx_data gfx_data;

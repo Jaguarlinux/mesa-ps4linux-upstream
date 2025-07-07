@@ -203,8 +203,7 @@ LLVMTypeRef lp_build_size_function_type(struct gallivm_state *gallivm,
                                         const struct lp_sampler_size_query_params *params);
 
 LLVMTypeRef lp_build_image_function_type(struct gallivm_state *gallivm,
-                                         const struct lp_img_params *params, bool ms,
-                                         bool is64);
+                                         const struct lp_img_params *params, bool ms);
 
 struct lp_texture_functions {
    void ***sample_functions;

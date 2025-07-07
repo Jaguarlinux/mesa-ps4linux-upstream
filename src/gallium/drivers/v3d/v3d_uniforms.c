@@ -141,12 +141,13 @@ write_tmu_p0(struct v3d_job *job,
          * This can be interpreted as allowing any result to come back, but
          * not terminate the program (and some tests interpret that).
          *
-         * FIXME: just return is not a full valid solution, as it could still
-         * try to get a wrong address for the shader state address. Perhaps we
-         * would need to set up a BO with a "default texture state"
+         * We write the texture state base address to 0 (NULL) so the default
+         * texture state is used.
          */
-        if (sview == NULL)
+        if (sview == NULL) {
+                cl_aligned_u32(uniforms, v3d_unit_data_get_offset(data) & 0xf);
                 return;
+        }
 
         struct v3d_resource *rsc = v3d_resource(sview->texture);
 
@@ -393,19 +394,6 @@ v3d_write_uniforms(struct v3d_context *v3d, struct v3d_job *job,
                         cl_aligned_u32(&uniforms, job->num_layers);
                         break;
 
-                case QUNIFORM_BLEND_CONSTANT_R:
-                        cl_aligned_f(&uniforms, v3d->blend_color.f.color[0]);
-                        break;
-                case QUNIFORM_BLEND_CONSTANT_G:
-                        cl_aligned_f(&uniforms, v3d->blend_color.f.color[1]);
-                        break;
-                case QUNIFORM_BLEND_CONSTANT_B:
-                        cl_aligned_f(&uniforms, v3d->blend_color.f.color[2]);
-                        break;
-                case QUNIFORM_BLEND_CONSTANT_A:
-                        cl_aligned_f(&uniforms, v3d->blend_color.f.color[3]);
-                        break;
-
                 default:
                         unreachable("Unknown QUNIFORM");
 
@@ -497,13 +485,6 @@ v3d_set_shader_uniform_dirty_flags(struct v3d_compiled_shader *shader)
 
                 case QUNIFORM_FB_LAYERS:
                         dirty |= V3D_DIRTY_FRAMEBUFFER;
-                        break;
-
-                case QUNIFORM_BLEND_CONSTANT_R:
-                case QUNIFORM_BLEND_CONSTANT_G:
-                case QUNIFORM_BLEND_CONSTANT_B:
-                case QUNIFORM_BLEND_CONSTANT_A:
-                        dirty |= V3D_DIRTY_BLEND_COLOR;
                         break;
 
                 default:

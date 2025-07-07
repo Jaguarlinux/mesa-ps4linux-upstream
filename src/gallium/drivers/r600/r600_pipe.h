@@ -274,6 +274,8 @@ struct r600_rasterizer_state {
 	unsigned			pa_su_sc_mode_cntl;
 	float				offset_units;
 	float				offset_scale;
+	float				line_width;
+	float				max_point_size;
 	bool				offset_enable;
 	bool				offset_units_unscaled;
 	bool				scissor_enable;
@@ -484,10 +486,6 @@ struct r600_context {
 	struct r600_screen		*screen;
 	struct blitter_context		*blitter;
 	struct u_suballocator		allocator_fetch_shader;
-
-	/* blitter state */
-	void *vs_pos_only[4];
-	void *velem_state_readbuf[4]; /**< X, XY, XYZ, XYZW */
 
 	/* Hardware info. */
 	bool				has_vertex_cache;

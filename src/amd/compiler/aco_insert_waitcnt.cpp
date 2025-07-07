@@ -86,7 +86,7 @@ struct wait_entry {
    bool join(const wait_entry& other)
    {
       bool changed = (other.events & ~events) || (other.counters & ~counters) ||
-                     (other.wait_on_read && !wait_on_read) || (other.vmem_types & ~vmem_types) ||
+                     (other.wait_on_read && !wait_on_read) || (other.vmem_types & !vmem_types) ||
                      (!other.logical && logical);
       events |= other.events;
       counters |= other.counters;
@@ -655,8 +655,8 @@ gen(Instruction* instr, wait_ctx& ctx)
 
       update_counters(ctx, ev, get_sync_info(instr));
 
-      for (auto& definition : instr->definitions)
-         insert_wait_entry(ctx, definition, ev, type);
+      if (!instr->definitions.empty())
+         insert_wait_entry(ctx, instr->definitions[0], ev, type);
 
       if (ctx.gfx_level == GFX6 && instr->format != Format::MIMG && instr->operands.size() == 4) {
          update_counters(ctx, event_vmem_gpr_lock);
@@ -807,7 +807,7 @@ insert_waitcnt(Program* program)
 
    for (Definition def : program->args_pending_vmem) {
       update_counters(in_ctx[0], event_vmem);
-      insert_wait_entry(in_ctx[0], def, event_vmem);
+      insert_wait_entry(in_ctx[0], def, event_vmem, vmem_nosampler);
    }
 
    for (unsigned i = 0; i < program->blocks.size();) {

@@ -862,10 +862,13 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
    }
 
    if (bo_size) {
+      const struct radv_physical_device *pdev = radv_device_physical(device);
+      const struct radv_instance *instance = radv_physical_device_instance(pdev);
+
       if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
          enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_32BIT;
 
-         if (radv_device_should_clear_vram(device))
+         if (instance->drirc.zero_vram)
             flags |= RADEON_FLAG_ZERO_VRAM;
 
          VkResult result = radv_bo_create(device, &pool->base, bo_size, 32, RADEON_DOMAIN_VRAM, flags,
@@ -1630,7 +1633,7 @@ radv_GetDescriptorEXT(VkDevice _device, const VkDescriptorGetInfoEXT *pDescripto
       write_sampler_descriptor(pDescriptor, *pDescriptorInfo->data.pSampler);
       break;
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-      write_image_descriptor(pDescriptor, 64, pDescriptorInfo->type, pDescriptorInfo->data.pCombinedImageSampler);
+      write_image_descriptor(pDescriptor, 80, pDescriptorInfo->type, pDescriptorInfo->data.pCombinedImageSampler);
       if (pDescriptorInfo->data.pCombinedImageSampler) {
          write_sampler_descriptor((uint32_t *)pDescriptor + 20, pDescriptorInfo->data.pCombinedImageSampler->sampler);
       }
@@ -1662,7 +1665,7 @@ radv_GetDescriptorEXT(VkDevice _device, const VkDescriptorGetInfoEXT *pDescripto
       const VkDescriptorAddressInfoEXT *addr_info = pDescriptorInfo->data.pUniformTexelBuffer;
 
       if (addr_info && addr_info->address) {
-         radv_make_texel_buffer_descriptor(device, addr_info->address, addr_info->format, addr_info->range,
+         radv_make_texel_buffer_descriptor(device, addr_info->address, addr_info->format, 0, addr_info->range,
                                            pDescriptor);
       } else {
          memset(pDescriptor, 0, 4 * 4);
@@ -1673,7 +1676,7 @@ radv_GetDescriptorEXT(VkDevice _device, const VkDescriptorGetInfoEXT *pDescripto
       const VkDescriptorAddressInfoEXT *addr_info = pDescriptorInfo->data.pStorageTexelBuffer;
 
       if (addr_info && addr_info->address) {
-         radv_make_texel_buffer_descriptor(device, addr_info->address, addr_info->format, addr_info->range,
+         radv_make_texel_buffer_descriptor(device, addr_info->address, addr_info->format, 0, addr_info->range,
                                            pDescriptor);
       } else {
          memset(pDescriptor, 0, 4 * 4);

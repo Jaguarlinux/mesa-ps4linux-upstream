@@ -225,9 +225,10 @@ def wait_for_job_get_started(job, attempt_no):
 
 
 def bootstrap_log_follower(main_test_case, timestamp_relative_to) -> LogFollower:
+    deploy_timeout = GL_SECTION_TIMEOUTS[LogSectionType.LAVA_DEPLOY]
     start_section = GitlabSection(
         id="dut_deploy",
-        header="Running LAVA deploy action",
+        header=f"Running LAVA deploy action - Timeout: {deploy_timeout}",
         type=LogSectionType.LAVA_DEPLOY,
         start_collapsed=True,
         timestamp_relative_to=timestamp_relative_to,
@@ -407,6 +408,7 @@ class LAVAJobSubmitter(PathResolver):
     kernel_image_name: str = None
     kernel_image_type: str = ""
     kernel_url_prefix: str = None
+    kernel_external: str = None
     lava_tags: str | tuple[str, ...] = ()  # Comma-separated LAVA tags for the job
     mesa_job_name: str = "mesa_ci_job"
     pipeline_info: str = ""

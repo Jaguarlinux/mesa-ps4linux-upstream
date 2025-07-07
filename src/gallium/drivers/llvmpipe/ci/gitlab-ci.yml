@@ -5,7 +5,6 @@ llvmpipe-piglit-rusticl:
   extends:
     - .llvmpipe-piglit-cl
     - .llvmpipe-rusticl-rules
-    - .test-piglit
   needs:
     - debian-testing
     - debian/x86_64_test-gl
@@ -29,9 +28,7 @@ llvmpipe:
     DEQP_SUITE: llvmpipe
     XVFB_SCRIPT: "install/deqp-runner.sh"
     DEQP_FRACTION: 4
-  extends:
-    - .llvmpipe-deqp-test
-    - .test-piglit
+  extends: .llvmpipe-deqp-test
   script: |
     . "$SCRIPTS_DIR"/setup-test-env.sh
     export LD_LIBRARY_PATH="$CI_PROJECT_DIR/install/lib"
@@ -60,7 +57,6 @@ llvmpipe-deqp-asan:
     # shared runners
     LP_NUM_THREADS: 0
     DEQP_FORCE_ASAN: 1
-    S3_ARTIFACT_NAME: mesa-x86_64-asan-debugoptimized
   extends: .llvmpipe-deqp-test
   needs:
     - debian/x86_64_test-gl

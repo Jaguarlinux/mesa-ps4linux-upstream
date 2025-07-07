@@ -2,6 +2,8 @@
   stage: layered-backends
   rules:
     - !reference [.test, rules]
+    - if: $EXTERNAL_KERNEL_TAG != null
+      when: never
     - !reference [.gl-rules, rules]
     - !reference [.llvmpipe-rules, rules]
     - changes: &virgl_file_list
@@ -39,7 +41,7 @@
     LAVA_S3_ARTIFACT_NAME: mesa-x86_64-default-release
     S3_ARTIFACT_NAME: mesa-python-ci-artifacts
   needs:
-    - debian/x86_64_test-gl
+    - kernel+rootfs_x86_64
     - debian-release
 
 .virpipe-test:
@@ -58,7 +60,6 @@
 .virgl-test:
   extends:
     - .test-gl
-    - .test-crosvm
     - .virgl-rules
   timeout: 15m
   variables:
@@ -70,12 +71,11 @@
 
 .virgl-iris-test:
   extends:
-    - .lava-x86_64-piglit-traces
+    - .lava-piglit-traces:x86_64
     - .lava-acer-cp514-2h-1130g7-volteer:x86_64
-    - .test-crosvm
   variables:
     HWCI_KERNEL_MODULES: vhost_vsock
-    HWCI_ENABLE_X86_KVM: 1
+    HWCI_KVM: "true"
     HWCI_TEST_SCRIPT: "/install/crosvm-runner.sh"
     HWCI_TEST_ARGS: "/install/piglit/piglit-traces.sh"
     PARALLELISE_VIA_LP_THREADS: 1

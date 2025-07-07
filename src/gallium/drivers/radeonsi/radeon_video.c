@@ -14,17 +14,19 @@
 #include "util/u_video.h"
 #include "vl/vl_defines.h"
 #include "vl/vl_video_buffer.h"
-#include "ac_uvd_dec.h"
 
 #include <unistd.h>
 
 /* generate an stream handle */
 unsigned si_vid_alloc_stream_handle()
 {
-   static struct ac_uvd_stream_handle stream_handle;
-   if (!stream_handle.base)
-      ac_uvd_init_stream_handle(&stream_handle);
-   return ac_uvd_alloc_stream_handle(&stream_handle);
+   static unsigned counter = 0;
+   static unsigned handle_base = 0;
+
+   if (!handle_base)
+      handle_base = util_bitreverse(getpid() ^ os_time_get());
+
+   return handle_base ^ ++counter;
 }
 
 /* create a buffer in the winsys */

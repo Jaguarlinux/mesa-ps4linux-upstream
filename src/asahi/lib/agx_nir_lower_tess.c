@@ -16,6 +16,18 @@
 #include "shader_enums.h"
 
 static nir_def *
+tcs_patch_id(nir_builder *b)
+{
+   return nir_channel(b, nir_load_workgroup_id(b), 0);
+}
+
+static nir_def *
+tcs_instance_id(nir_builder *b)
+{
+   return nir_channel(b, nir_load_workgroup_id(b), 1);
+}
+
+static nir_def *
 tcs_unrolled_id(nir_builder *b)
 {
    return libagx_tcs_unrolled_id(b, nir_load_tess_param_buffer_agx(b),
@@ -99,10 +111,10 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr)
       return NIR_LOWER_INSTR_PROGRESS_REPLACE;
 
    case nir_intrinsic_load_primitive_id:
-      return nir_channel(b, nir_load_workgroup_id(b), 0);
+      return tcs_patch_id(b);
 
    case nir_intrinsic_load_instance_id:
-      return nir_channel(b, nir_load_workgroup_id(b), 1);
+      return tcs_instance_id(b);
 
    case nir_intrinsic_load_invocation_id:
       if (b->shader->info.tess.tcs_vertices_out == 1)
@@ -224,6 +236,9 @@ lower_tes(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 static bool
 lower_tes_indexing(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   if (intr->intrinsic == nir_intrinsic_load_instance_id)
+      unreachable("todo");
+
    if (intr->intrinsic != nir_intrinsic_load_vertex_id)
       return false;
 
@@ -243,8 +258,18 @@ agx_nir_lower_tes(nir_shader *tes, bool to_hw_vs)
    nir_shader_intrinsics_pass(tes, lower_tes, nir_metadata_control_flow, NULL);
 
    /* Points mode renders as points, make sure we write point size for the HW */
-   if (tes->info.tess.point_mode && to_hw_vs) {
-      nir_lower_default_point_size(tes);
+   if (tes->info.tess.point_mode &&
+       !(tes->info.outputs_written & VARYING_BIT_PSIZ) && to_hw_vs) {
+
+      nir_function_impl *impl = nir_shader_get_entrypoint(tes);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+
+      nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                       .io_semantics.location = VARYING_SLOT_PSIZ,
+                       .write_mask = nir_component_mask(1), .range = 1,
+                       .src_type = nir_type_float32);
+
+      tes->info.outputs_written |= VARYING_BIT_PSIZ;
    }
 
    if (to_hw_vs) {

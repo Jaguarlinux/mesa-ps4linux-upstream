@@ -4678,39 +4678,30 @@ iris_create_so_decl_list(const struct pipe_stream_output_info *info,
 }
 
 static inline int
-iris_compute_first_urb_slot_required(struct iris_compiled_shader *fs_shader,
+iris_compute_first_urb_slot_required(uint64_t inputs_read,
                                      const struct intel_vue_map *prev_stage_vue_map)
 {
 #if GFX_VER >= 9
-   uint32_t read_offset, read_length, num_varyings, primid_offset;
-   brw_compute_sbe_per_vertex_urb_read(prev_stage_vue_map,
-                                       false /* mesh*/,
-                                       brw_wm_prog_data(fs_shader->brw_prog_data),
-                                       &read_offset, &read_length, &num_varyings,
-                                       &primid_offset);
-   return 2 * read_offset;
+   return brw_compute_first_urb_slot_required(inputs_read, prev_stage_vue_map);
 #else
-   const struct iris_fs_data *fs_data = iris_fs_data(fs_shader);
-   return elk_compute_first_urb_slot_required(fs_data->inputs, prev_stage_vue_map);
+   return elk_compute_first_urb_slot_required(inputs_read, prev_stage_vue_map);
 #endif
 }
 
 static void
-iris_compute_sbe_urb_read_interval(struct iris_compiled_shader *fs_shader,
+iris_compute_sbe_urb_read_interval(uint64_t fs_input_slots,
                                    const struct intel_vue_map *last_vue_map,
                                    bool two_sided_color,
                                    unsigned *out_offset,
                                    unsigned *out_length)
 {
-   const struct iris_fs_data *fs_data = iris_fs_data(fs_shader);
-
    /* The compiler computes the first URB slot without considering COL/BFC
     * swizzling (because it doesn't know whether it's enabled), so we need
     * to do that here too.  This may result in a smaller offset, which
     * should be safe.
     */
    const unsigned first_slot =
-      iris_compute_first_urb_slot_required(fs_shader, last_vue_map);
+      iris_compute_first_urb_slot_required(fs_input_slots, last_vue_map);
 
    /* This becomes the URB read offset (counted in pairs of slots). */
    assert(first_slot % 2 == 0);
@@ -4719,7 +4710,6 @@ iris_compute_sbe_urb_read_interval(struct iris_compiled_shader *fs_shader,
    /* We need to adjust the inputs read to account for front/back color
     * swizzling, as it can make the URB length longer.
     */
-   uint64_t fs_input_slots = fs_data->inputs;
    for (int c = 0; c <= 1; c++) {
       if (fs_input_slots & (VARYING_BIT_COL0 << c)) {
          /* If two sided color is enabled, the fragment shader's gl_Color
@@ -4908,7 +4898,7 @@ iris_emit_sbe(struct iris_batch *batch, const struct iris_context *ice)
       &iris_vue_data(ice->shaders.last_vue_shader)->vue_map;
 
    unsigned urb_read_offset, urb_read_length;
-   iris_compute_sbe_urb_read_interval(ice->shaders.prog[MESA_SHADER_FRAGMENT],
+   iris_compute_sbe_urb_read_interval(fs_data->inputs,
                                       last_vue_map,
                                       cso_rast->light_twoside,
                                       &urb_read_offset, &urb_read_length);
@@ -6895,6 +6885,14 @@ iris_upload_dirty_render_state(struct iris_context *ice,
        ice->shaders.prog[MESA_SHADER_TESS_EVAL])
       ice->state.stage_dirty |= IRIS_STAGE_DIRTY_TES;
 
+   /* Reprogram SF_CLIP & CC_STATE together. This reproduces the windows driver programming.
+    * Since blorp disables 3DSTATE_CLIP::ClipEnable and dirties CC_STATE, this takes care of
+    * Wa_14016820455 which requires SF_CLIP to be reprogrammed whenever
+    * 3DSTATE_CLIP::ClipEnable is enabled.
+    */
+   if (ice->state.dirty & (IRIS_DIRTY_CC_VIEWPORT | IRIS_DIRTY_SF_CL_VIEWPORT))
+      ice->state.dirty |= IRIS_DIRTY_CC_VIEWPORT | IRIS_DIRTY_SF_CL_VIEWPORT;
+
    uint64_t dirty = ice->state.dirty;
    uint64_t stage_dirty = ice->state.stage_dirty;
 
@@ -7111,11 +7109,11 @@ iris_upload_dirty_render_state(struct iris_context *ice,
       /* Blend constants modified for Wa_14018912822. */
       if (ice->state.color_blend_zero != color_blend_zero) {
          ice->state.color_blend_zero = color_blend_zero;
-         ice->state.dirty |= IRIS_DIRTY_COLOR_CALC_STATE;
+         dirty |= IRIS_DIRTY_COLOR_CALC_STATE;
       }
       if (ice->state.alpha_blend_zero != alpha_blend_zero) {
          ice->state.alpha_blend_zero = alpha_blend_zero;
-         ice->state.dirty |= IRIS_DIRTY_COLOR_CALC_STATE;
+         dirty |= IRIS_DIRTY_COLOR_CALC_STATE;
       }
 
       uint32_t blend_state_header;
@@ -7200,7 +7198,7 @@ iris_upload_dirty_render_state(struct iris_context *ice,
     * Testing shows that all the 3DSTATE_CONSTANT_XS need to be emitted if
     * any stage has a dirty binding table.
     */
-   const bool emit_const_wa = INTEL_NEEDS_WA_1604061319 &&
+   const bool emit_const_wa = GFX_VER >= 11 &&
       ((dirty & IRIS_DIRTY_RENDER_BUFFER) ||
        (stage_dirty & IRIS_ALL_STAGE_DIRTY_BINDINGS_FOR_RENDER));
 

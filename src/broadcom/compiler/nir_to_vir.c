@@ -1865,16 +1865,31 @@ vir_emit_tlb_color_write(struct v3d_compile *c, unsigned rt)
                 num_components = MAX2(num_components, 3);
         assert(num_components != 0);
 
-        if (c->fs_key->f32_color_rb & (1 << rt)) {
-                conf |= TLB_TYPE_F32_COLOR;
+        enum glsl_base_type type = glsl_get_base_type(var->type);
+        bool is_int_format = type == GLSL_TYPE_INT || type == GLSL_TYPE_UINT;
+        bool is_32b_tlb_format = is_int_format ||
+                                 (c->fs_key->f32_color_rb & (1 << rt));
+
+        if (is_int_format) {
+                /* The F32 vs I32 distinction was dropped in 4.2. */
+                if (c->devinfo->ver < 42)
+                        conf |= TLB_TYPE_I32_COLOR;
+                else
+                        conf |= TLB_TYPE_F32_COLOR;
                 conf |= ((num_components - 1) << TLB_VEC_SIZE_MINUS_1_SHIFT);
         } else {
-                conf |= TLB_TYPE_F16_COLOR;
-                conf |= TLB_F16_SWAP_HI_LO;
-                if (num_components >= 3)
-                        conf |= TLB_VEC_SIZE_4_F16;
-                else
-                        conf |= TLB_VEC_SIZE_2_F16;
+                if (c->fs_key->f32_color_rb & (1 << rt)) {
+                        conf |= TLB_TYPE_F32_COLOR;
+                        conf |= ((num_components - 1) <<
+                                TLB_VEC_SIZE_MINUS_1_SHIFT);
+                } else {
+                        conf |= TLB_TYPE_F16_COLOR;
+                        conf |= TLB_F16_SWAP_HI_LO;
+                        if (num_components >= 3)
+                                conf |= TLB_VEC_SIZE_4_F16;
+                        else
+                                conf |= TLB_VEC_SIZE_2_F16;
+                }
         }
 
         int num_samples = c->msaa_per_sample_output ? V3D_MAX_SAMPLES : 1;
@@ -1896,7 +1911,7 @@ vir_emit_tlb_color_write(struct v3d_compile *c, unsigned rt)
                 if (c->fs_key->sample_alpha_to_one)
                         a = vir_uniform_f(c, 1.0);
 
-                if (c->fs_key->f32_color_rb & (1 << rt)) {
+                if (is_32b_tlb_format) {
                         if (i == 0) {
                                 inst = vir_MOV_dest(c, tlbu_reg, r);
                                 inst->uniform =
@@ -1945,8 +1960,7 @@ emit_frag_end(struct v3d_compile *c)
                         has_any_tlb_color_write = true;
         }
 
-        if (!c->fs_key->software_blend &&
-            c->fs_key->sample_alpha_to_coverage && c->output_color_var[0]) {
+        if (c->fs_key->sample_alpha_to_coverage && c->output_color_var[0]) {
                 struct nir_variable *var = c->output_color_var[0];
                 struct qreg *color = &c->outputs[var->data.driver_location * 4];
 
@@ -2471,15 +2485,6 @@ ntq_setup_outputs(struct v3d_compile *c)
                 case FRAG_RESULT_DATA5:
                 case FRAG_RESULT_DATA6:
                 case FRAG_RESULT_DATA7:
-                        /* Dual source outputs have an index that is != 0.
-                         * If they have not been removed by now they end up
-                         * clobbering `output_color_var` with the wrong
-                         * variable.
-                         */
-                        if (var->data.index != 0 && var->data.index != NIR_VARIABLE_NO_INDEX) {
-                            break;
-                        }
-
                         c->output_color_var[var->data.location -
                                             FRAG_RESULT_DATA0] = var;
                         break;
@@ -2595,12 +2600,22 @@ vir_emit_tlb_color_read(struct v3d_compile *c, nir_intrinsic_instr *instr)
                 &c->color_reads[(rt * V3D_MAX_SAMPLES + sample_index) * 4];
 
         if (color_reads_for_sample[component].file == QFILE_NULL) {
-                nir_variable *var = c->output_color_var[rt];
-                int num_components = glsl_get_vector_elements(var->type);
+                enum pipe_format rt_format = c->fs_key->color_fmt[rt].format;
+                int num_components =
+                        util_format_get_nr_components(rt_format);
 
                 const bool swap_rb = c->fs_key->swap_color_rb & (1 << rt);
                 if (swap_rb)
                         num_components = MAX2(num_components, 3);
+
+                nir_variable *var = c->output_color_var[rt];
+                enum glsl_base_type type = glsl_get_base_type(var->type);
+
+                bool is_int_format = type == GLSL_TYPE_INT ||
+                                     type == GLSL_TYPE_UINT;
+
+                bool is_32b_tlb_format = is_int_format ||
+                                         (c->fs_key->f32_color_rb & (1 << rt));
 
                 int num_samples = c->fs_key->msaa ? V3D_MAX_SAMPLES : 1;
 
@@ -2609,8 +2624,11 @@ vir_emit_tlb_color_read(struct v3d_compile *c, nir_intrinsic_instr *instr)
                                           TLB_SAMPLE_MODE_PER_PIXEL;
                 conf |= (7 - rt) << TLB_RENDER_TARGET_SHIFT;
 
-                if (c->fs_key->f32_color_rb & (1 << rt)) {
-                        conf |= TLB_TYPE_F32_COLOR;
+                if (is_32b_tlb_format) {
+                        /* The F32 vs I32 distinction was dropped in 4.2. */
+                        conf |= (c->devinfo->ver < 42 && is_int_format) ?
+                                TLB_TYPE_I32_COLOR : TLB_TYPE_F32_COLOR;
+
                         conf |= ((num_components - 1) <<
                                  TLB_VEC_SIZE_MINUS_1_SHIFT);
                 } else {
@@ -2626,7 +2644,7 @@ vir_emit_tlb_color_read(struct v3d_compile *c, nir_intrinsic_instr *instr)
 
                 for (int i = 0; i < num_samples; i++) {
                         struct qreg r, g, b, a;
-                        if (c->fs_key->f32_color_rb & (1 << rt)) {
+                        if (is_32b_tlb_format) {
                                 r = conf != 0xffffffff && i == 0?
                                         vir_TLBU_COLOR_READ(c, conf) :
                                         vir_TLB_COLOR_READ(c);
@@ -3579,15 +3597,6 @@ ntq_emit_intrinsic(struct v3d_compile *c, nir_intrinsic_instr *instr)
                               vir_uniform(c, QUNIFORM_AA_LINE_WIDTH, 0));
                 break;
 
-        case nir_intrinsic_demote_samples: {
-                struct qreg mask =
-                        vir_NOT(c, ntq_get_src(c, instr->src[0], 0));
-
-                vir_SETMSF_dest(c, vir_nop_reg(),
-                                vir_AND(c, mask, vir_MSF(c)));
-                break;
-        }
-
         case nir_intrinsic_load_sample_mask_in:
                 ntq_store_def(c, &instr->def, 0, vir_MSF(c));
                 break;
@@ -4111,34 +4120,6 @@ ntq_emit_intrinsic(struct v3d_compile *c, nir_intrinsic_instr *instr)
         case nir_intrinsic_load_view_index:
                 ntq_store_def(c, &instr->def, 0,
                               vir_uniform(c, QUNIFORM_VIEW_INDEX, 0));
-                break;
-
-        /* We only use these when doing software blending. */
-        case nir_intrinsic_load_blend_const_color_r_float:
-                ntq_store_def(c, &instr->def, 0,
-                              vir_uniform(c, QUNIFORM_BLEND_CONSTANT_R, 0));
-                break;
-        case nir_intrinsic_load_blend_const_color_g_float:
-                ntq_store_def(c, &instr->def, 0,
-                              vir_uniform(c, QUNIFORM_BLEND_CONSTANT_G, 0));
-                break;
-        case nir_intrinsic_load_blend_const_color_b_float:
-                ntq_store_def(c, &instr->def, 0,
-                              vir_uniform(c, QUNIFORM_BLEND_CONSTANT_B, 0));
-                break;
-        case nir_intrinsic_load_blend_const_color_a_float:
-                ntq_store_def(c, &instr->def, 0,
-                              vir_uniform(c, QUNIFORM_BLEND_CONSTANT_A, 0));
-                break;
-
-
-        /* We only use this if alpha to coverage is enabled when using
-         * software blending.
-         */
-        case nir_intrinsic_alpha_to_coverage:
-                assert(c->fs_key->msaa);
-                ntq_store_def(c, &instr->def, 0,
-                              vir_FTOC(c, ntq_get_src(c, instr->src[0], 0)));
                 break;
 
         default:

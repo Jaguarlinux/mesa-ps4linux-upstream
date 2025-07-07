@@ -503,7 +503,7 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
     * inferring the shader image flag. Do so to avoid reallocation in case the
     * resource is later used as an image.
     */
-   if (!ail_is_drm_modifier_compressed(nresource->modifier) &&
+   if (nresource->modifier != DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
        templ->depth0 == 1) {
 
       nresource->base.bind |= PIPE_BIND_SHADER_IMAGE;
@@ -1241,7 +1241,6 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    c->isp_bgobjvals = 0x300;
 
    struct agx_resource *zres = NULL, *sres = NULL;
-   struct pipe_surface *zsbuf = framebuffer->zsbuf;
 
    if (framebuffer->zsbuf) {
       agx_pack(&c->isp_zls_pixels, CR_ISP_ZLS_PIXELS, cfg) {
@@ -1250,107 +1249,122 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       }
    }
 
-   if (zsbuf) {
-      struct agx_resource *zsres = agx_resource(zsbuf->texture);
-      const struct util_format_description *desc =
-         util_format_description(zsres->layout.format);
+   agx_pack(&c->zls_ctrl, ZLS_CONTROL, zls_control) {
 
-      assert(desc->format == PIPE_FORMAT_Z32_FLOAT ||
-             desc->format == PIPE_FORMAT_Z16_UNORM ||
-             desc->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT ||
-             desc->format == PIPE_FORMAT_S8_UINT);
+      if (framebuffer->zsbuf) {
+         struct pipe_surface *zsbuf = framebuffer->zsbuf;
+         struct agx_resource *zsres = agx_resource(zsbuf->texture);
 
-      if (util_format_has_depth(desc))
-         zres = zsres;
-      else
-         sres = zsres;
+         unsigned level = zsbuf->u.tex.level;
+         unsigned first_layer = zsbuf->u.tex.first_layer;
 
-      if (zsres->separate_stencil)
-         sres = zsres->separate_stencil;
+         const struct util_format_description *desc = util_format_description(
+            agx_resource(zsbuf->texture)->layout.format);
 
-      unsigned level = zsbuf->u.tex.level;
-      unsigned first_layer = zsbuf->u.tex.first_layer;
+         assert(desc->format == PIPE_FORMAT_Z32_FLOAT ||
+                desc->format == PIPE_FORMAT_Z16_UNORM ||
+                desc->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT ||
+                desc->format == PIPE_FORMAT_S8_UINT);
 
-      if (zres) {
-         c->depth.base = agx_map_texture_gpu(zres, first_layer) +
-                         ail_get_level_offset_B(&zres->layout, level);
+         if (util_format_has_depth(desc))
+            zres = zsres;
+         else
+            sres = zsres;
 
-         /* Main stride in pages */
-         assert((zres->layout.depth_px == 1 ||
-                 is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
-                "Page aligned Z layers");
+         if (zsres->separate_stencil)
+            sres = zsres->separate_stencil;
 
-         unsigned stride_pages = zres->layout.layer_stride_B / AIL_PAGESIZE;
-         c->depth.stride = ((stride_pages - 1) << 14) | 1;
+         if (zres) {
+            bool clear = (batch->clear & PIPE_CLEAR_DEPTH);
+            bool load = (batch->load & PIPE_CLEAR_DEPTH);
 
-         if (zres->layout.compressed) {
-            c->depth.comp_base =
-               agx_map_texture_gpu(zres, 0) + zres->layout.metadata_offset_B +
-               (first_layer * zres->layout.compression_layer_stride_B) +
-               zres->layout.level_offsets_compressed_B[level];
+            zls_control.z_store_enable = (batch->resolve & PIPE_CLEAR_DEPTH);
+            zls_control.z_load_enable = !clear && load;
 
-            /* Meta stride in cache lines */
-            assert(is_aligned(zres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
-                   "Cacheline aligned Z meta layers");
-            unsigned stride_lines =
-               zres->layout.compression_layer_stride_B / AIL_CACHELINE;
-            c->depth.comp_stride = (stride_lines - 1) << 14;
+            c->depth.base = agx_map_texture_gpu(zres, first_layer) +
+                            ail_get_level_offset_B(&zres->layout, level);
+
+            /* Main stride in pages */
+            assert((zres->layout.depth_px == 1 ||
+                    is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                   "Page aligned Z layers");
+
+            unsigned stride_pages = zres->layout.layer_stride_B / AIL_PAGESIZE;
+            c->depth.stride = ((stride_pages - 1) << 14) | 1;
+
+            assert(zres->layout.tiling != AIL_TILING_LINEAR && "must tile");
+
+            if (zres->layout.compressed) {
+               c->depth.comp_base =
+                  agx_map_texture_gpu(zres, 0) +
+                  zres->layout.metadata_offset_B +
+                  (first_layer * zres->layout.compression_layer_stride_B) +
+                  zres->layout.level_offsets_compressed_B[level];
+
+               /* Meta stride in cache lines */
+               assert(is_aligned(zres->layout.compression_layer_stride_B,
+                                 AIL_CACHELINE) &&
+                      "Cacheline aligned Z meta layers");
+               unsigned stride_lines =
+                  zres->layout.compression_layer_stride_B / AIL_CACHELINE;
+               c->depth.comp_stride = (stride_lines - 1) << 14;
+
+               zls_control.z_compress_1 = true;
+               zls_control.z_compress_2 = true;
+            }
+
+            if (zres->base.format == PIPE_FORMAT_Z16_UNORM) {
+               const float scale = 0xffff;
+               c->isp_bgobjdepth =
+                  (uint16_t)(SATURATE(clear_depth) * scale + 0.5f);
+               zls_control.z_format = AGX_ZLS_FORMAT_16;
+               c->flags |= DRM_ASAHI_RENDER_DBIAS_IS_INT;
+            } else {
+               c->isp_bgobjdepth = fui(clear_depth);
+               zls_control.z_format = AGX_ZLS_FORMAT_32F;
+            }
          }
 
-         if (zres->base.format == PIPE_FORMAT_Z16_UNORM) {
-            const float scale = 0xffff;
-            c->isp_bgobjdepth =
-               (uint16_t)(SATURATE(clear_depth) * scale + 0.5f);
+         if (sres) {
+            bool clear = (batch->clear & PIPE_CLEAR_STENCIL);
+            bool load = (batch->load & PIPE_CLEAR_STENCIL);
 
-            c->flags |= DRM_ASAHI_RENDER_DBIAS_IS_INT;
-         } else {
-            c->isp_bgobjdepth = fui(clear_depth);
+            zls_control.s_store_enable = (batch->resolve & PIPE_CLEAR_STENCIL);
+            zls_control.s_load_enable = !clear && load;
+
+            c->stencil.base = agx_map_texture_gpu(sres, first_layer) +
+                              ail_get_level_offset_B(&sres->layout, level);
+
+            /* Main stride in pages */
+            assert((sres->layout.depth_px == 1 ||
+                    is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                   "Page aligned S layers");
+            unsigned stride_pages = sres->layout.layer_stride_B / AIL_PAGESIZE;
+            c->stencil.stride = ((stride_pages - 1) << 14) | 1;
+
+            if (sres->layout.compressed) {
+               c->stencil.comp_base =
+                  agx_map_texture_gpu(sres, 0) +
+                  sres->layout.metadata_offset_B +
+                  (first_layer * sres->layout.compression_layer_stride_B) +
+                  sres->layout.level_offsets_compressed_B[level];
+
+               /* Meta stride in cache lines */
+               assert(is_aligned(sres->layout.compression_layer_stride_B,
+                                 AIL_CACHELINE) &&
+                      "Cacheline aligned S meta layers");
+               unsigned stride_lines =
+                  sres->layout.compression_layer_stride_B / AIL_CACHELINE;
+               c->stencil.comp_stride = (stride_lines - 1) << 14;
+
+               zls_control.s_compress_1 = true;
+               zls_control.s_compress_2 = true;
+            }
+
+            c->isp_bgobjvals |= clear_stencil;
          }
-      }
-
-      if (sres) {
-         c->stencil.base = agx_map_texture_gpu(sres, first_layer) +
-                           ail_get_level_offset_B(&sres->layout, level);
-
-         /* Main stride in pages */
-         assert((sres->layout.depth_px == 1 ||
-                 is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
-                "Page aligned S layers");
-         unsigned stride_pages = sres->layout.layer_stride_B / AIL_PAGESIZE;
-         c->stencil.stride = ((stride_pages - 1) << 14) | 1;
-
-         if (sres->layout.compressed) {
-            c->stencil.comp_base =
-               agx_map_texture_gpu(sres, 0) + sres->layout.metadata_offset_B +
-               (first_layer * sres->layout.compression_layer_stride_B) +
-               sres->layout.level_offsets_compressed_B[level];
-
-            /* Meta stride in cache lines */
-            assert(is_aligned(sres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
-                   "Cacheline aligned S meta layers");
-            unsigned stride_lines =
-               sres->layout.compression_layer_stride_B / AIL_CACHELINE;
-            c->stencil.comp_stride = (stride_lines - 1) << 14;
-         }
-
-         c->isp_bgobjvals |= clear_stencil;
       }
    }
-
-   unsigned load = batch->load & ~batch->clear;
-
-   struct agx_zls zls = {
-      .z_store = batch->resolve & PIPE_CLEAR_DEPTH,
-      .s_store = batch->resolve & PIPE_CLEAR_STENCIL,
-      .z_load = load & PIPE_CLEAR_DEPTH,
-      .s_load = load & PIPE_CLEAR_STENCIL,
-   };
-
-   agx_pack_zls_control((struct agx_zls_control_packed *)&c->zls_ctrl,
-                        zres ? &zres->layout : NULL,
-                        sres ? &sres->layout : NULL, &zls);
 
    if (dev->debug & AGX_DBG_NOCLUSTER)
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
@@ -1945,9 +1959,13 @@ agx_init_compute_caps(struct pipe_screen *pscreen)
 
    caps->max_local_size = 32768;
 
+   caps->max_private_size = caps->max_input_size = 4096;
+
    caps->max_clock_frequency = dev->params.max_frequency_khz / 1000;
 
    caps->max_compute_units = agx_get_num_cores(dev);
+
+   caps->images_supported = true;
 
    caps->subgroup_sizes = 32;
 

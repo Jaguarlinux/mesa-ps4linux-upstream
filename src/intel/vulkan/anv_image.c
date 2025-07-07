@@ -312,7 +312,7 @@ anv_image_choose_isl_surf_usage(struct anv_physical_device *device,
    if (comp_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT)
       isl_usage |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
 
-   if (anv_is_storage_format_emulated(vk_format)) {
+   if (anv_is_storage_format_atomics_emulated(devinfo, vk_format)) {
       isl_usage |= ISL_SURF_USAGE_DISABLE_AUX_BIT |
                    ISL_SURF_USAGE_SOFTWARE_DETILING;
    }
@@ -481,7 +481,8 @@ anv_formats_ccs_e_compatible(const struct anv_physical_device *physical_device,
 
    if ((vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
        vk_tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
-      assert(vk_format_aspects(vk_format) == VK_IMAGE_ASPECT_COLOR_BIT);
+      /* Only color */
+      assert((vk_format_aspects(vk_format) & ~VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV) == 0);
       if (devinfo->ver == 12) {
          /* From the TGL Bspec 44930 (r47128):
           *
@@ -913,12 +914,6 @@ add_video_buffers(struct anv_device *device,
                                     ANV_OFFSET_IMPLICIT, av1_cdf_max_num_bytes, 4096, &image->av1_cdf_table);
          }
       }
-   } else {
-      /* Nothing to check if it's AV1 decoding, so we need to allocate av1
-       * tables all the time.
-       */
-      ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
-                              ANV_OFFSET_IMPLICIT, av1_cdf_max_num_bytes, 4096, &image->av1_cdf_table);
    }
 
    return ok;
@@ -2615,7 +2610,7 @@ anv_image_bind_address(struct anv_device *device,
       uint64_t offset = image->bindings[binding].address.offset +
                         image->bindings[binding].memory_range.offset;
       uint64_t map_offset, map_size;
-      anv_sanitize_map_params(device, image->bindings[binding].address.bo, offset,
+      anv_sanitize_map_params(device, offset,
                               image->bindings[binding].memory_range.size,
                               &map_offset, &map_size);
 
@@ -2923,19 +2918,21 @@ anv_get_image_subresource_layout(struct anv_device *device,
    }
 
    const uint32_t level = subresource->imageSubresource.mipLevel;
-   bool subresource_has_unique_tiles = false;
    if (isl_surf) {
       /* ISL tries to give us a single layer but the Vulkan API expect the
        * entire 3D size.
        */
       const uint32_t layer = subresource->imageSubresource.arrayLayer;
-      const uint32_t layers = u_minify(isl_surf->logical_level0_px.d, level);
-      uint64_t start_tile_B, end_tile_B;
-      subresource_has_unique_tiles =
-         isl_surf_image_has_unique_tiles(isl_surf, level, layer, layers,
-                                         &start_tile_B, &end_tile_B);
-      layout->subresourceLayout.offset = mem_range->offset + start_tile_B;
-      layout->subresourceLayout.size = end_tile_B - start_tile_B;
+      const uint32_t z = u_minify(isl_surf->logical_level0_px.d, level) - 1;
+      uint64_t z0_start_tile_B, z0_end_tile_B;
+      uint64_t zX_start_tile_B, zX_end_tile_B;
+      isl_surf_get_image_range_B_tile(isl_surf, level, layer, 0,
+                                      &z0_start_tile_B, &z0_end_tile_B);
+      isl_surf_get_image_range_B_tile(isl_surf, level, layer, z,
+                                      &zX_start_tile_B, &zX_end_tile_B);
+
+      layout->subresourceLayout.offset = mem_range->offset + z0_start_tile_B;
+      layout->subresourceLayout.size = zX_end_tile_B - z0_start_tile_B;
       layout->subresourceLayout.rowPitch = row_pitch_B;
       layout->subresourceLayout.depthPitch =
          isl_surf_get_array_pitch(isl_surf);
@@ -2955,7 +2952,7 @@ anv_get_image_subresource_layout(struct anv_device *device,
    if (host_memcpy_size) {
       if (!isl_surf) {
          host_memcpy_size->size = 0;
-      } else if (subresource_has_unique_tiles) {
+      } else if (anv_image_can_host_memcpy(image)) {
          host_memcpy_size->size = layout->subresourceLayout.size;
       } else {
          /* If we cannot do straight memcpy of the image, compute a linear
@@ -3461,6 +3458,7 @@ anv_layout_to_fast_clear_type(const struct intel_device_info * const devinfo,
 bool
 anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
                          const struct anv_image *image,
+                         VkImageAspectFlags clear_aspect,
                          unsigned level,
                          const struct VkClearRect *clear_rect,
                          VkImageLayout layout,
@@ -3480,7 +3478,7 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
     */
    enum anv_fast_clear_type fast_clear_type =
       anv_layout_to_fast_clear_type(cmd_buffer->device->info, image,
-                                    VK_IMAGE_ASPECT_COLOR_BIT, layout,
+                                    clear_aspect, layout,
                                     cmd_buffer->queue_family->queueFlags);
    switch (fast_clear_type) {
    case ANV_FAST_CLEAR_NONE:
@@ -3551,6 +3549,21 @@ anv_can_fast_clear_color(const struct anv_cmd_buffer *cmd_buffer,
    /* Wa_16021232440: Disable fast clear when height is 16k */
    if (intel_needs_workaround(cmd_buffer->device->info, 16021232440) &&
        image->vk.extent.height == 16 * 1024) {
+      return false;
+   }
+
+   /* The fast-clear preamble and/or postamble flushes are more expensive than
+    * the flushes performed by BLORP during slow clears. Use a heuristic to
+    * determine if the cost of the flushes are worth fast-clearing. See
+    * genX(cmd_buffer_update_color_aux_op)() and blorp_exec_on_render().
+    * TODO: Tune for Xe2
+    */
+   if (cmd_buffer->device->info->verx10 <= 125 &&
+       cmd_buffer->num_independent_clears >= 16 &&
+       cmd_buffer->num_independent_clears >
+       cmd_buffer->num_dependent_clears * 2) {
+      anv_perf_warn(VK_LOG_OBJS(&image->vk.base),
+                    "Not enough back-to-back fast-clears. Slow clearing.");
       return false;
    }
 

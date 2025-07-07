@@ -32,6 +32,7 @@
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
 #include "vk_util.h"
+#include "util/compiler.h"
 #include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/perf/cpu_trace.h"
@@ -111,9 +112,9 @@ vk_device_memory_report_init(struct vk_device *device,
    vk_foreach_struct_const(pnext, pCreateInfo->pNext) {
       if (pnext->sType == VK_STRUCTURE_TYPE_DEVICE_DEVICE_MEMORY_REPORT_CREATE_INFO_EXT) {
          const struct VkDeviceDeviceMemoryReportCreateInfoEXT *report = (void *)pnext;
-         mem_reports[count].callback = report->pfnUserCallback;
-         mem_reports[count].data = report->pUserData;
-         count++;
+	 mem_reports[count].callback = report->pfnUserCallback;
+	 mem_reports[count].data = report->pUserData;
+	 count++;
       }
    }
 

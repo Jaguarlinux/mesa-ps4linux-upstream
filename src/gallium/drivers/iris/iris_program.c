@@ -55,20 +55,12 @@
 #include "iris_pipe.h"
 #include "nir/tgsi_to_nir.h"
 
-static inline enum intel_vue_layout
-vue_layout(bool separate_shader)
-{
-   return separate_shader ? INTEL_VUE_LAYOUT_SEPARATE : INTEL_VUE_LAYOUT_FIXED;
-}
-
-#define KEY_INIT(prefix)                                   \
-   .prefix.program_string_id = ish->program_id,            \
-   .prefix.limit_trig_input_range =                        \
-      screen->driconf.limit_trig_input_range
-#define BRW_KEY_INIT(gen, prog_id, limit_trig_input, _vue_layout) \
+#define KEY_INIT(prefix)                                                   \
+   .prefix.program_string_id = ish->program_id,                            \
+   .prefix.limit_trig_input_range = screen->driconf.limit_trig_input_range
+#define BRW_KEY_INIT(gen, prog_id, limit_trig_input)       \
    .base.program_string_id = prog_id,                      \
-   .base.limit_trig_input_range = limit_trig_input,        \
-   .base.vue_layout = _vue_layout
+   .base.limit_trig_input_range = limit_trig_input
 
 #ifdef INTEL_USE_ELK
 #define ELK_KEY_INIT(gen, prog_id, limit_trig_input)       \
@@ -533,8 +525,7 @@ iris_to_brw_vs_key(const struct iris_screen *screen,
 {
    return (struct brw_vs_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->vue.base.program_string_id,
-                   key->vue.base.limit_trig_input_range,
-                   key->vue.layout),
+                   key->vue.base.limit_trig_input_range),
    };
 }
 
@@ -544,8 +535,7 @@ iris_to_brw_tcs_key(const struct iris_screen *screen,
 {
    return (struct brw_tcs_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->vue.base.program_string_id,
-                   key->vue.base.limit_trig_input_range,
-                   key->vue.layout),
+                   key->vue.base.limit_trig_input_range),
       ._tes_primitive_mode = key->_tes_primitive_mode,
       .input_vertices = key->input_vertices,
       .patch_outputs_written = key->patch_outputs_written,
@@ -559,8 +549,7 @@ iris_to_brw_tes_key(const struct iris_screen *screen,
 {
    return (struct brw_tes_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->vue.base.program_string_id,
-                   key->vue.base.limit_trig_input_range,
-                   key->vue.layout),
+                   key->vue.base.limit_trig_input_range),
       .patch_inputs_read = key->patch_inputs_read,
       .inputs_read = key->inputs_read,
    };
@@ -572,8 +561,7 @@ iris_to_brw_gs_key(const struct iris_screen *screen,
 {
    return (struct brw_gs_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->vue.base.program_string_id,
-                   key->vue.base.limit_trig_input_range,
-                   key->vue.layout),
+                   key->vue.base.limit_trig_input_range),
    };
 }
 
@@ -583,8 +571,7 @@ iris_to_brw_fs_key(const struct iris_screen *screen,
 {
    return (struct brw_wm_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->base.program_string_id,
-                   key->base.limit_trig_input_range,
-                   key->vue_layout),
+                   key->base.limit_trig_input_range),
       .nr_color_regions = key->nr_color_regions,
       .flat_shade = key->flat_shade,
       .alpha_test_replicate_alpha = key->alpha_test_replicate_alpha,
@@ -608,8 +595,7 @@ iris_to_brw_cs_key(const struct iris_screen *screen,
 {
    return (struct brw_cs_prog_key) {
       BRW_KEY_INIT(screen->devinfo->ver, key->base.program_string_id,
-                   key->base.limit_trig_input_range,
-                   INTEL_VUE_LAYOUT_SEPARATE),
+                   key->base.limit_trig_input_range),
    };
 }
 
@@ -1898,7 +1884,7 @@ iris_compile_vs(struct iris_screen *screen,
 
       brw_compute_vue_map(devinfo,
                           &brw_prog_data->base.vue_map, nir->info.outputs_written,
-                          key->vue.layout, /* pos_slots */ 1);
+                          nir->info.separate_shader, /* pos_slots */ 1);
 
       struct brw_vs_prog_key brw_key = iris_to_brw_vs_key(screen, key);
 
@@ -1930,9 +1916,7 @@ iris_compile_vs(struct iris_screen *screen,
 
       elk_compute_vue_map(devinfo,
                           &elk_prog_data->base.vue_map, nir->info.outputs_written,
-                          nir->info.separate_shader ?
-                          INTEL_VUE_LAYOUT_SEPARATE :
-                          INTEL_VUE_LAYOUT_FIXED, /* pos_slots */ 1);
+                          nir->info.separate_shader, /* pos_slots */ 1);
 
       struct elk_vs_prog_key elk_key = iris_to_elk_vs_key(screen, key);
 
@@ -1999,10 +1983,7 @@ iris_update_compiled_vs(struct iris_context *ice)
    struct iris_uncompiled_shader *ish =
       ice->shaders.uncompiled[MESA_SHADER_VERTEX];
 
-   struct iris_vs_prog_key key = {
-      KEY_INIT(vue.base),
-      .vue.layout = vue_layout(ish->nir->info.separate_shader),
-   };
+   struct iris_vs_prog_key key = { KEY_INIT(vue.base) };
    screen->vtbl.populate_vs_key(ice, &ish->nir->info, last_vue_stage(ice), &key);
 
    struct iris_compiled_shader *old = ice->shaders.prog[IRIS_CACHE_VS];
@@ -2227,7 +2208,6 @@ iris_update_compiled_tcs(struct iris_context *ice)
       iris_get_shader_info(ice, MESA_SHADER_TESS_EVAL);
    struct iris_tcs_prog_key key = {
       .vue.base.program_string_id = tcs ? tcs->program_id : 0,
-      .vue.layout = vue_layout(tcs ? tcs->nir->info.separate_shader : false),
       ._tes_primitive_mode = tes_info->tess._primitive_mode,
       .input_vertices =
          !tcs || iris_use_tcs_multi_patch(screen) ? ice->state.vertices_per_patch : 0,
@@ -2436,10 +2416,7 @@ iris_update_compiled_tes(struct iris_context *ice)
    struct iris_uncompiled_shader *ish =
       ice->shaders.uncompiled[MESA_SHADER_TESS_EVAL];
 
-   struct iris_tes_prog_key key = {
-      KEY_INIT(vue.base),
-      .vue.layout = vue_layout(ish->nir->info.separate_shader),
-   };
+   struct iris_tes_prog_key key = { KEY_INIT(vue.base) };
    get_unified_tess_slots(ice, &key.inputs_read, &key.patch_inputs_read);
    screen->vtbl.populate_tes_key(ice, &ish->nir->info, last_vue_stage(ice), &key);
 
@@ -2523,7 +2500,7 @@ iris_compile_gs(struct iris_screen *screen,
 
       brw_compute_vue_map(devinfo,
                           &brw_prog_data->base.vue_map, nir->info.outputs_written,
-                          key->vue.layout, /* pos_slots */ 1);
+                          nir->info.separate_shader, /* pos_slots */ 1);
 
       struct brw_gs_prog_key brw_key = iris_to_brw_gs_key(screen, key);
 
@@ -2553,9 +2530,7 @@ iris_compile_gs(struct iris_screen *screen,
 
       elk_compute_vue_map(devinfo,
                           &elk_prog_data->base.vue_map, nir->info.outputs_written,
-                          nir->info.separate_shader ?
-                          INTEL_VUE_LAYOUT_SEPARATE :
-                          INTEL_VUE_LAYOUT_FIXED, /* pos_slots */ 1);
+                          nir->info.separate_shader, /* pos_slots */ 1);
 
       struct elk_gs_prog_key elk_key = iris_to_elk_gs_key(screen, key);
 
@@ -2625,10 +2600,7 @@ iris_update_compiled_gs(struct iris_context *ice)
    struct iris_screen *screen = (struct iris_screen *)ice->ctx.screen;
 
    if (ish) {
-      struct iris_gs_prog_key key = {
-         KEY_INIT(vue.base),
-         .vue.layout = vue_layout(ish->nir->info.separate_shader),
-      };
+      struct iris_gs_prog_key key = { KEY_INIT(vue.base) };
       screen->vtbl.populate_gs_key(ice, &ish->nir->info, last_vue_stage(ice), &key);
 
       bool added;
@@ -2690,7 +2662,6 @@ iris_compile_fs(struct iris_screen *screen,
    brw_nir_lower_fs_outputs(nir);
 
    int null_rts = brw_nir_fs_needs_null_rt(devinfo, nir,
-                                           key->multisample_fbo,
                                            key->alpha_to_coverage) ? 1 : 0;
 
    struct iris_binding_table bt;
@@ -2805,10 +2776,7 @@ iris_update_compiled_fs(struct iris_context *ice)
    struct iris_uncompiled_shader *ish =
       ice->shaders.uncompiled[MESA_SHADER_FRAGMENT];
    struct iris_screen *screen = (struct iris_screen *)ice->ctx.screen;
-   struct iris_fs_prog_key key = {
-      KEY_INIT(base),
-      .vue_layout = vue_layout(ish->nir->info.separate_shader),
-   };
+   struct iris_fs_prog_key key = { KEY_INIT(base) };
    screen->vtbl.populate_fs_key(ice, &ish->nir->info, &key);
 
    struct intel_vue_map *last_vue_map =
@@ -2878,7 +2846,7 @@ update_last_vue_map(struct iris_context *ice,
       ice->state.dirty |= IRIS_DIRTY_CLIP;
    }
 
-   if (changed_slots || (old_map && old_map->layout != vue_map->layout)) {
+   if (changed_slots || (old_map && old_map->separate != vue_map->separate)) {
       ice->state.dirty |= IRIS_DIRTY_SBE;
    }
 
@@ -3460,17 +3428,13 @@ iris_create_shader_state(struct pipe_context *ctx,
       if (info->clip_distance_array_size == 0)
          ish->nos |= (1ull << IRIS_NOS_RASTERIZER);
 
-      key.vs = (struct iris_vs_prog_key) {
-         KEY_INIT(vue.base),
-         .vue.layout = vue_layout(ish->nir->info.separate_shader),
-      };
+      key.vs = (struct iris_vs_prog_key) { KEY_INIT(vue.base) };
       key_size = sizeof(key.vs);
       break;
 
    case MESA_SHADER_TESS_CTRL: {
       key.tcs = (struct iris_tcs_prog_key) {
          KEY_INIT(vue.base),
-         .vue.layout = vue_layout(ish->nir->info.separate_shader),
          // XXX: make sure the linker fills this out from the TES...
          ._tes_primitive_mode =
          info->tess._primitive_mode ? info->tess._primitive_mode
@@ -3498,7 +3462,6 @@ iris_create_shader_state(struct pipe_context *ctx,
 
       key.tes = (struct iris_tes_prog_key) {
          KEY_INIT(vue.base),
-         .vue.layout = vue_layout(ish->nir->info.separate_shader),
          // XXX: not ideal, need TCS output/TES input unification
          .inputs_read = info->inputs_read,
          .patch_inputs_read = info->patch_inputs_read,
@@ -3510,10 +3473,7 @@ iris_create_shader_state(struct pipe_context *ctx,
    case MESA_SHADER_GEOMETRY:
       ish->nos |= (1ull << IRIS_NOS_RASTERIZER);
 
-      key.gs = (struct iris_gs_prog_key) {
-         KEY_INIT(vue.base),
-         .vue.layout = vue_layout(ish->nir->info.separate_shader),
-      };
+      key.gs = (struct iris_gs_prog_key) { KEY_INIT(vue.base) };
       key_size = sizeof(key.gs);
       break;
 
@@ -3544,7 +3504,6 @@ iris_create_shader_state(struct pipe_context *ctx,
 
       key.fs = (struct iris_fs_prog_key) {
          KEY_INIT(base),
-         .vue_layout = vue_layout(ish->nir->info.separate_shader),
          .nr_color_regions = util_bitcount(color_outputs),
          .coherent_fb_fetch = devinfo->ver >= 9 && devinfo->ver < 20,
          .input_slots_valid =

@@ -65,11 +65,6 @@ hk_upload_rodata(struct hk_device *dev)
    if (!dev->rodata.bo || !dev->sparse.write)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   /* The contents of sparse.write are undefined, but making them nonzero helps
-    * fuzz for bugs where we incorrectly read from the write section.
-    */
-   memset(agx_bo_map(dev->sparse.write), 0xCA, AIL_PAGESIZE);
-
    uint8_t *map = agx_bo_map(dev->rodata.bo);
    uint32_t offs = 0;
 
@@ -101,7 +96,7 @@ hk_upload_rodata(struct hk_device *dev)
    *image_heap_ptr = dev->images.bo->va->addr;
    offs += sizeof(uint64_t);
 
-   /* The heap descriptor isn't strictly readonly data, but we only have a
+   /* The geometry state buffer isn't strictly readonly data, but we only have a
     * single instance of it device-wide and -- after initializing at heap
     * allocate time -- it is read-only from the CPU perspective. The GPU uses it
     * for scratch, but is required to reset it after use to ensure resubmitting
@@ -110,8 +105,8 @@ hk_upload_rodata(struct hk_device *dev)
     * So, we allocate it here for convenience.
     */
    offs = align(offs, sizeof(uint64_t));
-   dev->rodata.heap = dev->rodata.bo->va->addr + offs;
-   offs += sizeof(struct agx_heap);
+   dev->rodata.geometry_state = dev->rodata.bo->va->addr + offs;
+   offs += sizeof(struct agx_geometry_state);
 
    /* For null storage descriptors, we need to reserve 16 bytes to catch writes.
     * No particular content is required; we cannot get robustness2 semantics

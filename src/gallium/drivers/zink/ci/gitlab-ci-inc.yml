@@ -41,7 +41,7 @@
     - !reference [.zink-common-rules, rules]
 
 .zink-venus-lvp-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -57,7 +57,7 @@
     - !reference [.zink-common-rules, rules]
 
 .zink-anv-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -80,7 +80,7 @@
     - !reference [.zink-common-rules, rules]
 
 .zink-nvk-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -97,7 +97,7 @@
     ZINK_DEBUG: optimal_keys
 
 .zink-turnip-collabora-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -105,7 +105,7 @@
     - !reference [.zink-common-manual-rules, rules]
 
 .zink-turnip-valve-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -120,7 +120,7 @@
     - !reference [.zink-common-rules, rules]
 
 .zink-radv-manual-rules:
-  stage: layered-backends-nightly
+  stage: layered-backends-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -184,7 +184,6 @@
 
 .zink-anv-adl-test:
   extends:
-    - .lava-x86_64-test-gl
     - .anv-test
     - .lava-acer-cbv514-1h-34uz-brya:x86_64
     - .zink-anv-rules
@@ -195,7 +194,7 @@
 
 .zink-anv-adl-trace-test:
   extends:
-    - .lava-x86_64-piglit-traces
+    - .lava-piglit-traces:x86_64
     - .anv-test
     - .lava-acer-n20q11-r856ltn-p1s2-nissa:x86_64
     - .zink-anv-rules
@@ -206,7 +205,6 @@
 
 .zink-anv-tgl-test:
   extends:
-    - .lava-x86_64-test-gl
     - .anv-test
     - .lava-acer-cp514-2h-1160g7-volteer:x86_64
     - .zink-anv-rules
@@ -217,7 +215,7 @@
 
 .zink-anv-tgl-trace-test:
   extends:
-    - .lava-x86_64-piglit-traces
+    - .lava-piglit-traces:x86_64
     - .anv-test
     - .lava-acer-cp514-2h-1130g7-volteer:x86_64
     - .zink-anv-rules
@@ -228,9 +226,8 @@
 
 .zink-nvk-test-valve:
   extends:
-    - .ci-tron-x86_64-test-gl-manual
+    - .b2c-x86_64-test-gl-manual
     - .nvk-vkcts
-    - .test-piglit
     - .zink-test
   variables:
     DEQP_SUITE: zink-nvk
@@ -239,8 +236,8 @@
 
 .tu-zink-test-valve:
   extends:
-    - .ci-tron-arm64-test-gl
     - .zink-test
+    - .b2c-arm64-test-gl
   variables:
     VK_DRIVER: freedreno
     HWCI_TEST_SCRIPT: ./install/deqp-runner.sh
@@ -250,15 +247,14 @@
 .radv-zink-test-valve:
   timeout: 30m
   extends:
-    - .ci-tron-test-amdgpu
-    - .ci-tron-x86_64-test-gl
     - .zink-test
-    - .test-piglit
-    - .ci-tron-test-radv
+    - .test-radv
+    - .b2c-x86_64-test-gl
   variables:
     DEQP_SUITE: zink-radv
     HWCI_TEST_SCRIPT: ./install/deqp-runner.sh
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 20
+    B2C_KERNEL_URL: https://fs.mupuf.org/linux-6.6-b2c-radv-ci # 6.6
+    B2C_TIMEOUT_OVERALL_MINUTES: 20
 
     # Disable reporting, since DUTs don't have internet access
     FLAKES_CHANNEL: ""

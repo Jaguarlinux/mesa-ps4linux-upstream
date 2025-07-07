@@ -731,7 +731,9 @@ bool vpe_color_calculate_input_cs(struct vpe_priv *vpe_priv, enum color_space in
         bright_norm_factor = bright_norm_factor_10bit;        
     }
 
-    translate_blt_to_internal_adjustments(&vpe_in_adjust, &vpe_adjust);
+    if (vpe_blt_adjust) {
+        translate_blt_to_internal_adjustments(&vpe_in_adjust, &vpe_adjust);
+    }
 
     switch (in_cs) {
     case COLOR_SPACE_SRGB:

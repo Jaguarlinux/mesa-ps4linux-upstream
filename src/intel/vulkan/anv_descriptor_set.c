@@ -1036,13 +1036,11 @@ sha1_update_immutable_sampler(struct mesa_sha1 *ctx,
                               bool embedded_sampler,
                               const struct anv_sampler *sampler)
 {
-   if (!sampler->vk.ycbcr_conversion)
-      return;
-
-   /* Hash the conversion if any as this affect placement of descriptors in
-    * the set due to the number of planes.
+   /* Hash the conversion if any as this affect shader compilation due to NIR
+    * lowering.
     */
-   SHA1_UPDATE_VALUE(ctx, sampler->vk.ycbcr_conversion->state);
+   if (sampler->vk.ycbcr_conversion)
+      SHA1_UPDATE_VALUE(ctx, sampler->vk.ycbcr_conversion->state);
 
    /* For embedded samplers, we need to hash the sampler parameters as the
     * sampler handle is baked into the shader and this ultimately is part of
@@ -1307,12 +1305,14 @@ anv_descriptor_pool_heap_init(struct anv_device *device,
 
       heap->size = align(size, 4096);
 
-      enum anv_bo_alloc_flags alloc_flags;
-      alloc_flags = samplers ? ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL_FLAGS :
-                               ANV_BO_ALLOC_DESCRIPTOR_POOL_FLAGS;
       VkResult result = anv_device_alloc_bo(device,
                                             bo_name, heap->size,
-                                            alloc_flags,
+                                            ANV_BO_ALLOC_CAPTURE |
+                                            ANV_BO_ALLOC_MAPPED |
+                                            ANV_BO_ALLOC_HOST_CACHED_COHERENT |
+                                            (samplers ?
+                                             ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL :
+                                             ANV_BO_ALLOC_DESCRIPTOR_POOL),
                                             0 /* explicit_address */,
                                             &heap->bo);
       ANV_DMR_BO_ALLOC(&pool->base, heap->bo, result);
@@ -1352,6 +1352,7 @@ anv_descriptor_pool_heap_reset(struct anv_device *device,
 
    util_vma_heap_finish(&heap->heap);
    util_vma_heap_init(&heap->heap, POOL_HEAP_OFFSET, heap->size);
+   heap->alloc_size = 0;
 }
 
 static VkResult

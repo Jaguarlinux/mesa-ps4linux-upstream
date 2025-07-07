@@ -142,7 +142,8 @@ rewrite_emit_vertex(nir_intrinsic_instr *intrin, struct state *state)
       /* We form a new primitive for every vertex emitted after the first
        * complete primitive (since we're outputting strips).
        */
-      unsigned min_verts = nir_verts_in_output_prim(b->shader);
+      unsigned min_verts =
+         mesa_vertices_per_prim(b->shader->info.gs.output_primitive);
       nir_def *new_prim = nir_uge_imm(b, vtx_per_prim_cnt, min_verts);
 
       /* Increment the decomposed primitive count by 1 if we formed a complete
@@ -184,6 +185,8 @@ overwrite_incomplete_primitives(struct state *state, unsigned stream)
    assert(state->count_vtx_per_prim);
 
    nir_builder *b = state->builder;
+   unsigned outprim_min_vertices =
+      mesa_vertices_per_prim(b->shader->info.gs.output_primitive);
 
    /* Total count of vertices emitted so far. */
    nir_def *vtxcnt_total =
@@ -195,7 +198,7 @@ overwrite_incomplete_primitives(struct state *state, unsigned stream)
 
    /* See if the current primitive is a incomplete */
    nir_def *is_inc_prim =
-      nir_ilt_imm(b, vtxcnt_per_primitive, nir_verts_in_output_prim(b->shader));
+      nir_ilt_imm(b, vtxcnt_per_primitive, outprim_min_vertices);
 
    /* Number of vertices in the incomplete primitive */
    nir_def *num_inc_vtx =
@@ -462,7 +465,6 @@ nir_lower_gs_intrinsics(nir_shader *shader, nir_lower_gs_intrinsics_flags option
    }
 
    struct state state;
-   memset(&state, 0, sizeof(state));
    state.progress = false;
    state.count_prims = count_primitives;
    state.count_vtx_per_prim = count_vtx_per_prim;

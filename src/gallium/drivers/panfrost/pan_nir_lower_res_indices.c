@@ -77,12 +77,15 @@ static bool
 lower_input_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
                    const struct panfrost_compile_inputs *inputs)
 {
+   /* We always use heap-based varying allocation when IDVS is used on Valhall. */
+   bool malloc_idvs = !inputs->no_idvs;
+
    /* All vertex attributes come from the attribute table.
     * Fragment inputs come from the attribute table too, unless they've
     * been allocated on the heap.
     */
    if (b->shader->info.stage == MESA_SHADER_VERTEX ||
-       b->shader->info.stage == MESA_SHADER_FRAGMENT) {
+       (b->shader->info.stage == MESA_SHADER_FRAGMENT && !malloc_idvs)) {
       nir_intrinsic_set_base(
          intrin,
          pan_res_handle(PAN_TABLE_ATTRIBUTE, nir_intrinsic_base(intrin)));
@@ -128,7 +131,6 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_image_texel_address:
       return lower_image_intrin(b, intrin);
    case nir_intrinsic_load_input:
-   case nir_intrinsic_load_interpolated_input:
       return lower_input_intrin(b, intrin, inputs);
    case nir_intrinsic_load_ubo:
       return lower_load_ubo_intrin(b, intrin);

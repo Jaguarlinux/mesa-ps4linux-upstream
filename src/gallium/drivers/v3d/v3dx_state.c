@@ -24,7 +24,6 @@
 
 #include "pipe/p_state.h"
 #include "util/format/u_format.h"
-#include "util/u_dual_blend.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
@@ -124,22 +123,6 @@ v3d_create_rasterizer_state(struct pipe_context *pctx,
         return so;
 }
 
-/* If the pipe_blend_state contains dual source factors then we need to fall
- * back to software blend.
- */
-static bool
-v3d_needs_software_blend(const struct pipe_blend_state *blend)
-{
-        if (V3D_DBG(SOFT_BLEND))
-                return true;
-
-        /* We only support 1 attachment with dual source blend. */
-        if (util_blend_state_is_dual(blend, 0))
-                return true;
-
-        return false;
-}
-
 /* Blend state is baked into shaders. */
 static void *
 v3d_create_blend_state(struct pipe_context *pctx,
@@ -152,8 +135,6 @@ v3d_create_blend_state(struct pipe_context *pctx,
                 return NULL;
 
         so->base = *cso;
-
-        so->use_software = v3d_needs_software_blend(cso);
 
         uint32_t max_rts = V3D_MAX_RENDER_TARGETS(V3D_VERSION);
         if (cso->independent_blend_enable) {
@@ -523,6 +504,8 @@ v3d_set_framebuffer_state(struct pipe_context *pctx,
 
         v3d->swap_color_rb = 0;
         v3d->blend_dst_alpha_one = 0;
+        v3d->submitted_any_jobs_for_current_fbo = false;
+
         for (int i = 0; i < v3d->framebuffer.nr_cbufs; i++) {
                 struct pipe_surface *cbuf = v3d->framebuffer.cbufs[i];
                 if (!cbuf)

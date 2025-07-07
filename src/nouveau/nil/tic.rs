@@ -97,8 +97,8 @@ fn nvb097_th_bl_source(
 
 type THBitView<'a> = BitMutView<'a, [u32; 8]>;
 
-fn nv9097_set_th_v2_0(
-    th: &mut THBitView<'_>,
+fn nv9097_set_th_v2_0<'a>(
+    th: &mut THBitView<'a>,
     format: &Format,
     swizzle: [nil_rs_bindings::pipe_swizzle; 4],
 ) {
@@ -122,8 +122,8 @@ fn nv9097_set_th_v2_0(
     th.set_field(cl9097::TEXHEADV2_W_SOURCE, source[3]);
 }
 
-fn nvb097_set_th_bl_0(
-    th: &mut THBitView<'_>,
+fn nvb097_set_th_bl_0<'a>(
+    th: &mut THBitView<'a>,
     format: &Format,
     swizzle: [nil_rs_bindings::pipe_swizzle; 4],
 ) {
@@ -273,8 +273,8 @@ fn nv9097_fill_tic(
     nv9097_set_th_v2_0(&mut th, &view.format, view.swizzle);
 
     // There's no base layer field in the texture header
-    let layer_address =
-        base_address + u64::from(view.base_array_layer) * image.array_stride_B;
+    let layer_address = base_address
+        + u64::from(view.base_array_layer) * u64::from(image.array_stride_B);
 
     th.set_field(cl9097::TEXHEADV2_OFFSET_LOWER, layer_address as u32);
     th.set_field(cl9097::TEXHEADV2_OFFSET_UPPER, (layer_address >> 32) as u32);
@@ -395,7 +395,7 @@ fn nvb097_fill_tic(
             view.base_array_layer + view.array_len <= image.extent_px.array_len
         );
         layer_address +=
-            u64::from(view.base_array_layer) * image.array_stride_B;
+            u64::from(view.base_array_layer) * u64::from(image.array_stride_B);
     }
 
     if tiling.is_tiled() {
@@ -692,10 +692,10 @@ fn nvb097_fill_null_tic(zero_page_address: u64, desc_out: &mut [u32; 8]) {
 
     set_enum!(th, clb097, TEXHEAD_BL_TEXTURE_TYPE, TWO_D_ARRAY);
     set_enum!(th, clb097, TEXHEAD_BL_BORDER_SIZE, BORDER_SAMPLER_COLOR);
-    th.set_field(cl9097::TEXHEADV2_NORMALIZED_COORDS, true);
+    th.set_field(clb097::TEXHEAD_BL_NORMALIZED_COORDS, true);
 
-    th.set_field(cl9097::TEXHEADV2_RES_VIEW_MIN_MIP_LEVEL, 1_u8);
-    th.set_field(cl9097::TEXHEADV2_RES_VIEW_MAX_MIP_LEVEL, 0_u8);
+    th.set_field(clb097::TEXHEAD_BL_RES_VIEW_MIN_MIP_LEVEL, 1_u8);
+    th.set_field(clb097::TEXHEAD_BL_RES_VIEW_MAX_MIP_LEVEL, 0_u8);
 
     // This is copied from the D3D12 driver. I have no idea what these bits do
     // or if they even do anything.

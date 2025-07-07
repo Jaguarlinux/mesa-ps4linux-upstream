@@ -464,7 +464,7 @@ void si_handle_sqtt(struct si_context *sctx, struct radeon_cmdbuf *rcs)
          /* Force shader update to make sure si_sqtt_describe_pipeline_bind is
           * called for the current "pipeline".
           */
-         sctx->dirty_shaders_mask |= SI_SQTT_STATE_DIRTY_BIT;
+         sctx->do_update_shaders = true;
       }
    } else {
       struct ac_sqtt_trace sqtt_trace = {0};

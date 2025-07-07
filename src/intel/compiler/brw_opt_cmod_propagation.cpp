@@ -103,17 +103,6 @@ cmod_propagate_cmp_to_add(const intel_device_info *devinfo, brw_inst *inst)
          if (isinf(src_as_float(inst->src[1])) != 0)
             return false;
       }
-   } else {
-      /* This optimization can fail for integers.  For inputs a = 0x80000000,
-       * b = 4, int(0x80000000) < 4, but int(0x80000000) - 4 overflows and
-       * results in 0x7ffffffc.  that's not less than zero, so the flags get
-       * set differently than for (a < b).
-       *
-       * However, it is safe if the comparison is Z or NZ.
-       */
-      if (inst->conditional_mod != BRW_CONDITIONAL_Z &&
-          inst->conditional_mod != BRW_CONDITIONAL_NZ)
-         return false;
    }
 
    foreach_inst_in_block_reverse_starting_from(brw_inst, scan_inst, inst) {
@@ -190,13 +179,8 @@ cmod_propagate_cmp_to_add(const intel_device_info *devinfo, brw_inst *inst)
             : inst->conditional_mod;
 
          if (scan_inst->saturate) {
-            /* Note: Integer types can only have NZ or Z, so this path does
-             * not need to worry about integer handling.
-             */
             if (cond != BRW_CONDITIONAL_G)
                goto not_match;
-
-            assert(!brw_type_is_int(scan_inst->dst.type));
 
             if (inst->src[1].file != IMM)
                goto not_match;
@@ -232,6 +216,74 @@ cmod_propagate_cmp_to_add(const intel_device_info *devinfo, brw_inst *inst)
    return false;
 }
 
+/**
+ * Propagate conditional modifiers from NOT instructions
+ *
+ * Attempt to convert sequences like
+ *
+ *    or(8)           g78<8,8,1>      g76<8,8,1>UD    g77<8,8,1>UD
+ *    ...
+ *    not.nz.f0(8)    null            g78<8,8,1>UD
+ *
+ * into
+ *
+ *    or.z.f0(8)      g78<8,8,1>      g76<8,8,1>UD    g77<8,8,1>UD
+ */
+static bool
+cmod_propagate_not(const intel_device_info *devinfo, brw_inst *inst)
+{
+   const enum brw_conditional_mod cond = brw_negate_cmod(inst->conditional_mod);
+   bool read_flag = false;
+   const unsigned flags_written = inst->flags_written(devinfo);
+
+   if (cond != BRW_CONDITIONAL_Z && cond != BRW_CONDITIONAL_NZ)
+      return false;
+
+   foreach_inst_in_block_reverse_starting_from(brw_inst, scan_inst, inst) {
+      if (regions_overlap(scan_inst->dst, scan_inst->size_written,
+                          inst->src[0], inst->size_read(devinfo, 0))) {
+         if (scan_inst->opcode != BRW_OPCODE_OR &&
+             scan_inst->opcode != BRW_OPCODE_AND)
+            break;
+
+         if (scan_inst->predicate ||
+             !scan_inst->dst.is_contiguous() ||
+             scan_inst->dst.offset != inst->src[0].offset ||
+             scan_inst->exec_size != inst->exec_size)
+            break;
+
+         /* If the scan instruction writes a different flag register than the
+          * instruction we're trying to propagate from, bail.
+          *
+          * FINISHME: The second part of the condition may be too strong.
+          * Perhaps (scan_inst->flags_written() & flags_written) !=
+          * flags_written?
+          */
+         if (scan_inst->flags_written(devinfo) != 0 &&
+             scan_inst->flags_written(devinfo) != flags_written)
+            break;
+
+         if (scan_inst->can_do_cmod() &&
+             ((!read_flag && scan_inst->conditional_mod == BRW_CONDITIONAL_NONE) ||
+              scan_inst->conditional_mod == cond)) {
+            scan_inst->conditional_mod = cond;
+            scan_inst->flag_subreg = inst->flag_subreg;
+            inst->remove();
+            return true;
+         }
+         break;
+      }
+
+      if ((scan_inst->flags_written(devinfo) & flags_written) != 0)
+         break;
+
+      read_flag = read_flag ||
+                  (scan_inst->flags_read(devinfo) & flags_written) != 0;
+   }
+
+   return false;
+}
+
 static bool
 opt_cmod_propagation_local(const intel_device_info *devinfo, bblock_t *block)
 {
@@ -240,7 +292,8 @@ opt_cmod_propagation_local(const intel_device_info *devinfo, bblock_t *block)
    foreach_inst_in_block_reverse_safe(brw_inst, inst, block) {
       if ((inst->opcode != BRW_OPCODE_AND &&
            inst->opcode != BRW_OPCODE_CMP &&
-           inst->opcode != BRW_OPCODE_MOV) ||
+           inst->opcode != BRW_OPCODE_MOV &&
+           inst->opcode != BRW_OPCODE_NOT) ||
           inst->predicate != BRW_PREDICATE_NONE ||
           !inst->dst.is_null() ||
           (inst->src[0].file != VGRF && inst->src[0].file != ATTR &&
@@ -254,10 +307,12 @@ opt_cmod_propagation_local(const intel_device_info *devinfo, bblock_t *block)
           (inst->opcode != BRW_OPCODE_CMP || inst->src[1].is_zero()))
          continue;
 
-      /* Only an AND.NZ can be propagated. Propagating AND.Z would require
-       * inverting the condition on the CMP. This changes both the flag value
-       * and the register destination of the CMP. That result may be used
-       * elsewhere, so we can't change its value on a whim.
+      /* Only an AND.NZ can be propagated.  Many AND.Z instructions are
+       * generated (for ir_unop_not in brw_shader::emit_bool_to_cond_code).
+       * Propagating those would require inverting the condition on the CMP.
+       * This changes both the flag value and the register destination of the
+       * CMP.  That result may be used elsewhere, so we can't change its value
+       * on a whim.
        */
       if (inst->opcode == BRW_OPCODE_AND &&
           !(inst->src[1].is_one() &&
@@ -268,11 +323,22 @@ opt_cmod_propagation_local(const intel_device_info *devinfo, bblock_t *block)
       /* A CMP with a second source of zero can match with anything.  A CMP
        * with a second source that is not zero can only match with an ADD
        * instruction.
+       *
+       * Only apply this optimization to float-point sources.  It can fail for
+       * integers.  For inputs a = 0x80000000, b = 4, int(0x80000000) < 4, but
+       * int(0x80000000) - 4 overflows and results in 0x7ffffffc.  that's not
+       * less than zero, so the flags get set differently than for (a < b).
        */
       if (inst->opcode == BRW_OPCODE_CMP && !inst->src[1].is_zero()) {
-         if (cmod_propagate_cmp_to_add(devinfo, inst))
+         if (brw_type_is_float(inst->src[0].type) &&
+             cmod_propagate_cmp_to_add(devinfo, inst))
             progress = true;
 
+         continue;
+      }
+
+      if (inst->opcode == BRW_OPCODE_NOT) {
+         progress = cmod_propagate_not(devinfo, inst) || progress;
          continue;
       }
 

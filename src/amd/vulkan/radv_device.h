@@ -91,8 +91,17 @@ struct radv_meta_state {
    mtx_t mtx;
 
    struct {
+      VkPipelineLayout encode_p_layout;
+      VkPipeline encode_pipeline;
+      VkPipeline encode_compact_pipeline;
+      VkPipelineLayout header_p_layout;
+      VkPipeline header_pipeline;
+      VkPipelineLayout update_p_layout;
+      VkPipeline update_pipeline;
+      VkPipelineLayout copy_p_layout;
+      VkPipeline copy_pipeline;
+
       struct radix_sort_vk *radix_sort;
-      struct vk_acceleration_structure_build_ops build_ops;
       struct vk_acceleration_structure_build_args build_args;
 
       struct {
@@ -378,7 +387,5 @@ bool radv_device_set_pstate(struct radv_device *device, bool enable);
 bool radv_device_acquire_performance_counters(struct radv_device *device);
 
 void radv_device_release_performance_counters(struct radv_device *device);
-
-bool radv_device_should_clear_vram(const struct radv_device *device);
 
 #endif /* RADV_DEVICE_H */

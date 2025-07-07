@@ -40,6 +40,7 @@ section_start prepare_rootfs "Preparing root filesystem"
 
 set -ex
 
+section_switch rootfs "Assembling root filesystem"
 ROOTFS_URL="$(get_path_to_artifact lava-rootfs.tar.zst)"
 [ $? != 1 ] || exit 1
 
@@ -51,7 +52,7 @@ cp artifacts/ci-common/init-*.sh results/job-rootfs-overlay/
 cp "$SCRIPTS_DIR"/setup-test-env.sh results/job-rootfs-overlay/
 
 tar zcf job-rootfs-overlay.tar.gz -C results/job-rootfs-overlay/ .
-ci-fairy s3cp --token-file "${S3_JWT_FILE}" job-rootfs-overlay.tar.gz "https://${JOB_ROOTFS_OVERLAY_PATH}"
+s3_upload job-rootfs-overlay.tar.gz "https://${JOB_ARTIFACTS_BASE}/"
 
 # Prepare env vars for upload.
 section_switch variables "Environment variables passed through to device:"
@@ -73,6 +74,7 @@ PYTHONPATH=artifacts/ artifacts/lava/lava_job_submitter.py \
 	--pipeline-info "$CI_JOB_NAME: $CI_PIPELINE_URL on $CI_COMMIT_REF_NAME ${CI_NODE_INDEX}/${CI_NODE_TOTAL}" \
 	--rootfs-url "${ROOTFS_URL}" \
 	--kernel-url-prefix "${KERNEL_IMAGE_BASE}/${DEBIAN_ARCH}" \
+	--kernel-external "${EXTERNAL_KERNEL_TAG}" \
 	--first-stage-init artifacts/ci-common/init-stage1.sh \
 	--dtb-filename "${DTB}" \
 	--jwt-file "${S3_JWT_FILE}" \
@@ -99,7 +101,7 @@ PYTHONPATH=artifacts/ artifacts/lava/lava_job_submitter.py \
 		--path="/" \
 		--format=tar \
 	- append-overlay \
-		--name=kernel-modules \
+		--name=extra-modules \
 		--url="${KERNEL_IMAGE_BASE}/${DEBIAN_ARCH}/modules.tar.zst" \
 		--compression=zstd \
 		--path="/" \

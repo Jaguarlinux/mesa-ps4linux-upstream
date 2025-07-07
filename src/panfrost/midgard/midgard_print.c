@@ -153,39 +153,12 @@ mir_print_embedded_constant(const midgard_instruction *ins, unsigned src_idx)
 }
 
 static void
-mir_print_alu_type(nir_alu_type t, FILE *fp)
-{
-   unsigned size = nir_alu_type_get_type_size(t);
-   nir_alu_type base = nir_alu_type_get_base_type(t);
-
-   switch (base) {
-   case nir_type_int:
-      fprintf(fp, ".i");
-      break;
-   case nir_type_uint:
-      fprintf(fp, ".u");
-      break;
-   case nir_type_bool:
-      fprintf(fp, ".b");
-      break;
-   case nir_type_float:
-      fprintf(fp, ".f");
-      break;
-   default:
-      fprintf(fp, ".unknown");
-      break;
-   }
-
-   fprintf(fp, "%u", size);
-}
-
-static void
 mir_print_src(const midgard_instruction *ins, unsigned c)
 {
    mir_print_index(ins->src[c]);
 
    if (ins->src[c] != ~0 && ins->src_types[c] != nir_type_invalid) {
-      mir_print_alu_type(ins->src_types[c], stdout);
+      pan_print_alu_type(ins->src_types[c], stdout);
       mir_print_swizzle(ins->mask, ins->swizzle[c]);
    }
 }
@@ -287,7 +260,7 @@ mir_print_instruction(const midgard_instruction *ins)
    mir_print_index(ins->dest);
 
    if (ins->dest != ~0) {
-      mir_print_alu_type(ins->dest_type, stdout);
+      pan_print_alu_type(ins->dest_type, stdout);
       mir_print_mask(ins->mask);
    }
 
@@ -355,7 +328,7 @@ mir_print_instruction(const midgard_instruction *ins)
 void
 mir_print_block(const midgard_block *block)
 {
-   printf("block%u: {\n", block->name);
+   printf("block%u: {\n", block->base.name);
 
    if (block->scheduled) {
       mir_foreach_bundle_in_block(block, bundle) {
@@ -372,15 +345,15 @@ mir_print_block(const midgard_block *block)
 
    printf("}");
 
-   if (block->successors[0]) {
+   if (block->base.successors[0]) {
       printf(" -> ");
-      mir_foreach_successor(block, succ)
+      pan_foreach_successor((&block->base), succ)
          printf(" block%u ", succ->name);
    }
 
    printf(" from { ");
    mir_foreach_predecessor(block, pred)
-      printf("block%u ", pred->name);
+      printf("block%u ", pred->base.name);
    printf("}");
 
    printf("\n\n");

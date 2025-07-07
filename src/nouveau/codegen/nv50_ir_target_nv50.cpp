@@ -21,7 +21,6 @@
  */
 
 #include "nv50_ir_target_nv50.h"
-#include "pipe/p_shader_tokens.h"
 
 namespace nv50_ir {
 

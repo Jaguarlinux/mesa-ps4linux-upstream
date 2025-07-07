@@ -4,7 +4,6 @@ include:
 zink-lvp:
   extends:
     - .test-gl
-    - .test-piglit
     - .deqp-test
     - .zink-lvp-test
   tags:
@@ -28,8 +27,6 @@ zink-venus-lvp:
     - .test-gl
     - .deqp-test
     - .zink-venus-lvp-test
-    - .test-crosvm
-    - .test-piglit
   timeout: 15min  # base run time = 8min, but it's on the shared runners so it can go up
   variables:
     DEQP_SUITE: zink-venus-lvp
@@ -41,11 +38,10 @@ zink-venus-lvp:
     LP_NUM_THREADS: 2
     CROSVM_MEMORY: 12288
     CROSVM_CPU: $FDO_CI_CONCURRENT
-    XVFB_SCRIPT: "./install/crosvm-runner.sh ./install/deqp-runner.sh"
   script: |
     export LD_LIBRARY_PATH="$CI_PROJECT_DIR/install/lib"
     export LIBGL_DRIVERS_PATH="$CI_PROJECT_DIR/install/lib/dri"
-    xvfb-run --server-args='-noreset' bash -c ". $SCRIPTS_DIR/setup-test-env.sh && ${XVFB_SCRIPT}"
+    xvfb-run --server-args='-noreset' bash -c "./install/crosvm-runner.sh ./install/deqp-runner.sh"
 
 zink-venus-lvp-full:
   extends:
@@ -58,7 +54,6 @@ zink-venus-lvp-full:
 zink-anv-adl:
   extends:
     - .zink-anv-adl-test
-    - .test-piglit
   variables:
     DEQP_SUITE: zink-anv-adl
     PIGLIT_NO_WINDOW: 1
@@ -74,7 +69,6 @@ zink-anv-adl-full:
   extends:
     - zink-anv-adl
     - .zink-anv-manual-rules
-    - .test-piglit
   variables:
     DEQP_SUITE: zink-anv-adl-full
   timeout: 2h
@@ -98,7 +92,6 @@ zink-anv-adl-traces-restricted:
 zink-anv-tgl:
   extends:
     - .zink-anv-tgl-test
-    - .test-piglit
   timeout: 30m
   variables:
     DEQP_SUITE: zink-anv-tgl
@@ -116,7 +109,6 @@ zink-anv-tgl-full:
   extends:
     - zink-anv-tgl
     - .zink-anv-manual-rules
-    - .test-piglit
   variables:
     DEQP_SUITE: zink-anv-tgl-full
   timeout: 1h 45m
@@ -139,7 +131,7 @@ zink-anv-tgl-traces-restricted:
 
 zink-tu-a618:
   extends:
-    - .lava-arm64-test-gl
+    - .lava-test-deqp:arm64
     - .zink-turnip-collabora-rules
     - .zink-test
     - .lava-sc7180-trogdor-lazor-limozeen:arm64
@@ -189,24 +181,25 @@ zink-tu-a750:
     - .tu-zink-test-valve
     - .a750-mupuf
     - .zink-turnip-valve-manual-rules
-    - .test-piglit
   timeout: 25m  # base runtime 11min total, 9min of testing
   variables:
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 20
+    B2C_TIMEOUT_BOOT_MINUTES: 18
+    B2C_TIMEOUT_OVERALL_MINUTES: 20
     DEQP_SUITE: zink-tu-a750
     GPU_VERSION: zink-tu-a750
     HWCI_START_WESTON: 1
 
 ############### Combined testing (GL, GLES, Piglit) on NVK / RADV
 zink-nvk-ga106-valve:
-  timeout: 45m
+  timeout: 60m
   extends:
     - .zink-nvk-test-valve
     - .zink-nvk-manual-rules
     - .nvk-ga106-valve
   variables:
     GPU_VERSION: zink-nvk-ga106
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 40  # usual run time: 32min
+    B2C_TIMEOUT_BOOT_MINUTES: 50
+    B2C_TIMEOUT_OVERALL_MINUTES: 55  # usual run time: 35min
 
 zink-radv-polaris10-valve:
   extends:
@@ -217,7 +210,7 @@ zink-radv-polaris10-valve:
   variables:
     GPU_VERSION: zink-radv-polaris10
     ZINK_DEBUG: quiet
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 30
+    B2C_TIMEOUT_OVERALL_MINUTES: 30
 
 zink-radv-navi10-valve:
   extends:
@@ -226,7 +219,7 @@ zink-radv-navi10-valve:
     - .zink-radv-manual-rules
   timeout: 40m
   variables:
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 30
+    B2C_TIMEOUT_OVERALL_MINUTES: 30
     GPU_VERSION: zink-radv-navi10
 
 zink-radv-vangogh-valve:
@@ -238,10 +231,10 @@ zink-radv-vangogh-valve:
     - .zink-radv-rules
   variables:
     GPU_VERSION: zink-radv-vangogh
-    CI_TRON_PATTERN__SESSION_REBOOT__REGEX: 'BUG: kernel NULL pointer dereference, address'
-    CI_TRON_TIMEOUT__BOOT_CYCLE__RETRIES: 1
-    CI_TRON_TIMEOUT__BOOT_CYCLE__MINUTES: 30
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 30
+    B2C_SESSION_REBOOT_REGEX: 'BUG: kernel NULL pointer dereference, address'
+    B2C_TIMEOUT_BOOT_RETRIES: 1
+    B2C_TIMEOUT_BOOT_MINUTES: 30
+    B2C_TIMEOUT_OVERALL_MINUTES: 30
     FDO_CI_CONCURRENT: 6
     ZINK_DEBUG: vvl
   # Override the list of tags to drop `ci-tron:priority:low`
@@ -257,5 +250,6 @@ zink-radv-navi31-valve:
   timeout: 1h 20m
   variables:
     GPU_VERSION: zink-radv-navi31
-    CI_TRON_TIMEOUT__OVERALL__MINUTES: 75
+    B2C_TIMEOUT_BOOT_MINUTES: 75
+    B2C_TIMEOUT_OVERALL_MINUTES: 75
     ZINK_DEBUG: vvl

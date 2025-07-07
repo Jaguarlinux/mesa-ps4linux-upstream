@@ -80,8 +80,6 @@ enum radeon_family
    CHIP_HAINAN,
    /* GFX7 (Sea Islands) */
    CHIP_BONAIRE,
-   CHIP_LIVERPOOL,
-   CHIP_GLADIUS,
    CHIP_KAVERI,
    CHIP_KABINI,
    CHIP_HAWAII,         /* Radeon 290, 390 */
@@ -255,24 +253,6 @@ enum sdma_version {
 
    /* GFX12 */
    SDMA_7_0 = SDMA_VERSION_VALUE(7, 0),
-};
-
-/* The enum values match PAL so they can be written into RRA files. */
-enum rt_version {
-   RT_NONE = 0x0,
-
-   RT_1_0 = 0x1,
-
-   /* GFX10.3 */
-   RT_1_1 = 0x2,
-
-   /* GFX11 */
-   RT_2_0 = 0x3,
-
-   RT_3_0 = 0x4,
-
-   /* GFX12 */
-   RT_3_1 = 0x6,
 };
 
 const char *ac_get_family_name(enum radeon_family family);

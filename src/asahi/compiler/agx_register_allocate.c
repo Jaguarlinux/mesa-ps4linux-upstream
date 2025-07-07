@@ -352,12 +352,13 @@ find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
  * Postcondition: at least one register in the returned region is already free.
  */
 static unsigned
-find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
+find_best_region_to_evict(struct ra_ctx *rctx, enum ra_class cls, unsigned size,
                           BITSET_WORD *already_evicted)
 {
    assert(util_is_power_of_two_or_zero(size) && "precondition");
-   assert((rctx->bound[RA_GPR] % size) == 0 &&
+   assert((rctx->bound[cls] % size) == 0 &&
           "register file size must be aligned to the maximum vector size");
+   assert(cls == RA_GPR);
 
    /* Useful for testing RA */
    bool invert = false;
@@ -365,7 +366,7 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
    unsigned best_base = ~0;
    unsigned best_moves = invert ? 0 : ~0;
 
-   for (unsigned base = 0; base + size <= rctx->bound[RA_GPR]; base += size) {
+   for (unsigned base = 0; base + size <= rctx->bound[cls]; base += size) {
       /* The first k registers are preallocated and unevictable, so must be
        * skipped. By itself, this does not pose a problem. We are allocating n
        * registers, but this region has at most n-k free.  Since there are at
@@ -397,7 +398,7 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
          /* We need a move for each blocked register (TODO: we only need a
           * single move for 32-bit pairs, could optimize to use that instead.)
           */
-         if (BITSET_TEST(rctx->used_regs[RA_GPR], reg))
+         if (BITSET_TEST(rctx->used_regs[cls], reg))
             moves++;
          else
             any_free = true;
@@ -413,7 +414,7 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
       }
    }
 
-   assert(best_base < rctx->bound[RA_GPR] &&
+   assert(best_base < rctx->bound[cls] &&
           "not enough registers (should have spilled already)");
    return best_base;
 }
@@ -488,7 +489,7 @@ assign_regs_by_copying(struct ra_ctx *rctx, agx_index dest, const agx_instr *I,
       /* We need to shuffle some variables to make room. Look for a range of
        * the register file that is partially blocked.
        */
-      unsigned new_reg = find_best_region_to_evict(rctx, nr, clobbered);
+      unsigned new_reg = find_best_region_to_evict(rctx, RA_GPR, nr, clobbered);
 
       /* Blocked registers need to get reassigned. Add them to the worklist. */
       for (unsigned i = 0; i < nr; ++i) {

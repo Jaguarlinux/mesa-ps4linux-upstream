@@ -60,7 +60,6 @@
 #include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_tilebuffer.h"
-#include "geometry.h"
 #include "libagx.h"
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -1304,14 +1303,14 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
             cfg.aligned_width_msaa_sw =
                align(u_minify(view->resource->width0, level),
                      tex->layout.tilesize_el[level].width_el);
-
-            cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
          } else {
             cfg.level_offset_sw =
                ail_get_level_offset_B(&tex->layout, cfg.level);
          }
 
-         if (tex->layout.tiling != AIL_TILING_LINEAR || emrt) {
+         cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
+
+         if (tex->layout.tiling == AIL_TILING_GPU || emrt) {
             struct ail_tile tile_size = tex->layout.tilesize_el[level];
             cfg.tile_width_sw = tile_size.width_el;
             cfg.tile_height_sw = tile_size.height_el;
@@ -3938,11 +3937,11 @@ agx_ia_update(struct agx_batch *batch, const struct pipe_draw_info *info,
 }
 
 static uint64_t
-agx_batch_heap(struct agx_batch *batch)
+agx_batch_geometry_state(struct agx_batch *batch)
 {
    struct agx_context *ctx = batch->ctx;
 
-   if (!batch->heap) {
+   if (!batch->geometry_state) {
       uint32_t size = 128 * 1024 * 1024;
 
       if (!ctx->heap) {
@@ -3950,18 +3949,18 @@ agx_batch_heap(struct agx_batch *batch)
                                         PIPE_USAGE_DEFAULT, size);
       }
 
-      struct agx_heap heap = {
-         .base = agx_resource(ctx->heap)->bo->va->addr,
-         .size = size,
+      struct agx_geometry_state state = {
+         .heap = agx_resource(ctx->heap)->bo->va->addr,
+         .heap_size = size,
       };
 
       agx_batch_writes(batch, agx_resource(ctx->heap), 0);
 
-      batch->heap =
-         agx_pool_upload_aligned(&batch->pool, &heap, sizeof(heap), 8);
+      batch->geometry_state =
+         agx_pool_upload_aligned(&batch->pool, &state, sizeof(state), 8);
    }
 
-   return batch->heap;
+   return batch->geometry_state;
 }
 
 static uint64_t
@@ -3981,6 +3980,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       agx_pool_upload_aligned(&batch->pool, &ia, sizeof(ia), 8);
 
    struct agx_geometry_params params = {
+      .state = agx_batch_geometry_state(batch),
       .indirect_desc = batch->geom_indirect,
       .flat_outputs =
          batch->ctx->stage[PIPE_SHADER_FRAGMENT].shader->info.inputs_flat_shaded,
@@ -4039,16 +4039,14 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       params.count_buffer = T.gpu;
    }
 
-   /* Workgroup size */
-   params.vs_grid[3] = params.gs_grid[3] = 64;
-   params.vs_grid[4] = params.gs_grid[4] = 1;
-   params.vs_grid[5] = params.gs_grid[5] = 1;
-
    if (indirect) {
       batch->uniforms.vertex_output_buffer_ptr =
          agx_pool_alloc_aligned(&batch->pool, 8, 8).gpu;
 
       params.vs_grid[2] = params.gs_grid[2] = 1;
+
+      batch->geom_index_bo = agx_resource(batch->ctx->heap)->bo;
+      batch->geom_index = batch->geom_index_bo->va->addr;
    } else {
       params.vs_grid[0] = draw->count;
       params.gs_grid[0] =
@@ -4075,16 +4073,14 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
          params.input_buffer = addr;
       }
 
-      struct agx_gs_info *gsi = &batch->ctx->gs->gs;
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
-         unsigned idx_size = params.input_primitives * gsi->max_indices;
+      unsigned idx_size =
+         params.input_primitives * batch->ctx->gs->gs.max_indices;
 
-         params.output_index_buffer =
-            agx_pool_alloc_aligned_with_bo(&batch->pool, idx_size * 4, 4,
-                                           &batch->geom_index_bo)
-               .gpu;
-         batch->geom_index = params.output_index_buffer;
-      }
+      params.output_index_buffer =
+         agx_pool_alloc_aligned_with_bo(&batch->pool, idx_size * 4, 4,
+                                        &batch->geom_index_bo)
+            .gpu;
+      batch->geom_index = params.output_index_buffer;
    }
 
    return agx_pool_upload_aligned_with_bo(&batch->pool, &params, sizeof(params),
@@ -4135,7 +4131,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
 
    uint64_t gp = batch->uniforms.geometry_params;
    struct agx_grid grid_vs, grid_gs;
-   struct agx_workgroup wg = agx_workgroup(64, 1, 1);
+   struct agx_workgroup wg;
 
    /* Setup grids */
    if (indirect) {
@@ -4154,23 +4150,23 @@ agx_launch_gs_prerast(struct agx_batch *batch,
          .vertex_buffer = batch->uniforms.vertex_output_buffer_ptr,
          .ia = batch->uniforms.input_assembly,
          .p = batch->uniforms.geometry_params,
-         .heap = agx_batch_heap(batch),
          .vs_outputs = batch->uniforms.vertex_outputs,
          .index_size_B = info->index_size,
          .prim = info->mode,
          .is_prefix_summing = gs->gs.prefix_sum,
-         .max_indices = gs->gs.max_indices,
-         .shape = gs->gs.shape,
+         .indices_per_in_prim = gs->gs.max_indices,
       };
 
       libagx_gs_setup_indirect_struct(batch, agx_1d(1), AGX_BARRIER_ALL, gsi);
 
-      grid_vs = agx_grid_indirect_local(
-         gp + offsetof(struct agx_geometry_params, vs_grid));
+      wg = agx_workgroup(1, 1, 1);
+      grid_vs =
+         agx_grid_indirect(gp + offsetof(struct agx_geometry_params, vs_grid));
 
-      grid_gs = agx_grid_indirect_local(
-         gp + offsetof(struct agx_geometry_params, gs_grid));
+      grid_gs =
+         agx_grid_indirect(gp + offsetof(struct agx_geometry_params, gs_grid));
    } else {
+      wg = agx_workgroup(64, 1, 1);
       grid_vs = agx_3d(draws->count, info->instance_count, 1);
 
       grid_gs =
@@ -4274,7 +4270,7 @@ agx_draw_without_restart(struct agx_batch *batch,
       &out_draws_rsrc.bo);
 
    struct libagx_unroll_restart_args unroll = {
-      .heap = agx_batch_heap(batch),
+      .heap = agx_batch_geometry_state(batch),
       .index_buffer = ib,
       .out_draw = out_draws.gpu,
       .restart_index = info->restart_index,
@@ -4610,11 +4606,11 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    agx_upload_draw_params(batch, indirect, draws, info);
 
    /* Setup parameters */
-   uint64_t heap = agx_batch_heap(batch);
+   uint64_t geom_state = agx_batch_geometry_state(batch);
    assert((tcs->tess.output_stride & 3) == 0 && "must be aligned");
 
    struct libagx_tess_args args = {
-      .heap = heap,
+      .heap = geom_state,
       .tcs_stride_el = tcs->tess.output_stride / 4,
       .statistic = agx_get_query_address(
          batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_DS_INVOCATIONS]),
@@ -4892,6 +4888,40 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
    }
 }
 
+/*
+ * Usually, non-attachment stores must be barriered explicitly by the app using
+ * glMemoryBarrier. Transform feedback buffers are annoyingly excluded from this
+ * requirement, so we need to handle those hazards ourselves. Transform feedback
+ * will barrier with itself so we only need to consider write-after-read
+ * hazards.
+ *
+ * The general case does require a flush. Consider binding a buffer as a UBO,
+ * drawing with a fragment shader reading that UBO, then rebinding as XFB, and
+ * drawing with XFB stores. We have to split the batch in the middle.
+ * gles-3.0-transform-feedback-uniform-buffer-object does this.
+ */
+static void
+agx_legalize_xfb(struct agx_context *ctx)
+{
+   /* If this draw isn't writing transform feedback, there's nothing to worry
+    * about.
+    */
+   if (!ctx->streamout.num_targets ||
+       !agx_last_uncompiled_vgt(ctx)->has_xfb_info)
+      return;
+
+   /* Otherwise, flush the readers of anything written by transform feedback. */
+   for (unsigned i = 0; i < ctx->streamout.num_targets; ++i) {
+      struct agx_streamout_target *tgt =
+         agx_so_target(ctx->streamout.targets[i]);
+
+      if (tgt != NULL) {
+         agx_flush_readers(ctx, agx_resource(tgt->base.buffer),
+                           "Transform feedback buffer");
+      }
+   }
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -4945,10 +4975,12 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       return;
    }
 
-   /* We must legalize feedback loops before getting the batch, since once we
-    * have the batch we're not allowed to flush the bound render targets.
+   /* We must legalize feedback loops and transform feedback writes before
+    * getting the batch, since once we have the batch we're not allowed to flush
+    * the bound render targets.
     */
    agx_legalize_feedback_loops(ctx);
+   agx_legalize_xfb(ctx);
 
    struct agx_batch *batch = agx_get_batch(ctx);
    uint64_t ib = 0;
@@ -5139,7 +5171,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    /* Wrap the pool allocation in a fake resource for meta-Gallium use */
    struct agx_resource indirect_rsrc = {.bo = batch->geom_indirect_bo};
-   struct agx_resource index_rsrc = {};
+   struct agx_resource index_rsrc = {.bo = batch->geom_index_bo};
 
    if (ctx->gs) {
       /* Launch the pre-rasterization parts of the geometry shader */
@@ -5149,12 +5181,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          return;
 
       /* Setup to rasterize the GS results */
-      struct agx_gs_info *gsi = &ctx->gs->gs;
       info_gs = (struct pipe_draw_info){
-         .mode = gsi->mode,
-         .index_size = agx_gs_index_size(gsi->shape),
-         .primitive_restart = agx_gs_indexed(gsi->shape),
-         .restart_index = agx_gs_index_size(gsi->shape) == 1 ? 0xFF : ~0,
+         .mode = ctx->gs->gs.mode,
+         .index_size = 4,
+         .primitive_restart = true,
+         .restart_index = ~0,
          .index.resource = &index_rsrc.base,
          .instance_count = 1,
       };
@@ -5167,38 +5198,26 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          };
 
          indirect = &indirect_gs;
-
-         batch->geom_index_bo = agx_resource(batch->ctx->heap)->bo;
-         batch->geom_index = batch->geom_index_bo->va->addr;
       } else {
-         unsigned prims =
-            u_decomposed_prims_for_vertices(info->mode, draws->count);
+         unsigned unrolled_prims =
+            u_decomposed_prims_for_vertices(info->mode, draws->count) *
+            info->instance_count;
 
          draw_gs = (struct pipe_draw_start_count_bias){
-            .count = agx_gs_rast_vertices(gsi->shape, gsi->max_indices, prims,
-                                          info->instance_count),
+            .count = ctx->gs->gs.max_indices * unrolled_prims,
          };
-
-         info_gs.instance_count = agx_gs_rast_instances(
-            gsi->shape, gsi->max_indices, prims, info->instance_count);
 
          draws = &draw_gs;
       }
 
       info = &info_gs;
-      index_rsrc.bo = batch->geom_index_bo;
 
       /* TODO: Deduplicate? */
       batch->reduced_prim = u_reduced_prim(info->mode);
       ctx->dirty |= AGX_DIRTY_PRIM;
 
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
-         ib = batch->geom_index;
-         ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
-      } else if (gsi->shape == AGX_GS_SHAPE_STATIC_INDEXED) {
-         ib = agx_pool_upload(&batch->pool, gsi->topology, gsi->max_indices);
-         ib_extent = gsi->max_indices;
-      }
+      ib = batch->geom_index;
+      ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
 
       /* We need to reemit geometry descriptors since the txf sampler may change
        * between the GS prepass and the GS rast program.
@@ -5314,8 +5333,6 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
            unsigned variable_shared_mem)
 {
    struct agx_context *ctx = batch->ctx;
-   if (!linked && agx_is_shader_empty(&cs->b))
-      return;
 
    /* To implement load_num_workgroups, the number of workgroups needs to be
     * available in GPU memory. This is either the indirect buffer, or just a

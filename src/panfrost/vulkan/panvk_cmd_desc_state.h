@@ -41,6 +41,16 @@ struct panvk_shader_desc_state {
 #endif
 };
 
+#if PAN_ARCH >= 9
+static inline uint32_t
+panvk_shader_res_table_count(struct panvk_shader_desc_state *shader_desc_state)
+{
+   uint32_t count = (shader_desc_state->res_table & BITFIELD_MASK(6));
+   assert(count % MALI_RESOURCE_TABLE_SIZE_ALIGNMENT == 0);
+   return count;
+}
+#endif
+
 struct panvk_push_set {
    struct panvk_cmd_pool_obj base;
    struct panvk_descriptor_set set;
@@ -76,7 +86,7 @@ VkResult panvk_per_arch(cmd_prepare_shader_res_table)(
    struct panvk_cmd_buffer *cmdbuf,
    const struct panvk_descriptor_state *desc_state,
    const struct panvk_shader *shader,
-   struct panvk_shader_desc_state *shader_desc_state, uint32_t repeat_count);
+   struct panvk_shader_desc_state *shader_desc_state);
 #endif
 
 VkResult panvk_per_arch(cmd_prepare_push_descs)(

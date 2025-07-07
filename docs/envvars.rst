@@ -201,10 +201,10 @@ Core Mesa environment variables
 
    if set, determines the directory to be used for the on-disk cache of
    compiled shader programs. If set then the cache will be stored in
-   ``$MESA_SHADER_CACHE_DIR/mesa_shader_cache``. If this variable is not
+   ``$MESA_SHADER_CACHE_DIR/mesa_shader_cache_db``. If this variable is not
    set, then the cache will be stored in
-   ``$XDG_CACHE_HOME/mesa_shader_cache`` (if that variable is set), or else
-   within ``.cache/mesa_shader_cache`` within the user's home directory.
+   ``$XDG_CACHE_HOME/mesa_shader_cache_db`` (if that variable is set), or else
+   within ``.cache/mesa_shader_cache_db`` within the user's home directory.
 
 .. envvar:: MESA_SHADER_CACHE_SHOW_STATS
 
@@ -228,9 +228,9 @@ Core Mesa environment variables
 
 .. envvar:: MESA_DISK_CACHE_MULTI_FILE
 
-   if set to 1 (set by default), enables the multi file on-disk
-   shader cache implementation. This implementation increases the overall
-   disk usage.
+   if set to 1, enables the multi file on-disk shader cache implementation
+   instead of the default Mesa-DB cache implementation.
+   This implementation increases the overall disk usage.
    If :envvar:`MESA_SHADER_CACHE_DIR` is set, the cache will be stored in
    ``$MESA_SHADER_CACHE_DIR/mesa_shader_cache``, or else within
    ``$XDG_CACHE_HOME/mesa_shader_cache`` (if that variable is set)
@@ -247,18 +247,6 @@ Core Mesa environment variables
    ``MESA_DISK_CACHE_SINGLE_FILE=filename1`` refers to ``filename1.foz``
    and ``filename1_idx.foz``. A limit of 8 DBs can be loaded and this limit
    is shared with :envvar:`MESA_DISK_CACHE_READ_ONLY_FOZ_DBS_DYNAMIC_LIST`.
-
-.. envvar:: MESA_DISK_CACHE_DATABASE
-
-   if set to 1, enables the Mesa-DB single file on-disk shader cache
-   implementation instead of the default multi-file cache implementation.
-   Like :envvar:`MESA_DISK_CACHE_SINGLE_FILE`, Mesa-DB reduces overall
-   disk usage but Mesa-DB supports cache size limits via
-   :envvar:`MESA_SHADER_CACHE_MAX_SIZE`. If
-   :envvar:`MESA_SHADER_CACHE_DIR` is not set, the cache will be stored
-   in ``$XDG_CACHE_HOME/mesa_shader_cache_db`` (if that variable is set)
-   or else within ``.cache/mesa_shader_cache_db`` within the user's home
-   directory.
 
 .. envvar:: MESA_DISK_CACHE_DATABASE_NUM_PARTS
 
@@ -1089,20 +1077,20 @@ Gallium environment variables
 
 .. envvar:: GALLIUM_TRACE
 
-   If set, this variable will cause the trace output to be written to the
+   If set, this variable will cause the :ref:`trace` output to be written to the
    specified file. Paths may be relative or absolute; relative paths are relative
    to the working directory.  For example, setting it to "trace.xml" will cause
    the trace to be written to a file of the same name in the working directory.
 
 .. envvar:: GALLIUM_TRACE_TC
 
-   If enabled while trace is active, this variable specifies that the threaded context
+   If enabled while :ref:`trace` is active, this variable specifies that the threaded context
    should be traced for drivers which implement it. By default, the driver thread is traced,
    which will include any reordering of the command stream from threaded context.
 
 .. envvar:: GALLIUM_TRACE_TRIGGER
 
-   If set while trace is active, this variable specifies a filename to monitor.
+   If set while :ref:`trace` is active, this variable specifies a filename to monitor.
    Once the file exists (e.g., from the user running 'touch /path/to/file'), a single
    frame will be recorded into the trace output.
    Paths may be relative or absolute; relative paths are relative to the working directory.
@@ -1146,6 +1134,54 @@ Gallium environment variables
    ``ssse3``
    ``sse4.1``
    ``avx``
+
+Clover environment variables
+----------------------------
+
+.. envvar:: CLOVER_DEVICE_TYPE
+
+   allows to overwrite the device type of devices. Possible values are
+   ``accelerator``, ``cpu``, ``custom`` and ``gpu``
+
+.. envvar:: CLOVER_DEVICE_VERSION_OVERRIDE
+
+   overwrites the auto detected OpenCL version of a device. Possible values:
+   ``1.0``
+   ``1.1``
+   ``1.2``
+   ``2.0``
+   ``2.1``
+   ``2.2``
+   ``3.0``
+
+.. envvar:: CLOVER_DEVICE_CLC_VERSION_OVERRIDE
+
+   overwrites the auto detected CLC version. Possible values:
+   ``1.0``
+   ``1.1``
+   ``1.2``
+   ``2.0``
+   ``2.1``
+   ``2.2``
+   ``3.0``
+
+.. envvar:: CLOVER_EXTRA_BUILD_OPTIONS
+
+   allows specifying additional compiler and linker options. Specified
+   options are appended after the options set by the OpenCL program in
+   ``clBuildProgram``.
+
+.. envvar:: CLOVER_EXTRA_COMPILE_OPTIONS
+
+   allows specifying additional compiler options. Specified options are
+   appended after the options set by the OpenCL program in
+   ``clCompileProgram``.
+
+.. envvar:: CLOVER_EXTRA_LINK_OPTIONS
+
+   allows specifying additional linker options. Specified options are
+   appended after the options set by the OpenCL program in
+   ``clLinkProgram``.
 
 .. _rusticl-env-var:
 
@@ -1473,8 +1509,6 @@ RADV driver environment variables
       Dump backend IR (ACO or LLVM) for selected shader stages.
    ``asm``
       Dump shader disassembly for selected shader stages.
-   ``bvh4``
-      Use bvh4 encoding on GPUs that support bvh8 encoding.
 
 .. envvar:: RADV_FORCE_FAMILY
 
@@ -1607,8 +1641,8 @@ RADV driver environment variables
    ``validateir``
       validate the ACO IR at various points of compilation (enabled by
       default for debug/debugoptimized builds)
-   ``novalidate``
-      don't enable some ACO validation by default in debug/debugoptimized builds
+   ``novalidateir``
+      disable ACO IR validation in debug/debugoptimized builds
    ``validatera``
       validate register assignment of ACO IR and catches many RA bugs
    ``force-waitcnt``

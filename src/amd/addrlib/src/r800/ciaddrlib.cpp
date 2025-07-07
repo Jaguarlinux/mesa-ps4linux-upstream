@@ -368,14 +368,12 @@ ChipFamily CiLib::HwlConvertChipFamily(
             m_settings.isBonaire    = ASICREV_IS_BONAIRE_M(uChipRevision);
             m_settings.isHawaii     = ASICREV_IS_HAWAII_P(uChipRevision);
             break;
-         case FAMILY_KV:
+        case FAMILY_KV:
             m_settings.isKaveri     = 1;
             m_settings.isSpectre    = ASICREV_IS_SPECTRE(uChipRevision);
             m_settings.isSpooky     = ASICREV_IS_SPOOKY(uChipRevision);
-            //FIXME this is broken
-            //m_settings.isKalindi    = ASICREV_IS_KALINDI(uChipRevision);
+            m_settings.isKalindi    = ASICREV_IS_KALINDI(uChipRevision);
             break;
-
         case FAMILY_VI:
             m_settings.isVolcanicIslands = 1;
             m_settings.isIceland         = ASICREV_IS_ICELAND_M(uChipRevision);

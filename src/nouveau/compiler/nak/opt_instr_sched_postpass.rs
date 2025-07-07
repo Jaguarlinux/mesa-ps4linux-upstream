@@ -31,7 +31,10 @@ impl<T: Clone> RegUse<T> {
     }
 }
 
-fn generate_dep_graph(sm: &dyn ShaderModel, instrs: &[Box<Instr>]) -> DepGraph {
+fn generate_dep_graph(
+    sm: &dyn ShaderModel,
+    instrs: &Vec<Box<Instr>>,
+) -> DepGraph {
     let mut g = DepGraph::new((0..instrs.len()).map(|_| Default::default()));
 
     // Maps registers to RegUse<ip, src_dst_idx>.  Predicates are
@@ -197,8 +200,7 @@ fn generate_order(
             }
         }
     }
-
-    (instr_order, current_cycle)
+    return (instr_order, current_cycle);
 }
 
 fn sched_buffer(

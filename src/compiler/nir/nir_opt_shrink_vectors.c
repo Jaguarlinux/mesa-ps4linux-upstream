@@ -114,7 +114,6 @@ shrink_dest_to_read_mask(nir_def *def, bool shrink_start)
 
       if (first_bit) {
          assert(shrink_start);
-         assume(comps < NIR_MAX_VEC_COMPONENTS);
 
          if (nir_intrinsic_has_component(intr)) {
             unsigned new_component = nir_intrinsic_component(intr) + first_bit;
@@ -321,7 +320,6 @@ opt_shrink_vectors_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
    switch (instr->intrinsic) {
    case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_ubo:
-   case nir_intrinsic_load_ubo_vec4:
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_per_primitive_input:
    case nir_intrinsic_load_input_vertex:

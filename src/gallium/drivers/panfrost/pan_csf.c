@@ -26,6 +26,7 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "genxml/cs_builder.h"
+#include "panfrost/lib/genxml/cs_builder.h"
 
 #include "gen_macros.h"
 #include "pan_cmdstream.h"
@@ -118,17 +119,17 @@ csf_oom_handler_init(struct panfrost_context *ctx)
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
       .reg_perm = (dev->debug & PAN_DBG_CS) ? csf_reg_perm_cb : NULL,
-      .ls_sb_slot = 0,
    };
    cs_builder_init(&b, &conf, queue);
 
-   struct cs_exception_handler_ctx handler_ctx = {
+   struct cs_function_ctx handler_ctx = {
       .ctx_reg = cs_reg64(&b, TILER_OOM_CTX_REG),
       .dump_addr_offset = offsetof(struct pan_csf_tiler_oom_ctx, dump_addr),
+      .ls_sb_slot = 0,
    };
-   struct cs_exception_handler handler;
+   struct cs_function handler;
 
-   cs_exception_handler_def(&b, &handler, handler_ctx) {
+   cs_function_def(&b, &handler, handler_ctx) {
       struct cs_index tiler_oom_ctx = cs_reg64(&b, TILER_OOM_CTX_REG);
       struct cs_index counter = cs_reg32(&b, 47);
       struct cs_index zero = cs_reg64(&b, 48);
@@ -148,7 +149,7 @@ csf_oom_handler_init(struct panfrost_context *ctx)
       /* Use different framebuffer descriptor depending on whether incremental
        * rendering has already been triggered */
       cs_load32_to(&b, counter, tiler_oom_ctx, FIELD_OFFSET(counter));
-      cs_wait_slot(&b, 0);
+      cs_wait_slot(&b, 0, false);
       cs_if(&b, MALI_CS_CONDITION_GREATER, counter) {
          cs_load64_to(&b, cs_sr_reg64(&b, FRAGMENT, FBD_POINTER), tiler_oom_ctx,
                       FBD_OFFSET(MIDDLE));
@@ -164,12 +165,12 @@ csf_oom_handler_init(struct panfrost_context *ctx)
                    FIELD_OFFSET(bbox_max));
       cs_move64_to(&b, cs_sr_reg64(&b, FRAGMENT, TEM_POINTER), 0);
       cs_move32_to(&b, cs_sr_reg32(&b, FRAGMENT, TEM_ROW_STRIDE), 0);
-      cs_wait_slot(&b, 0);
+      cs_wait_slot(&b, 0, false);
 
       /* Run the fragment job and wait */
       cs_select_sb_entries_for_async_ops(&b, 3);
-      cs_run_fragment(&b, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
-      cs_wait_slot(&b, 3);
+      cs_run_fragment(&b, false, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
+      cs_wait_slot(&b, 3, false);
 
       /* Increment counter */
       cs_add32(&b, counter, counter, 1);
@@ -177,9 +178,9 @@ csf_oom_handler_init(struct panfrost_context *ctx)
 
       /* Load completed chunks */
       cs_load64_to(&b, tiler_ctx, tiler_oom_ctx, FIELD_OFFSET(tiler_desc));
-      cs_wait_slot(&b, 0);
+      cs_wait_slot(&b, 0, false);
       cs_load_to(&b, completed_chunks, tiler_ctx, BITFIELD_MASK(4), 10 * 4);
-      cs_wait_slot(&b, 0);
+      cs_wait_slot(&b, 0, false);
 
       cs_finish_fragment(&b, false, completed_top, completed_bottom, cs_now());
 
@@ -195,7 +196,7 @@ csf_oom_handler_init(struct panfrost_context *ctx)
                       MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, flush_id,
                       cs_defer(0, 0));
 
-      cs_wait_slot(&b, 0);
+      cs_wait_slot(&b, 0, false);
 
       cs_select_sb_entries_for_async_ops(&b, 2);
    }
@@ -225,6 +226,7 @@ void
 GENX(csf_cleanup_batch)(struct panfrost_batch *batch)
 {
    free(batch->csf.cs.builder);
+   free(batch->csf.cs.ls_tracker);
 
    panfrost_pool_cleanup(&batch->csf.cs_chunk_pool);
 }
@@ -247,6 +249,13 @@ GENX(csf_init_batch)(struct panfrost_batch *batch)
                           "CS chunk pool", false, true))
       return -1;
 
+   if (dev->debug & PAN_DBG_CS) {
+      /* Load/store tracker if extra checks are enabled. */
+      batch->csf.cs.ls_tracker =
+         calloc(1, sizeof(struct cs_load_store_tracker));
+      batch->csf.cs.ls_tracker->sb_slot = 0;
+   }
+
    /* Allocate and bind the command queue */
    struct cs_buffer queue = csf_alloc_cs_buffer(batch);
    if (!queue.gpu)
@@ -260,8 +269,8 @@ GENX(csf_init_batch)(struct panfrost_batch *batch)
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
       .alloc_buffer = csf_alloc_cs_buffer,
       .cookie = batch,
+      .ls_tracker = batch->csf.cs.ls_tracker,
       .reg_perm = (dev->debug & PAN_DBG_CS) ? csf_reg_perm_cb : NULL,
-      .ls_sb_slot = 0,
    };
 
    /* Setup the queue builder */
@@ -339,7 +348,7 @@ csf_emit_batch_end(struct panfrost_batch *batch)
    struct cs_builder *b = batch->csf.cs.builder;
 
    /* Barrier to let everything finish */
-   cs_wait_slots(b, BITFIELD_MASK(8));
+   cs_wait_slots(b, BITFIELD_MASK(8), false);
 
    if (dev->debug & PAN_DBG_SYNC) {
       /* Get the CS state */
@@ -359,7 +368,7 @@ csf_emit_batch_end(struct panfrost_batch *batch)
    cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
                    MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, flush_id,
                    cs_defer(0, 0));
-   cs_wait_slot(b, 0);
+   cs_wait_slot(b, 0, false);
 
    /* Finish the command stream */
    if (!cs_is_valid(batch->csf.cs.builder))
@@ -813,8 +822,8 @@ GENX(csf_emit_fragment_job)(struct panfrost_batch *batch,
 
    if (batch->draw_count > 0) {
       /* Finish tiling and wait for IDVS and tiling */
-      cs_finish_tiling(b);
-      cs_wait_slot(b, 2);
+      cs_finish_tiling(b, false);
+      cs_wait_slot(b, 2, false);
       cs_vt_end(b, cs_now());
    }
 
@@ -833,7 +842,7 @@ GENX(csf_emit_fragment_job)(struct panfrost_batch *batch,
    if (batch->draw_count > 0) {
       struct cs_index counter = cs_reg32(b, 78);
       cs_load32_to(b, counter, cs_reg64(b, TILER_OOM_CTX_REG), 0);
-      cs_wait_slot(b, 0);
+      cs_wait_slot(b, 0, false);
       cs_if(b, MALI_CS_CONDITION_GREATER, counter) {
          cs_move64_to(b, cs_sr_reg64(b, FRAGMENT, FBD_POINTER),
                       GET_FBD(oom_ctx, LAST).gpu);
@@ -841,8 +850,8 @@ GENX(csf_emit_fragment_job)(struct panfrost_batch *batch,
    }
 
    /* Run the fragment job and wait */
-   cs_run_fragment(b, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
-   cs_wait_slot(b, 2);
+   cs_run_fragment(b, false, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
+   cs_wait_slot(b, 2, false);
 
    /* Gather freed heap chunks and add them to the heap context free list
     * so they can be re-used next time the tiler heap runs out of chunks.
@@ -854,7 +863,7 @@ GENX(csf_emit_fragment_job)(struct panfrost_batch *batch,
       cs_move64_to(b, cs_reg64(b, 90), batch->tiler_ctx.valhall.desc);
       cs_load_to(b, cs_reg_tuple(b, 86, 4), cs_reg64(b, 90), BITFIELD_MASK(4),
                  40);
-      cs_wait_slot(b, 0);
+      cs_wait_slot(b, 0, false);
       cs_finish_fragment(b, true, cs_reg64(b, 86), cs_reg64(b, 88), cs_now());
    }
 }
@@ -942,7 +951,7 @@ GENX(csf_launch_grid)(struct panfrost_batch *batch,
       cs_load_to(b, grid_xyz, address, BITFIELD_MASK(3), 0);
 
       /* Wait for the load */
-      cs_wait_slot(b, 0);
+      cs_wait_slot(b, 0, false);
 
       /* Copy to FAU */
       for (unsigned i = 0; i < 3; ++i) {
@@ -954,7 +963,7 @@ GENX(csf_launch_grid)(struct panfrost_batch *batch,
       }
 
       /* Wait for the stores */
-      cs_wait_slot(b, 0);
+      cs_wait_slot(b, 0, false);
 
       /* Use run_compute with a set task axis instead of run_compute_indirect as
        * run_compute_indirect has been found to cause intermittent hangs. This
@@ -965,7 +974,7 @@ GENX(csf_launch_grid)(struct panfrost_batch *batch,
        * this is somewhat offset by run_compute being a native instruction. */
       unsigned task_axis = MALI_TASK_AXIS_X;
       cs_run_compute(b, DIV_ROUND_UP(max_thread_cnt, threads_per_wg), task_axis,
-                     cs_shader_res_sel(0, 0, 0, 0));
+                     false, cs_shader_res_sel(0, 0, 0, 0));
    } else {
       /* Set size in workgroups per dimension immediately */
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), info->grid[0]);
@@ -1000,7 +1009,7 @@ GENX(csf_launch_grid)(struct panfrost_batch *batch,
 
       assert(task_axis <= MALI_TASK_AXIS_Z);
       assert(task_increment > 0);
-      cs_run_compute(b, task_increment, task_axis,
+      cs_run_compute(b, task_increment, task_axis, false,
                      cs_shader_res_sel(0, 0, 0, 0));
    }
 }
@@ -1042,10 +1051,10 @@ GENX(csf_launch_xfb)(struct panfrost_batch *batch,
    csf_emit_shader_regs(batch, PIPE_SHADER_VERTEX,
                         batch->rsd[PIPE_SHADER_VERTEX]);
    /* force a barrier to avoid read/write sync issues with buffers */
-   cs_wait_slot(b, 2);
+   cs_wait_slot(b, 2, false);
 
    /* XXX: Choose correctly */
-   cs_run_compute(b, 1, MALI_TASK_AXIS_Z, cs_shader_res_sel(0, 0, 0, 0));
+   cs_run_compute(b, 1, MALI_TASK_AXIS_Z, false, cs_shader_res_sel(0, 0, 0, 0));
 }
 
 static void
@@ -1356,10 +1365,10 @@ GENX(csf_launch_draw)(struct panfrost_batch *batch,
    }
 
 #if PAN_ARCH >= 12
-   cs_run_idvs2(b, flags_override, true, drawid,
+   cs_run_idvs2(b, flags_override, false, true, drawid,
                 MALI_IDVS_SHADING_MODE_EARLY);
 #else
-   cs_run_idvs(b, flags_override, true, cs_shader_res_sel(0, 0, 1, 0),
+   cs_run_idvs(b, flags_override, false, true, cs_shader_res_sel(0, 0, 1, 0),
                cs_shader_res_sel(2, 2, 2, 0), drawid);
 #endif
 }
@@ -1401,12 +1410,12 @@ GENX(csf_launch_draw_indirect)(struct panfrost_batch *batch,
          cs_move32_to(b, cs_sr_reg32(b, IDVS, INDEX_BUFFER_SIZE), 0);
       }
 
-      cs_wait_slot(b, 0);
+      cs_wait_slot(b, 0, false);
 #if PAN_ARCH >= 12
-      cs_run_idvs2(b, flags_override, true, drawid,
+      cs_run_idvs2(b, flags_override, false, true, drawid,
                   MALI_IDVS_SHADING_MODE_EARLY);
 #else
-      cs_run_idvs(b, flags_override, true, cs_shader_res_sel(0, 0, 1, 0),
+      cs_run_idvs(b, flags_override, false, true, cs_shader_res_sel(0, 0, 1, 0),
                   cs_shader_res_sel(2, 2, 2, 0), drawid);
 #endif
 
@@ -1527,7 +1536,6 @@ GENX(csf_init_context)(struct panfrost_context *ctx)
    const struct cs_builder_conf bconf = {
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
-      .ls_sb_slot = 0,
    };
    struct cs_builder b;
    cs_builder_init(&b, &bconf, init_buffer);

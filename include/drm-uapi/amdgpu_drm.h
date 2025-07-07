@@ -329,13 +329,6 @@ union drm_amdgpu_ctx {
 #define AMDGPU_USERQ_OP_CREATE	1
 #define AMDGPU_USERQ_OP_FREE	2
 
-/* queue priority levels */
-#define AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_MASK  0x3
-#define AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_SHIFT 0
-#define AMDGPU_USERQ_CREATE_FLAGS_QUEUE_PRIORITY_NORMAL_LOW 0
-/* for queues that need access to protected content */
-#define AMDGPU_USERQ_CREATE_FLAGS_QUEUE_SECURE  (1 << 2)
-
 /*
  * This structure is a container to pass input configuration
  * info for all supported userqueue related operations.
@@ -362,7 +355,7 @@ struct drm_amdgpu_userq_in {
 	 * and doorbell_offset in the doorbell bo.
 	 */
 	__u32   doorbell_offset;
-	__u32   flags;
+	__u32   _pad;
 	/**
 	 * @queue_va: Virtual address of the GPU memory which holds the queue
 	 * object. The queue holds the workload packets.
@@ -509,12 +502,6 @@ struct drm_amdgpu_userq_fence_info {
 };
 
 struct drm_amdgpu_userq_wait {
-	/**
-	 * @waitq_id: Queue handle used by the userq wait IOCTL to retrieve the
-	 * wait queue and maintain the fence driver references in it.
-	 */
-	__u32	waitq_id;
-	__u32	pad;
 	/**
 	 * @syncobj_handles: The list of syncobj handles submitted by the user queue
 	 * job to get the va/value pairs.
@@ -1467,9 +1454,6 @@ struct drm_amdgpu_info_device {
 	__u32 csa_size;
 	/* context save area base virtual alignment for gfx11 */
 	__u32 csa_alignment;
-	/* Userq IP mask (1 << AMDGPU_HW_IP_*) */
-	__u32 userq_ip_mask;
-	__u32 pad;
 };
 
 struct drm_amdgpu_info_hw_ip {

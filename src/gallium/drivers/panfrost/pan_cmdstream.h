@@ -273,7 +273,7 @@ panfrost_vertex_attribute_stride(struct panfrost_compiled_shader *vs,
    unsigned v = vs->info.varyings.output_count;
    unsigned f = fs->info.varyings.input_count;
    unsigned slots = MAX2(v, f);
-   slots += util_bitcount(vs->info.varyings.fixed_varyings);
+   slots += util_bitcount(fs->key.fs.fixed_varying_mask);
 
    /* Assumes 16 byte slots. We could do better. */
    return slots * 16;
@@ -285,7 +285,8 @@ panfrost_emit_resources(struct panfrost_batch *batch,
 {
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_ptr T;
-   unsigned nr_tables = PAN_NUM_RESOURCE_TABLES;
+   unsigned nr_tables =
+      ALIGN_POT(PAN_NUM_RESOURCE_TABLES, MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
 
    /* Although individual resources need only 16 byte alignment, the
     * resource table as a whole must be 64-byte aligned.
@@ -310,11 +311,7 @@ panfrost_emit_resources(struct panfrost_batch *batch,
    panfrost_make_resource_table(T, PAN_TABLE_IMAGE, batch->images[stage],
                                 util_last_bit(ctx->image_mask[stage]));
 
-   if (stage == PIPE_SHADER_FRAGMENT) {
-      panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
-                                   batch->attribs[stage],
-                                   batch->nr_varying_attribs[PIPE_SHADER_FRAGMENT]);
-   } else if (stage == PIPE_SHADER_VERTEX) {
+   if (stage == PIPE_SHADER_VERTEX) {
       panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
                                    batch->attribs[stage],
                                    ctx->vertex->num_elements);

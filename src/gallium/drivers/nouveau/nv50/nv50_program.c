@@ -21,7 +21,6 @@
  */
 
 #include "pipe/p_defines.h"
-#include "pipe/p_shader_tokens.h"
 
 #include "compiler/nir/nir.h"
 

@@ -36,9 +36,6 @@
 extern "C" {
 #endif
 
-struct vk_object_base;
-struct VkDebugUtilsObjectNameInfoEXT;
-
 enum intel_ds_api {
    INTEL_DS_API_OPENGL,
    INTEL_DS_API_VULKAN,
@@ -226,12 +223,6 @@ uint64_t intel_ds_begin_submit(struct intel_ds_queue *queue);
 void intel_ds_end_submit(struct intel_ds_queue *queue,
                          uint64_t start_ts);
 
-void intel_ds_perfetto_set_debug_utils_object_name(struct intel_ds_device *device,
-   const struct VkDebugUtilsObjectNameInfoEXT *pNameInfo);
-
-void intel_ds_perfetto_refresh_debug_utils_object_name(struct intel_ds_device *device,
-   const struct vk_object_base *object);
-
 #else
 
 static inline uint64_t intel_ds_begin_submit(struct intel_ds_queue *queue)
@@ -241,16 +232,6 @@ static inline uint64_t intel_ds_begin_submit(struct intel_ds_queue *queue)
 
 static inline void intel_ds_end_submit(struct intel_ds_queue *queue,
                                        uint64_t start_ts)
-{
-}
-
-static inline void intel_ds_perfetto_set_debug_utils_object_name(struct intel_ds_device *device,
-   const struct VkDebugUtilsObjectNameInfoEXT *pNameInfo)
-{
-}
-
-static inline void intel_ds_perfetto_refresh_debug_utils_object_name(struct intel_ds_device *device,
-   const struct vk_object_base *object)
 {
 }
 

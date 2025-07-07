@@ -10,12 +10,6 @@
 #include "util/u_math.h"
 
 static bool
-has_cbuf_tex(const struct nak_compiler *nak) {
-   /* TODO: Figure out how bound textures work on blackwell */
-   return nak->sm >= 70 && nak->sm < 100;
-}
-
-static bool
 tex_handle_as_cbuf(nir_def *tex_h, uint32_t *cbuf_out)
 {
    if (tex_h->parent_instr->type != nir_instr_type_intrinsic)
@@ -70,10 +64,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
       default:
          unreachable("Unsupported texture source");
       }
-      /* Remove sources as we walk them.  We'll add them back later */
-      nir_instr_clear_src(&tex->instr, &tex->src[i].src);
    }
-   tex->num_srcs = 0;
 
    /* Combine sampler and texture into one if needed */
    if (samp_h != NULL && samp_h != tex_h) {
@@ -82,7 +73,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
    }
 
    enum nak_nir_tex_ref_type ref_type = NAK_NIR_TEX_REF_TYPE_BINDLESS;
-   if (has_cbuf_tex(nak) && tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
+   if (nak->sm >= 70 && tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
       ref_type = NAK_NIR_TEX_REF_TYPE_CBUF;
       tex_h = NULL;
    }
@@ -179,6 +170,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
    a[a##_comps++] = val; \
 } while(0)
 
+   unsigned num_backend_srcs = 0;
    if (nak->sm >= 50) {
       nir_def *src0[4] = { NULL, };
       nir_def *src1[4] = { NULL, };
@@ -234,16 +226,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
             PUSH(src1, z_cmpr);
       }
 
-      nir_tex_instr_add_src(tex, nir_tex_src_backend1,
-                            nir_vec(b, src0, src0_comps));
+      num_backend_srcs = 1;
+      tex->src[0].src_type = nir_tex_src_backend1;
+      nir_src_rewrite(&tex->src[0].src, nir_vec(b, src0, src0_comps));
 
       if (src1_comps > 0) {
-         while (src1_comps < 4)
-            PUSH(src1, nir_undef(b, 1, 32));
-         nir_tex_instr_add_src(tex, nir_tex_src_backend2,
-                               nir_vec(b, src1, src1_comps));
+         num_backend_srcs = 2;
+         tex->src[1].src_type = nir_tex_src_backend2;
+         nir_src_rewrite(&tex->src[1].src, nir_vec(b, src1, src1_comps));
       }
-   } else if (nak->sm >= 30) {
+   } else if (nak->sm >= 32) {
       nir_def *src[8] = { NULL, };
       unsigned src_comps = 0;
 
@@ -292,15 +284,22 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
       while (src_comps % 4)
          PUSH(src, nir_undef(b, 1, 32));
 
-      nir_tex_instr_add_src(tex, nir_tex_src_backend1,
-                            nir_vec(b, src, 4));
+      num_backend_srcs = 1;
+      tex->src[0].src_type = nir_tex_src_backend1;
+      nir_src_rewrite(&tex->src[0].src, nir_vec(b, src, 4));
+
       if (src_comps > 4) {
-         nir_tex_instr_add_src(tex, nir_tex_src_backend2,
-                               nir_vec(b, src + 4, 4));
+         num_backend_srcs = 2;
+         tex->src[1].src_type = nir_tex_src_backend2;
+         nir_src_rewrite(&tex->src[1].src, nir_vec(b, src + 4, 4));
       }
    } else {
       unreachable("Unsupported shader model");
    }
+
+   /* Remove any extras */
+   while (tex->num_srcs > num_backend_srcs)
+      nir_tex_instr_remove_src(tex, tex->num_srcs - 1);
 
    tex->sampler_dim = remap_sampler_dim(tex->sampler_dim);
 
@@ -361,7 +360,7 @@ lower_txq(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
    }
 
    enum nak_nir_tex_ref_type ref_type = NAK_NIR_TEX_REF_TYPE_BINDLESS;
-   if (has_cbuf_tex(nak) && tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
+   if (nak->sm >= 70 && tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
       ref_type = NAK_NIR_TEX_REF_TYPE_CBUF;
       tex_h = NULL;
    }
@@ -653,7 +652,7 @@ lower_image_txq(nir_builder *b, nir_intrinsic_instr *intrin,
 
    uint32_t texture_index = 0;
    enum nak_nir_tex_ref_type ref_type = NAK_NIR_TEX_REF_TYPE_BINDLESS;
-   if (has_cbuf_tex(nak) && tex_handle_as_cbuf(img_h, &texture_index)) {
+   if (nak->sm >= 70 && tex_handle_as_cbuf(img_h, &texture_index)) {
       ref_type = NAK_NIR_TEX_REF_TYPE_CBUF;
       img_h = NULL;
    }

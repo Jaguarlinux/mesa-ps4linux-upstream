@@ -6,13 +6,14 @@
 # DEBIAN_TEST_ANDROID_TAG
 # DEBIAN_TEST_GL_TAG
 # DEBIAN_TEST_VK_TAG
+# KERNEL_ROOTFS_TAG
 
 set -ue -o pipefail
 
 # shellcheck disable=SC2153
 deqp_api=${DEQP_API,,}
 
-section_start deqp-$deqp_api "Building dEQP $DEQP_API"
+uncollapsed_section_start deqp-$deqp_api "Building dEQP $DEQP_API"
 
 set -x
 
@@ -288,7 +289,7 @@ if [ "$DEQP_API" != tools ]; then
 
     # Compress the caselists, since Vulkan's in particular are gigantic; higher
     # compression levels provide no real measurable benefit.
-    zstd -f -1 --rm mustpass/*.txt
+    zstd -1 --rm mustpass/*.txt
 fi
 
 if [ "$DEQP_API" = tools ]; then

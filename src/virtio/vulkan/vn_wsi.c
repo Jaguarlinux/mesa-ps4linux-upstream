@@ -75,14 +75,19 @@ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 VkResult
 vn_wsi_init(struct vn_physical_device *physical_dev)
 {
+   /* TODO Drop the workaround for NVIDIA_PROPRIETARY once hw prime buffer
+    * blit path works there.
+    */
+   const bool use_sw_device =
+      physical_dev->renderer_driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+
    const VkAllocationCallbacks *alloc =
       &physical_dev->instance->base.vk.alloc;
    VkResult result = wsi_device_init(
       &physical_dev->wsi_device, vn_physical_device_to_handle(physical_dev),
       vn_wsi_proc_addr, alloc, -1, &physical_dev->instance->dri_options,
       &(struct wsi_device_options){
-         .sw_device = !physical_dev->base.vk.supported_extensions
-                          .EXT_external_memory_dma_buf,
+         .sw_device = use_sw_device,
          .extra_xwayland_image = true,
       });
    if (result != VK_SUCCESS)
@@ -112,14 +117,28 @@ vn_wsi_create_image(struct vn_device *dev,
                     const VkAllocationCallbacks *alloc,
                     struct vn_image **out_img)
 {
-   VkImageCreateInfo local_create_info;
+   VkImageCreateInfo local_create_info = *create_info;
+   create_info = &local_create_info;
+
    if (dev->physical_device->renderer_driver_id ==
-          VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA &&
-       (create_info->flags & VK_IMAGE_CREATE_ALIAS_BIT)) {
+       VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
       /* See explanation in vn_GetPhysicalDeviceImageFormatProperties2() */
-      local_create_info = *create_info;
       local_create_info.flags &= ~VK_IMAGE_CREATE_ALIAS_BIT;
-      create_info = &local_create_info;
+   }
+
+   if (VN_PERF(NO_TILED_WSI_IMAGE)) {
+      const VkImageDrmFormatModifierListCreateInfoEXT *modifier_info =
+         vk_find_struct_const(
+            create_info->pNext,
+            IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+      assert(modifier_info);
+      assert(modifier_info->drmFormatModifierCount == 1 &&
+             modifier_info->pDrmFormatModifiers[0] ==
+                DRM_FORMAT_MOD_LINEAR);
+      if (VN_DEBUG(WSI)) {
+         vn_log(dev->instance,
+                "forcing image linear (given no_tiled_wsi_image)");
+      }
    }
 
    struct vn_image *img;

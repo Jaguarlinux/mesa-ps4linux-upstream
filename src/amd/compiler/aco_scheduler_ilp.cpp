@@ -29,15 +29,14 @@ using mask_t = uint16_t;
 static_assert(std::numeric_limits<mask_t>::digits >= num_nodes);
 
 struct VOPDInfo {
-   VOPDInfo() : can_be_opx(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0) {}
-   uint16_t can_be_opx : 1;
+   VOPDInfo() : is_opy_only(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0) {}
+   uint16_t is_opy_only : 1;
    uint16_t is_dst_odd : 1;
    uint16_t src_banks : 10; /* 0-3: src0, 4-7: src1, 8-9: src2 */
    uint16_t has_literal : 1;
    uint16_t is_commutative : 1;
    aco_opcode op = aco_opcode::num_opcodes;
    uint32_t literal = 0;
-   uint8_t port_vgprs[2] = {0, 0};
 };
 
 struct InstrInfo {
@@ -134,7 +133,6 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
       return VOPDInfo();
 
    VOPDInfo info;
-   info.can_be_opx = true;
    info.is_commutative = true;
    switch (instr->opcode) {
    case aco_opcode::v_fmac_f32: info.op = aco_opcode::v_dual_fmac_f32; break;
@@ -163,16 +161,16 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
    case aco_opcode::v_dot2c_f32_f16: info.op = aco_opcode::v_dual_dot2acc_f32_f16; break;
    case aco_opcode::v_add_u32:
       info.op = aco_opcode::v_dual_add_nc_u32;
-      info.can_be_opx = false;
+      info.is_opy_only = true;
       break;
    case aco_opcode::v_lshlrev_b32:
       info.op = aco_opcode::v_dual_lshlrev_b32;
-      info.can_be_opx = false;
+      info.is_opy_only = true;
       info.is_commutative = false;
       break;
    case aco_opcode::v_and_b32:
       info.op = aco_opcode::v_dual_and_b32;
-      info.can_be_opx = false;
+      info.is_opy_only = true;
       break;
    default: return VOPDInfo();
    }
@@ -191,11 +189,8 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
          op = Operand::get_const(ctx.program->gfx_level, util_bitreverse(op.constantValue()), 4);
 
       unsigned port = (instr->opcode == aco_opcode::v_fmamk_f32 && i == 1) ? 2 : i;
-      if (op.isOfType(RegType::vgpr)) {
+      if (op.isOfType(RegType::vgpr))
          info.src_banks |= 1 << (port * 4 + (op.physReg().reg() & bank_mask[port]));
-         if (port < 2)
-            info.port_vgprs[port] = op.physReg().reg();
-      }
 
       /* Check all operands because of fmaak/fmamk. */
       if (op.isLiteral()) {
@@ -218,106 +213,64 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
 }
 
 bool
-are_src_banks_compatible(enum amd_gfx_level gfx_level, const VOPDInfo& a, const VOPDInfo& b,
-                         bool swap)
+is_vopd_compatible(const VOPDInfo& a, const VOPDInfo& b, bool* swap)
 {
-   if (gfx_level >= GFX12 && a.op == aco_opcode::v_dual_mov_b32 &&
-       b.op == aco_opcode::v_dual_mov_b32) {
-      /* On GFX12+, OPY uses src2 if both OPX and OPY are v_dual_mov_b32, so there are no
-       * compatibility issues. */
-      return true;
-   }
-
-   uint16_t a_src_banks = a.src_banks;
-   uint8_t a_port_vgprs[2] = {a.port_vgprs[0], a.port_vgprs[1]};
-   if (swap) {
-      uint16_t src0 = a.src_banks & 0xf;
-      uint16_t src1 = a.src_banks & 0xf0;
-      uint16_t src2 = a.src_banks & 0x300;
-      a_src_banks = (src0 << 4) | (src1 >> 4) | src2;
-      std::swap(a_port_vgprs[0], a_port_vgprs[1]);
-   }
-
-   /* On GFX12+, we can skip checking a src0/src1 port if both SRCx and SRCy use the same VGPR and
-    * the same sized operand.
-    */
-   if (gfx_level >= GFX12) {
-      bool a_is_dot2cc =
-         a.op == aco_opcode::v_dual_dot2acc_f32_f16 || a.op == aco_opcode::v_dual_dot2acc_f32_bf16;
-      bool b_is_dot2cc =
-         b.op == aco_opcode::v_dual_dot2acc_f32_f16 || b.op == aco_opcode::v_dual_dot2acc_f32_bf16;
-      if (a_port_vgprs[0] == b.port_vgprs[0] && a_is_dot2cc == b_is_dot2cc)
-         a_src_banks &= ~0xf;
-      if (a_port_vgprs[1] == b.port_vgprs[1] && a_is_dot2cc == b_is_dot2cc)
-         a_src_banks &= ~0xf0;
-   }
-
-   return (a_src_banks & b.src_banks) == 0;
-}
-
-enum vopd_compatibility {
-   vopd_incompatible = 0x0,
-   vopd_first_is_opx = 0x1,
-   vopd_second_is_opx = 0x2,
-   vopd_need_swap = 0x4,
-};
-
-unsigned
-is_vopd_compatible(enum amd_gfx_level gfx_level, const VOPDInfo& a, const VOPDInfo& b)
-{
-   if ((!a.can_be_opx && !b.can_be_opx) || (a.is_dst_odd == b.is_dst_odd))
-      return vopd_incompatible;
+   if ((a.is_opy_only && b.is_opy_only) || (a.is_dst_odd == b.is_dst_odd))
+      return false;
 
    /* Both can use a literal, but it must be the same literal. */
    if (a.has_literal && b.has_literal && a.literal != b.literal)
-      return vopd_incompatible;
+      return false;
 
-   unsigned compat = vopd_incompatible;
+   *swap = false;
 
    /* The rest is checking src VGPR bank compatibility. */
-   if (are_src_banks_compatible(gfx_level, a, b, false)) {
-      if (a.can_be_opx)
-         compat |= vopd_first_is_opx;
-      if (b.can_be_opx)
-         compat |= vopd_second_is_opx;
-      return compat;
-   }
+   if ((a.src_banks & b.src_banks) == 0)
+      return true;
 
-   /* The rest of this function checks if we can resolve the VGPR bank incompatibility by swapping
-    * the operands of one of the instructions.
-    */
    if (!a.is_commutative && !b.is_commutative)
-      return vopd_incompatible;
+      return false;
 
-   if (!are_src_banks_compatible(gfx_level, a, b, true))
-      return vopd_incompatible;
+   uint16_t src0 = a.src_banks & 0xf;
+   uint16_t src1 = a.src_banks & 0xf0;
+   uint16_t src2 = a.src_banks & 0x300;
+   uint16_t a_src_banks = (src0 << 4) | (src1 >> 4) | src2;
+   if ((a_src_banks & b.src_banks) != 0)
+      return false;
 
-   /* Swapping v_mov_b32 makes it become an OPY-only opcode. */
-   if (a.can_be_opx && (b.is_commutative || a.op != aco_opcode::v_dual_mov_b32))
-      compat |= vopd_first_is_opx;
-   if (b.can_be_opx && (a.is_commutative || b.op != aco_opcode::v_dual_mov_b32))
-      compat |= vopd_second_is_opx;
+   /* If we have to turn v_mov_b32 into v_add_u32 but there is already an OPY-only instruction,
+    * we can't do it.
+    */
+   if (a.op == aco_opcode::v_dual_mov_b32 && !b.is_commutative && b.is_opy_only)
+      return false;
+   if (b.op == aco_opcode::v_dual_mov_b32 && !a.is_commutative && a.is_opy_only)
+      return false;
 
-   return compat ? (compat | vopd_need_swap) : vopd_incompatible;
+   *swap = true;
+
+   return true;
 }
 
-unsigned
-can_use_vopd(const SchedILPContext& ctx, unsigned idx)
+bool
+can_use_vopd(const SchedILPContext& ctx, unsigned idx, bool* prev_can_be_opx)
 {
-   VOPDInfo first_info = ctx.vopd[idx];
-   VOPDInfo second_info = ctx.prev_vopd_info;
+   VOPDInfo cur_vopd = ctx.vopd[idx];
    Instruction* first = ctx.nodes[idx].instr;
    Instruction* second = ctx.prev_info.instr;
 
    if (!second)
-      return 0;
+      return false;
 
-   if (second_info.op == aco_opcode::num_opcodes || first_info.op == aco_opcode::num_opcodes)
-      return 0;
+   if (ctx.prev_vopd_info.op == aco_opcode::num_opcodes || cur_vopd.op == aco_opcode::num_opcodes)
+      return false;
 
-   unsigned compat = is_vopd_compatible(ctx.program->gfx_level, first_info, second_info);
-   if (!compat)
-      return 0;
+   bool swap = false;
+   if (!is_vopd_compatible(ctx.prev_vopd_info, cur_vopd, &swap))
+      return false;
+
+   /* If we have to swap a v_mov_b32, it will become an OPY-only opcode. */
+   if (swap && !ctx.prev_vopd_info.is_commutative && cur_vopd.op == aco_opcode::v_dual_mov_b32)
+      cur_vopd.is_opy_only = true;
 
    assert(first->definitions.size() == 1);
    assert(first->definitions[0].size() == 1);
@@ -326,16 +279,17 @@ can_use_vopd(const SchedILPContext& ctx, unsigned idx)
 
    /* Check for WaW dependency. */
    if (first->definitions[0].physReg() == second->definitions[0].physReg())
-      return 0;
+      return false;
 
    /* Check for RaW dependency. */
    for (Operand op : second->operands) {
       assert(op.size() == 1);
       if (first->definitions[0].physReg() == op.physReg())
-         return 0;
+         return false;
    }
 
    /* WaR dependencies are not a concern before GFX12. */
+   *prev_can_be_opx = true;
    if (ctx.program->gfx_level >= GFX12) {
       /* From RDNA4 ISA doc:
        * The OPX instruction must not overwrite sources of the OPY instruction".
@@ -346,13 +300,11 @@ can_use_vopd(const SchedILPContext& ctx, unsigned idx)
          if (second->definitions[0].physReg() == op.physReg())
             war = true;
       }
-      if (war) {
-         compat &= ~vopd_second_is_opx;
-         compat = compat & vopd_first_is_opx ? compat : 0;
-      }
+      if (war)
+         *prev_can_be_opx = false;
    }
 
-   return compat;
+   return *prev_can_be_opx || !cur_vopd.is_opy_only;
 }
 
 Instruction_cycle_info
@@ -690,18 +642,17 @@ select_instruction_ilp(const SchedILPContext& ctx)
 }
 
 bool
-compare_nodes_vopd(const SchedILPContext& ctx, int num_vopd_odd_minus_even, unsigned* vopd_compat,
-                   unsigned current, unsigned candidate)
+compare_nodes_vopd(const SchedILPContext& ctx, int num_vopd_odd_minus_even, bool* use_vopd,
+                   bool* prev_can_be_opx, unsigned current, unsigned candidate)
 {
-   unsigned candidate_compat = can_use_vopd(ctx, candidate);
-   if (candidate_compat) {
+   if (can_use_vopd(ctx, candidate, prev_can_be_opx)) {
       /* If we can form a VOPD instruction, always prefer to do so. */
-      if (!*vopd_compat) {
-         *vopd_compat = candidate_compat;
+      if (!*use_vopd) {
+         *use_vopd = true;
          return true;
       }
    } else {
-      if (*vopd_compat)
+      if (*use_vopd)
          return false;
 
       /* Neither current nor candidate can form a VOPD instruction with the previously scheduled
@@ -726,17 +677,13 @@ compare_nodes_vopd(const SchedILPContext& ctx, int num_vopd_odd_minus_even, unsi
       }
    }
 
-   if (ctx.nodes[candidate].wait_cycles < ctx.nodes[current].wait_cycles) {
-      *vopd_compat = candidate_compat;
-      return true;
-   }
-   return false;
+   return ctx.nodes[candidate].wait_cycles < ctx.nodes[current].wait_cycles;
 }
 
 unsigned
-select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
+select_instruction_vopd(const SchedILPContext& ctx, bool* use_vopd, bool* prev_can_be_opx)
 {
-   *vopd_compat = 0;
+   *use_vopd = false;
 
    mask_t mask = ctx.active_mask;
    if (ctx.next_non_reorderable != UINT8_MAX)
@@ -756,11 +703,14 @@ select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
       if (candidate.dependency_mask)
          continue;
 
+      bool prev_can_be_opx_for_i;
       if (cur == -1u) {
          cur = i;
-         *vopd_compat = can_use_vopd(ctx, i);
-      } else if (compare_nodes_vopd(ctx, num_vopd_odd_minus_even, vopd_compat, cur, i)) {
+         *use_vopd = can_use_vopd(ctx, i, prev_can_be_opx);
+      } else if (compare_nodes_vopd(ctx, num_vopd_odd_minus_even, use_vopd, &prev_can_be_opx_for_i,
+                                    cur, i)) {
          cur = i;
+         *prev_can_be_opx = prev_can_be_opx_for_i;
       }
    }
 
@@ -796,37 +746,37 @@ get_vopd_opcode_operands(const SchedILPContext& ctx, Instruction* instr, const V
 }
 
 Instruction*
-create_vopd_instruction(const SchedILPContext& ctx, unsigned idx, unsigned compat)
+create_vopd_instruction(const SchedILPContext& ctx, unsigned idx, bool prev_can_be_opx)
 {
-   Instruction* x = ctx.prev_info.instr;  /* second */
-   Instruction* y = ctx.nodes[idx].instr; /* first */
+   Instruction* x = ctx.prev_info.instr;
+   Instruction* y = ctx.nodes[idx].instr;
    VOPDInfo x_info = ctx.prev_vopd_info;
    VOPDInfo y_info = ctx.vopd[idx];
-   x_info.can_be_opx = x_info.can_be_opx && (compat & vopd_second_is_opx);
+   x_info.is_opy_only |= !prev_can_be_opx;
 
    bool swap_x = false, swap_y = false;
-   if (compat & vopd_need_swap) {
+   if (x_info.src_banks & y_info.src_banks) {
       assert(x_info.is_commutative || y_info.is_commutative);
       /* Avoid swapping v_mov_b32 because it will become an OPY-only opcode. */
       if (x_info.op == aco_opcode::v_dual_mov_b32 && y_info.op == aco_opcode::v_dual_mov_b32) {
-         swap_x = !x_info.can_be_opx;
+         swap_x = x_info.is_opy_only;
          swap_y = !swap_x;
       } else if (x_info.op == aco_opcode::v_dual_mov_b32 && !y_info.is_commutative) {
          swap_x = true;
-         x_info.can_be_opx = false;
+         x_info.is_opy_only = true;
       } else {
          swap_x = x_info.is_commutative && x_info.op != aco_opcode::v_dual_mov_b32;
          swap_y = y_info.is_commutative && !swap_x;
       }
-      y_info.can_be_opx &= !swap_y || y_info.op != aco_opcode::v_dual_mov_b32;
+      y_info.is_opy_only |= swap_y && y_info.op == aco_opcode::v_dual_mov_b32;
    }
 
-   if (!x_info.can_be_opx) {
+   if (x_info.is_opy_only) {
       std::swap(x, y);
       std::swap(x_info, y_info);
       std::swap(swap_x, swap_y);
    }
-   assert(x_info.can_be_opx);
+   assert(!x_info.is_opy_only);
 
    aco_opcode x_op, y_op;
    unsigned num_operands = 0;
@@ -856,15 +806,16 @@ do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_
    }
 
    ctx.prev_info.instr = NULL;
-   unsigned vopd_compat = 0;
+   bool use_vopd = false;
+   bool prev_can_be_opx;
 
    while (ctx.active_mask) {
-      unsigned next_idx =
-         ctx.is_vopd ? select_instruction_vopd(ctx, &vopd_compat) : select_instruction_ilp(ctx);
+      unsigned next_idx = ctx.is_vopd ? select_instruction_vopd(ctx, &use_vopd, &prev_can_be_opx)
+                                      : select_instruction_ilp(ctx);
       Instruction* next_instr = ctx.nodes[next_idx].instr;
 
-      if (vopd_compat) {
-         std::prev(insert_it)->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
+      if (use_vopd) {
+         std::prev(insert_it)->reset(create_vopd_instruction(ctx, next_idx, prev_can_be_opx));
          ctx.prev_info.instr = NULL;
       } else {
          (insert_it++)->reset(next_instr);

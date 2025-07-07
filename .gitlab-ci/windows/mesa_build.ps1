@@ -53,6 +53,7 @@ meson setup `
 -Dvideo-codecs="all" `
 -Dgles1=enabled `
 -Dgles2=enabled `
+-Dgallium-opencl=icd `
 -Dgallium-rusticl=false `
 -Dmicrosoft-clc=enabled `
 -Dstatic-libclc=all `

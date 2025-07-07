@@ -676,10 +676,6 @@
    DRI_CONF_OPT_B(tu_use_tex_coord_round_nearest_even_mode, def, \
                   "Use D3D-compliant round-to-nearest-even mode for texture coordinates")
 
-#define DRI_CONF_TU_IGNORE_FRAG_DEPTH_DIRECTION(def) \
-   DRI_CONF_OPT_B(tu_ignore_frag_depth_direction, def, \
-                  "Ignore direction specified for gl_FragDepth output")
-
 /**
  * \brief Honeykrisp specific configuration options
  */
@@ -844,6 +840,11 @@
 #define DRI_CONF_RADV_FORCE_64K_SPARSE_ALIGNMENT(def) \
    DRI_CONF_OPT_B(radv_force_64k_sparse_alignment, def, \
                   "Force the alignment of sparse buffers to 64KiB")
+
+#define DRI_CONF_RADV_DISABLE_HIZ_HIS_GFX12(def) \
+   DRI_CONF_OPT_B(radv_disable_hiz_his_gfx12, def, \
+                  "Disable HiZ/HiS on GFX12 (RDNA4) to workaround a hw bug that causes random GPU hangs")
+
 /**
  * \brief ANV specific configuration options
  */

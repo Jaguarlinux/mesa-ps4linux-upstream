@@ -193,7 +193,8 @@ static void si_destroy_context(struct pipe_context *context)
 {
    struct si_context *sctx = (struct si_context *)context;
 
-   context->set_debug_callback(context, NULL);
+   if (context->set_debug_callback)
+      context->set_debug_callback(context, NULL);
 
    util_unreference_framebuffer_state(&sctx->framebuffer.state);
    si_release_all_descriptors(sctx);
@@ -643,13 +644,6 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       }
    }
 
-#if !AMD_LLVM_AVAILABLE
-   sctx->shader.vs.key.ge.use_aco = 1;
-   sctx->shader.gs.key.ge.use_aco = 1;
-   sctx->shader.tcs.key.ge.use_aco = 1;
-   sctx->shader.tes.key.ge.use_aco = 1;
-#endif
-
    sctx->ngg = sscreen->use_ngg;
    si_shader_change_notify(sctx);
 
@@ -896,34 +890,15 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       goto fail;
 
    /* Initialize compute_tmpring_size. */
-   si_get_scratch_tmpring_size(sctx, 0, true, &sctx->compute_tmpring_size);
+   ac_get_scratch_tmpring_size(&sctx->screen->info, 0,
+                               &sctx->max_seen_compute_scratch_bytes_per_wave,
+                               &sctx->compute_tmpring_size);
 
    return &sctx->b;
 fail:
    fprintf(stderr, "radeonsi: Failed to create a context.\n");
    si_destroy_context(&sctx->b);
    return NULL;
-}
-
-void
-si_get_scratch_tmpring_size(struct si_context *sctx, unsigned bytes_per_wave,
-                            bool is_compute, unsigned *spi_tmpring_size)
-{
-   bytes_per_wave = ac_compute_scratch_wavesize(&sctx->screen->info, bytes_per_wave);
-
-   if (is_compute) {
-      sctx->max_seen_compute_scratch_bytes_per_wave =
-         MAX2(sctx->max_seen_compute_scratch_bytes_per_wave, bytes_per_wave);
-   } else {
-      sctx->max_seen_scratch_bytes_per_wave =
-         MAX2(sctx->max_seen_scratch_bytes_per_wave, bytes_per_wave);
-   }
-
-   /* TODO: We could decrease WAVES to make the whole buffer fit into the infinity cache. */
-   ac_get_scratch_tmpring_size(&sctx->screen->info, sctx->screen->info.max_scratch_waves,
-                               is_compute ? sctx->max_seen_compute_scratch_bytes_per_wave
-                                          : sctx->max_seen_scratch_bytes_per_wave,
-                               spi_tmpring_size);
 }
 
 static bool si_is_resource_busy(struct pipe_screen *screen, struct pipe_resource *resource,
@@ -1348,26 +1323,13 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 
    sscreen->nir_options = CALLOC_STRUCT(nir_shader_compiler_options);
 
+   si_init_screen_get_functions(sscreen);
    si_init_screen_buffer_functions(sscreen);
    si_init_screen_fence_functions(sscreen);
    si_init_screen_state_functions(sscreen);
    si_init_screen_texture_functions(sscreen);
    si_init_screen_query_functions(sscreen);
    si_init_screen_live_shader_cache(sscreen);
-
-   if (sscreen->info.gfx_level >= GFX11) {
-      sscreen->use_ngg = true;
-      sscreen->use_ngg_culling = sscreen->info.max_render_backends >= 2 &&
-                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
-   } else {
-      sscreen->use_ngg = !(sscreen->debug_flags & DBG(NO_NGG)) &&
-                         sscreen->info.gfx_level >= GFX10 &&
-                         (sscreen->info.family != CHIP_NAVI14 ||
-                          sscreen->info.is_pro_graphics);
-      sscreen->use_ngg_culling = sscreen->use_ngg &&
-                                 sscreen->info.max_render_backends >= 2 &&
-                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
-   }
 
    sscreen->has_draw_indirect_multi =
       (sscreen->info.family >= CHIP_POLARIS10) ||
@@ -1378,7 +1340,6 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       (sscreen->info.gfx_level == GFX6 && sscreen->info.pfp_fw_version >= 79 &&
        sscreen->info.me_fw_version >= 142);
 
-   si_init_screen_get_functions(sscreen);
    si_init_shader_caps(sscreen);
    si_init_compute_caps(sscreen);
    si_init_screen_caps(sscreen);
@@ -1482,8 +1443,24 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
    if (!debug_get_bool_option("RADEON_DISABLE_PERFCOUNTERS", false))
       si_init_perfcounters(sscreen);
 
+   ac_get_hs_info(&sscreen->info, &sscreen->hs);
+
    if (sscreen->debug_flags & DBG(NO_OUT_OF_ORDER))
       sscreen->info.has_out_of_order_rast = false;
+
+   if (sscreen->info.gfx_level >= GFX11) {
+      sscreen->use_ngg = true;
+      sscreen->use_ngg_culling = sscreen->info.max_render_backends >= 2 &&
+                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
+   } else {
+      sscreen->use_ngg = !(sscreen->debug_flags & DBG(NO_NGG)) &&
+                         sscreen->info.gfx_level >= GFX10 &&
+                         (sscreen->info.family != CHIP_NAVI14 ||
+                          sscreen->info.is_pro_graphics);
+      sscreen->use_ngg_culling = sscreen->use_ngg &&
+                                 sscreen->info.max_render_backends >= 2 &&
+                                 !(sscreen->debug_flags & DBG(NO_NGG_CULLING));
+   }
 
    /* Only set this for the cases that are known to work, which are:
     * - GFX9 if bpp >= 4 (in bytes)

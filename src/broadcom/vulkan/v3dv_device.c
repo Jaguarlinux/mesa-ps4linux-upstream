@@ -258,7 +258,7 @@ get_features(const struct v3dv_physical_device *physical_device,
       .geometryShader = true,
       .tessellationShader = false,
       .sampleRateShading = true,
-      .dualSrcBlend = true,
+      .dualSrcBlend = false,
       .logicOp = true,
       .multiDrawIndirect = false,
       .drawIndirectFirstInstance = true,
@@ -967,7 +967,7 @@ get_device_properties(const struct v3dv_physical_device *device,
       /* Fragment limits */
       .maxFragmentInputComponents               = max_varying_components,
       .maxFragmentOutputAttachments             = 4,
-      .maxFragmentDualSrcAttachments            = 1,
+      .maxFragmentDualSrcAttachments            = 0,
       .maxFragmentCombinedOutputResources       = max_rts +
                                                   MAX_STORAGE_BUFFERS +
                                                   MAX_STORAGE_IMAGES,
@@ -2558,7 +2558,7 @@ v3dv_BindImageMemory2(VkDevice _device,
       }
 
       const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
-         vk_find_struct_const(pBindInfos->pNext,
+         vk_find_struct_const(pBindInfos[i].pNext,
                               BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
       if (swapchain_info && swapchain_info->swapchain) {
 #if !DETECT_OS_ANDROID

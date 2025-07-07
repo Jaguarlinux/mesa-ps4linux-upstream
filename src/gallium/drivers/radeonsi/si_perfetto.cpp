@@ -50,8 +50,12 @@ static const struct {
    }
 };
 
+struct SIRenderpassIncrementalState {
+   bool was_cleared = true;
+};
+
 struct SIRenderpassTraits : public perfetto::DefaultDataSourceTraits {
-   using IncrementalStateType = MesaRenderpassIncrementalState;
+   using IncrementalStateType = SIRenderpassIncrementalState;
 };
 
 class SIRenderpassDataSource : public MesaRenderpassDataSource<SIRenderpassDataSource, 

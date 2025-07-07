@@ -231,8 +231,7 @@ struct iris_vue_prog_key {
    struct iris_base_prog_key base;
 
    unsigned nr_userclip_plane_consts:4;
-   enum intel_vue_layout layout:2;
-   unsigned padding:26;
+   unsigned padding:28;
 };
 
 struct iris_vs_prog_key {
@@ -285,8 +284,7 @@ struct iris_fs_prog_key {
    bool multisample_fbo:1;
    bool force_dual_color_blend:1;
    bool coherent_fb_fetch:1;
-   enum intel_vue_layout vue_layout:2;
-   uint64_t padding:41;
+   uint64_t padding:43;
 };
 
 struct iris_cs_prog_key {

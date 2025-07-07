@@ -53,11 +53,16 @@ Kconfigs location
 Updating image tags
 -------------------
 
-Every kernel uprev should update the following tag:
+Every kernel uprev should update 3 image tags, located at two files.
 
-:code:`.gitlab-ci/image-tags.yml` tag
+:code:`.gitlab-ci/container/gitlab-ci.yml` tag
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+- **KERNEL_URL** for the location of the new kernel
+
+:code:`.gitlab-ci/image-tags.yml` tags
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-- **KERNEL_TAG** to use the new kernel
+- **KERNEL_ROOTFS_TAG** to rebuild rootfs with the new kernel
+- **DEBIAN_X86_TEST_GL_TAG** to ensure that the new rootfs is being used by the GitLab x86 jobs
 
 Development routine
 -------------------

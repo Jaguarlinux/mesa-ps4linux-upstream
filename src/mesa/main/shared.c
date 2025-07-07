@@ -74,11 +74,18 @@ _mesa_alloc_shared_state(struct gl_context *ctx,
 
    simple_mtx_init(&shared->Mutex, mtx_plain);
 
-   /* Enable GL name reuse for all drivers by default.
+   const char *process_name = util_get_process_name();
+   bool is_virgl_host = strstr(process_name, "qemu-system") == process_name ||
+                        strstr(process_name, "crosvm") ||
+                        strstr(process_name, "virgl_test_server");
+
+   /* Enable GL name reuse for all drivers by default except virglrenderer,
+    * which is hopelessly broken.
     *
     * To disable it, set reuse_gl_names=0 in the environment.
     */
-   shared->ReuseGLNames = options->reuse_gl_names != 0;
+   if (!is_virgl_host)
+      shared->ReuseGLNames = options->reuse_gl_names != 0;
 
    _mesa_InitHashTable(&shared->DisplayList, shared->ReuseGLNames);
    _mesa_InitHashTable(&shared->TexObjects, shared->ReuseGLNames);

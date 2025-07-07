@@ -1,5 +1,4 @@
 /*
- * Copyright (C) 2025 Arm Ltd.
  * Copyright (C) 2023 Amazon.com, Inc. or its affiliates.
  * Copyright (C) 2018 Alyssa Rosenzweig
  * Copyright (C) 2020 Collabora Ltd.
@@ -60,7 +59,6 @@
 #include "pan_shader.h"
 #include "pan_texture.h"
 #include "pan_util.h"
-#include "pan_desc.h"
 
 /* JOBX() is used to select the job backend helpers to call from generic
  * functions. */
@@ -105,6 +103,23 @@ static_assert((int)PIPE_FUNC_GREATER == MALI_FUNC_GREATER, "must match");
 static_assert((int)PIPE_FUNC_NOTEQUAL == MALI_FUNC_NOT_EQUAL, "must match");
 static_assert((int)PIPE_FUNC_GEQUAL == MALI_FUNC_GEQUAL, "must match");
 static_assert((int)PIPE_FUNC_ALWAYS == MALI_FUNC_ALWAYS, "must match");
+
+static inline enum mali_sample_pattern
+panfrost_sample_pattern(unsigned samples)
+{
+   switch (samples) {
+   case 1:
+      return MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+   case 4:
+      return MALI_SAMPLE_PATTERN_ROTATED_4X_GRID;
+   case 8:
+      return MALI_SAMPLE_PATTERN_D3D_8X_GRID;
+   case 16:
+      return MALI_SAMPLE_PATTERN_D3D_16X_GRID;
+   default:
+      unreachable("Unsupported sample count");
+   }
+}
 
 static unsigned
 translate_tex_wrap(enum pipe_tex_wrap w, bool using_nearest)
@@ -258,17 +273,17 @@ static void
 panfrost_get_blend_shaders(struct panfrost_batch *batch,
                            uint64_t *blend_shaders)
 {
-   bool used = false;
+   unsigned shader_offset = 0;
+   struct panfrost_bo *shader_bo = NULL;
 
    for (unsigned c = 0; c < batch->key.nr_cbufs; ++c) {
       if (batch->key.cbufs[c]) {
-         blend_shaders[c] = panfrost_get_blend(batch, c);
-         if (blend_shaders[c])
-            used = true;
+         blend_shaders[c] =
+            panfrost_get_blend(batch, c, &shader_bo, &shader_offset);
       }
    }
 
-   if (used)
+   if (shader_bo)
       perf_debug(batch->ctx, "Blend shader use");
 }
 
@@ -775,6 +790,12 @@ panfrost_emit_viewport(struct panfrost_batch *batch)
 
    float minz, maxz;
    util_viewport_zmin_zmax(vp, rast->clip_halfz, &minz, &maxz);
+   /* Hardware requires a clamped depth ranges, but util_viewport_zmin_zmax
+    * may return bounds outside [0,1] when the translate/scale fields are set
+    * directly instead of through _mesa_set_depth_range. This occurs in
+    * u_blitter. */
+   minz = SATURATE(minz);
+   maxz = SATURATE(maxz);
 
    /* Scissor to the intersection of viewport and to the scissor, clamped
     * to the framebuffer */
@@ -1227,7 +1248,7 @@ panfrost_upload_sample_positions_sysval(struct panfrost_batch *batch,
    unsigned samples = util_framebuffer_get_num_samples(&batch->key);
    uniform->du[0] =
       dev->sample_positions->ptr.gpu +
-      panfrost_sample_positions_offset(pan_sample_pattern(samples));
+      panfrost_sample_positions_offset(panfrost_sample_pattern(samples));
 }
 
 static void
@@ -1236,15 +1257,6 @@ panfrost_upload_multisampled_sysval(struct panfrost_batch *batch,
 {
    unsigned samples = util_framebuffer_get_num_samples(&batch->key);
    uniform->u[0] = (samples > 1) ? ~0 : 0;
-}
-
-static void
-panfrost_upload_blend_constants_sysval(struct panfrost_batch *batch,
-                                       struct sysval_uniform *uniform)
-{
-   struct panfrost_context *ctx = batch->ctx;
-   for (unsigned i = 0; i < 4; i++)
-      uniform->f[i] = ctx->blend_color.color[i];
 }
 
 #if PAN_ARCH >= 6
@@ -1359,9 +1371,6 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          break;
       case PAN_SYSVAL_MULTISAMPLED:
          panfrost_upload_multisampled_sysval(batch, &uniforms[i]);
-         break;
-      case PAN_SYSVAL_BLEND_CONSTANTS:
-         panfrost_upload_blend_constants_sysval(batch, &uniforms[i]);
          break;
 #if PAN_ARCH >= 6
       case PAN_SYSVAL_RT_CONVERSION:
@@ -1478,7 +1487,7 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    /* Next up, attach UBOs. UBO count includes gaps but no sysval UBO */
    struct panfrost_compiled_shader *shader = ctx->prog[stage];
    unsigned ubo_count = shader->info.ubo_count - (sys_size ? 1 : 0);
-   unsigned sysval_ubo = sys_size ? PAN_UBO_SYSVALS : ~0;
+   unsigned sysval_ubo = sys_size ? ubo_count : ~0;
    unsigned desc_size;
    struct panfrost_ptr ubos = {0};
 
@@ -1499,36 +1508,18 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    assert(buffer_count);
    *buffer_count = ubo_count + (sys_size ? 1 : 0);
 
-   /* If sysvals are present, panfrost_nir_lower_sysvals assigns UBO1 to
-    * sysvals and remaps UBOs from the original shader up by one to make
-    * space. Applications use the original UBO indices, which we call
-    * "adjusted" UBOs here to distinguish them from the actual indices we are
-    * using on the hardware. */
-
-   /* Upload sysvals to UBO1 */
+   /* Upload sysval as a final UBO */
    if (sys_size)
-      panfrost_emit_ubo(ubos.cpu, PAN_UBO_SYSVALS, transfer.gpu, sys_size);
+      panfrost_emit_ubo(ubos.cpu, ubo_count, transfer.gpu, sys_size);
 
    /* The rest are honest-to-goodness UBOs */
-
-   unsigned user_ubo_mask =
-      ss->info.ubo_mask & BITFIELD_MASK(shader->info.ubo_count);
-
-   unsigned user_ubo_mask_adj = user_ubo_mask;
-   /* Shift remapped bits to convert to a mask of adjusted indices */
-   if (sys_size)
-      user_ubo_mask_adj = (user_ubo_mask & BITFIELD_MASK(PAN_UBO_SYSVALS)) |
-         ((user_ubo_mask & ~BITFIELD_MASK(PAN_UBO_SYSVALS + 1)) >> 1);
-
-   u_foreach_bit(ubo_adj, user_ubo_mask_adj & buf->enabled_mask) {
-      unsigned ubo = ubo_adj + (ubo_adj >= sysval_ubo ? 1 : 0);
-
-      size_t usz = buf->cb[ubo_adj].buffer_size;
+   unsigned user_ubo_mask = ss->info.ubo_mask & BITFIELD_MASK(ubo_count);
+   u_foreach_bit(ubo, user_ubo_mask & buf->enabled_mask) {
+      size_t usz = buf->cb[ubo].buffer_size;
       uint64_t address = 0;
 
       if (usz > 0) {
-         address =
-            panfrost_map_constant_buffer_gpu(batch, stage, buf, ubo_adj);
+         address = panfrost_map_constant_buffer_gpu(batch, stage, buf, ubo);
       }
 
       panfrost_emit_ubo(ubos.cpu, ubo, address, usz);
@@ -1585,9 +1576,7 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
       if (src.ubo == sysval_ubo) {
          mapped_ubo = sysvals;
       } else {
-         unsigned ubo_adj = src.ubo - (src.ubo > sysval_ubo ? 1 : 0);
-
-         struct pipe_constant_buffer *cb = &buf->cb[ubo_adj];
+         struct pipe_constant_buffer *cb = &buf->cb[src.ubo];
          assert(!cb->buffer && cb->user_buffer &&
                 "only user buffers use this path");
 
@@ -1604,29 +1593,6 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
    return ubos.gpu;
 }
 
-/*
- * Choose the number of WLS instances to allocate. This must be a power-of-two.
- * The number of WLS instances limits the number of concurrent tasks on a given
- * shader core, setting to the (rounded) total number of tasks avoids any
- * throttling. Smaller values save memory at the expense of possible throttling.
- *
- * With indirect dispatch, we don't know at launch-time how many tasks will be
- * needed, so we use a conservative value that's unlikely to cause slowdown in
- * practice without wasting too much memory.
- */
-static unsigned
-panfrost_choose_wls_instance_count(const struct pipe_grid_info *grid)
-{
-   if (grid->indirect) {
-      /* May need tuning in the future, conservative guess */
-      return 128;
-   } else {
-      return util_next_power_of_two(grid->grid[0]) *
-             util_next_power_of_two(grid->grid[1]) *
-             util_next_power_of_two(grid->grid[2]);
-   }
-}
-
 static uint64_t
 panfrost_emit_shared_memory(struct panfrost_batch *batch,
                             const struct pipe_grid_info *grid)
@@ -1637,10 +1603,15 @@ panfrost_emit_shared_memory(struct panfrost_batch *batch,
    struct panfrost_ptr t =
       pan_pool_alloc_desc(&batch->pool.base, LOCAL_STORAGE);
 
+   struct pan_compute_dim local_size = {grid->block[0], grid->block[1],
+                                        grid->block[2]};
+   struct pan_compute_dim dim = {grid->grid[0], grid->grid[1], grid->grid[2]};
+
    struct pan_tls_info info = {
       .tls.size = ss->info.tls_size,
       .wls.size = ss->info.wls_size + grid->variable_shared_mem,
-      .wls.instances = panfrost_choose_wls_instance_count(grid),
+      .wls.instances = pan_calc_wls_instances(&local_size, &dev->kmod.props,
+                                              grid->indirect ? NULL : &dim),
    };
 
    if (ss->info.tls_size) {
@@ -1654,8 +1625,8 @@ panfrost_emit_shared_memory(struct panfrost_batch *batch,
    }
 
    if (info.wls.size) {
-      unsigned size = pan_wls_adjust_size(info.wls.size) * info.wls.instances *
-                      dev->core_id_range;
+      unsigned size = pan_calc_total_wls_size(info.wls.size, info.wls.instances,
+                                              dev->core_id_range);
 
       struct panfrost_bo *bo = panfrost_batch_get_shared_memory(batch, size, 1);
 
@@ -2892,57 +2863,6 @@ panfrost_update_streamout_offsets(struct panfrost_context *ctx)
    (PAN_DIRTY_ZS | PAN_DIRTY_BLEND | PAN_DIRTY_MSAA | PAN_DIRTY_RASTERIZER |   \
     PAN_DIRTY_OQ)
 
-#if PAN_ARCH >= 9
-static uint64_t
-panfrost_emit_varying_descriptors(struct panfrost_batch *batch)
-{
-   struct panfrost_compiled_shader *vs =
-      batch->ctx->prog[PIPE_SHADER_VERTEX];
-   struct panfrost_compiled_shader *fs =
-      batch->ctx->prog[PIPE_SHADER_FRAGMENT];
-
-   const uint32_t vs_out_mask = vs->info.varyings.fixed_varyings;
-   const uint32_t fs_in_mask = fs->info.varyings.fixed_varyings;
-   const uint32_t fs_in_slots = fs->info.varyings.input_count +
-                                util_bitcount(fs_in_mask);
-
-   struct panfrost_ptr bufs =
-      pan_pool_alloc_desc_array(&batch->pool.base, fs_in_slots, ATTRIBUTE);
-   struct mali_attribute_packed *descs = bufs.cpu;
-
-   batch->nr_varying_attribs[PIPE_SHADER_FRAGMENT] = fs_in_slots;
-
-   const uint32_t varying_size = panfrost_vertex_attribute_stride(vs, fs);
-
-   for (uint32_t i = 0; i < fs_in_slots; i++) {
-      const struct pan_shader_varying *var = &fs->info.varyings.input[i];
-
-      uint32_t index = 0;
-      if (var->location >= VARYING_SLOT_VAR0) {
-         unsigned nr_special = util_bitcount(vs_out_mask);
-         unsigned general_index = (var->location - VARYING_SLOT_VAR0);
-         index = nr_special + general_index;
-      } else {
-         index = util_bitcount(vs_out_mask & BITFIELD_MASK(var->location));
-      }
-
-      pan_pack(&descs[i], ATTRIBUTE, cfg) {
-         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_VERTEX_PACKET;
-         cfg.offset_enable = false;
-         cfg.format = GENX(panfrost_format_from_pipe_format)(var->format)->hw;
-         cfg.table = 61;
-         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
-         cfg.offset = 1024 + (index * 16);
-         cfg.buffer_index = 0;
-         cfg.attribute_stride = varying_size;
-         cfg.packet_stride = varying_size + 16;
-      }
-   }
-
-   return bufs.gpu;
-}
-#endif
-
 static inline void
 panfrost_update_shader_state(struct panfrost_batch *batch,
                              enum pipe_shader_type st)
@@ -2953,6 +2873,9 @@ panfrost_update_shader_state(struct panfrost_batch *batch,
    bool frag = (st == PIPE_SHADER_FRAGMENT);
    unsigned dirty_3d = ctx->dirty;
    unsigned dirty = ctx->dirty_shader[st];
+
+   if (ss->info.has_shader_clk_instr)
+      batch->need_job_req_cycle_count = true;
 
    if (dirty & (PAN_DIRTY_STAGE_TEXTURE | PAN_DIRTY_STAGE_SHADER)) {
       batch->textures[st] = panfrost_emit_texture_descriptors(batch, st);
@@ -2972,9 +2895,6 @@ panfrost_update_shader_state(struct panfrost_batch *batch,
    }
 
 #if PAN_ARCH >= 9
-   if ((dirty & PAN_DIRTY_STAGE_SHADER) && frag)
-      batch->attribs[st] = panfrost_emit_varying_descriptors(batch);
-
    if (dirty & PAN_DIRTY_STAGE_IMAGE) {
       batch->images[st] =
          ctx->image_mask[st] ? panfrost_emit_images(batch, st) : 0;
@@ -4214,7 +4134,6 @@ screen_destroy(struct pipe_screen *pscreen)
 {
    struct panfrost_device *dev = pan_device(pscreen);
    GENX(pan_fb_preload_cache_cleanup)(&dev->fb_preload_cache);
-   pan_blend_shader_cache_cleanup(&dev->blend_shaders);
 }
 
 static void
@@ -4371,15 +4290,13 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    screen->vtbl.cleanup_batch = JOBX(cleanup_batch);
    screen->vtbl.submit_batch = submit_batch;
    screen->vtbl.get_blend_shader = GENX(pan_blend_get_shader_locked);
-   screen->vtbl.compile_shader = pan_shader_compile;
+   screen->vtbl.get_compiler_options = GENX(pan_shader_get_compiler_options);
+   screen->vtbl.compile_shader = GENX(pan_shader_compile);
    screen->vtbl.afbc_size = panfrost_afbc_size;
    screen->vtbl.afbc_pack = panfrost_afbc_pack;
    screen->vtbl.mtk_detile = panfrost_mtk_detile_compute;
    screen->vtbl.emit_write_timestamp = emit_write_timestamp;
    screen->vtbl.select_tile_size = GENX(pan_select_tile_size);
-
-   pan_blend_shader_cache_init(&dev->blend_shaders, panfrost_device_gpu_id(dev),
-                               &screen->mempools.bin.base);
 
    GENX(pan_fb_preload_cache_init)
    (&dev->fb_preload_cache, panfrost_device_gpu_id(dev), &dev->blend_shaders,

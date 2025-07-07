@@ -20,8 +20,12 @@
 #include "panvk_tracepoints_perfetto.h"
 #include "panvk_utrace.h"
 
+struct PanVKRenderpassIncrementalState {
+   bool was_cleared = true;
+};
+
 struct PanVKRenderpassTraits : public perfetto::DefaultDataSourceTraits {
-   using IncrementalStateType = MesaRenderpassIncrementalState;
+   using IncrementalStateType = PanVKRenderpassIncrementalState;
 };
 
 class PanVKRenderpassDataSource

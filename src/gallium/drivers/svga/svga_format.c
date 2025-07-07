@@ -11,8 +11,6 @@
 #include "util/format/u_format.h"
 #include "util/u_memory.h"
 
-#include "pipe/p_shader_tokens.h"
-
 #include "svga_winsys.h"
 #include "svga_screen.h"
 #include "svga_format.h"

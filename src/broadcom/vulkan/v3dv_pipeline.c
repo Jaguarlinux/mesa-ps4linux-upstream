@@ -29,10 +29,8 @@
 #include "qpu/qpu_disasm.h"
 
 #include "compiler/nir/nir_builder.h"
-#include "compiler/nir/nir_lower_blend.h"
 #include "nir/nir_serialize.h"
 
-#include "util/format/u_format.h"
 #include "util/shader_stats.h"
 #include "util/u_atomic.h"
 #include "util/os_time.h"
@@ -41,7 +39,6 @@
 #include "vk_format.h"
 #include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
-#include "vk_blend.h"
 
 static VkResult
 compute_vpm_config(struct v3dv_pipeline *pipeline);
@@ -396,10 +393,11 @@ descriptor_map_add(struct v3dv_descriptor_map *map,
                    int array_index,
                    int array_size,
                    int start_index,
-                   bool sampler_is_32b,
+                   uint8_t return_size,
                    uint8_t plane)
 {
    assert(array_index < array_size);
+   assert(return_size == 16 || return_size == 32);
 
    unsigned index = start_index;
    for (; index < map->num_desc; index++) {
@@ -409,13 +407,14 @@ descriptor_map_add(struct v3dv_descriptor_map *map,
           array_index == map->array_index[index] &&
           plane == map->plane[index]) {
          assert(array_size == map->array_size[index]);
-         /* It the return_size is different it means that the same sampler
-          * was used for operations with different precision
-          * requirement. In this case we need to ensure that we use the
-          * larger one.
-          */
-         if (sampler_is_32b != map->sampler_is_32b[index])
-            map->sampler_is_32b[index] = true;
+         if (return_size != map->return_size[index]) {
+            /* It the return_size is different it means that the same sampler
+             * was used for operations with different precision
+             * requirement. In this case we need to ensure that we use the
+             * larger one.
+             */
+            map->return_size[index] = 32;
+         }
          return index;
       } else if (!map->used[index]) {
          break;
@@ -430,7 +429,7 @@ descriptor_map_add(struct v3dv_descriptor_map *map,
    map->binding[index] = binding;
    map->array_index[index] = array_index;
    map->array_size[index] = array_size;
-   map->sampler_is_32b[index] = sampler_is_32b;
+   map->return_size[index] = return_size;
    map->plane[index] = plane;
    map->num_desc = MAX2(map->num_desc, index + 1);
 
@@ -539,7 +538,7 @@ lower_vulkan_resource_index(nir_builder *b,
                                  const_val->u32,
                                  binding_layout->array_size,
                                  start_index,
-                                 true /* sampler_is_32b: doesn't really apply for this case */,
+                                 32 /* return_size: doesn't really apply for this case */,
                                  0);
       break;
    }
@@ -568,10 +567,10 @@ tex_instr_get_and_remove_plane_src(nir_tex_instr *tex)
    return plane;
 }
 
-/* Returns true if we need 32bit, so we know what size to use when we do not
- * have a sampler object
+/* Returns return_size, so it could be used for the case of not having a
+ * sampler object
  */
-static bool
+static uint8_t
 lower_tex_src(nir_builder *b,
               nir_tex_instr *instr,
               unsigned src_idx,
@@ -642,13 +641,13 @@ lower_tex_src(nir_builder *b,
    struct v3dv_descriptor_set_binding_layout *binding_layout =
       &set_layout->binding[binding];
 
-   uint8_t sampler_is_32b;
+   uint8_t return_size;
    if (V3D_DBG(TMU_16BIT))
-      sampler_is_32b = false;
+      return_size = 16;
    else  if (V3D_DBG(TMU_32BIT))
-      sampler_is_32b = true;
+      return_size = 32;
    else
-      sampler_is_32b = !relaxed_precision;
+      return_size = relaxed_precision ? 16 : 32;
 
    struct v3dv_descriptor_map *map =
       pipeline_get_descriptor_map(state->pipeline, binding_layout->type,
@@ -660,7 +659,7 @@ lower_tex_src(nir_builder *b,
                          base_index,
                          binding_layout->array_size,
                          0,
-                         sampler_is_32b,
+                         return_size,
                          plane);
 
    if (is_sampler)
@@ -668,7 +667,7 @@ lower_tex_src(nir_builder *b,
    else
       instr->texture_index = desc_index;
 
-   return sampler_is_32b;
+   return return_size;
 }
 
 static bool
@@ -676,13 +675,13 @@ lower_sampler(nir_builder *b,
               nir_tex_instr *instr,
               struct lower_pipeline_layout_state *state)
 {
-   bool sampler_is_32b = false;
+   uint8_t return_size = 0;
 
    int texture_idx =
       nir_tex_instr_src_index(instr, nir_tex_src_texture_deref);
 
    if (texture_idx >= 0)
-      sampler_is_32b = lower_tex_src(b, instr, texture_idx, state);
+      return_size = lower_tex_src(b, instr, texture_idx, state);
 
    int sampler_idx =
       nir_tex_instr_src_index(instr, nir_tex_src_sampler_deref);
@@ -700,8 +699,8 @@ lower_sampler(nir_builder *b,
     */
    if (sampler_idx < 0) {
       state->needs_default_sampler_state = true;
-      instr->backend_flags = sampler_is_32b ?
-         V3DV_NO_SAMPLER_32BIT_IDX : V3DV_NO_SAMPLER_16BIT_IDX;
+      instr->backend_flags = return_size == 16 ?
+         V3DV_NO_SAMPLER_16BIT_IDX : V3DV_NO_SAMPLER_32BIT_IDX;
    }
 
    return true;
@@ -767,7 +766,7 @@ lower_image_deref(nir_builder *b,
                          base_index,
                          binding_layout->array_size,
                          0,
-                         true /* return_size: doesn't apply for textures */,
+                         32 /* return_size: doesn't apply for textures */,
                          0);
 
    /* Note: we don't need to do anything here in relation to the precision and
@@ -960,11 +959,27 @@ pipeline_populate_v3d_key(struct v3d_key *key,
     */
    struct v3dv_descriptor_map *sampler_map =
       &p_stage->pipeline->shared_data->maps[p_stage->stage]->sampler_map;
+   struct v3dv_descriptor_map *texture_map =
+      &p_stage->pipeline->shared_data->maps[p_stage->stage]->texture_map;
 
+   key->num_tex_used = texture_map->num_desc;
+   assert(key->num_tex_used <= V3D_MAX_TEXTURE_SAMPLERS);
+   for (uint32_t tex_idx = 0; tex_idx < texture_map->num_desc; tex_idx++) {
+      key->tex[tex_idx].swizzle[0] = PIPE_SWIZZLE_X;
+      key->tex[tex_idx].swizzle[1] = PIPE_SWIZZLE_Y;
+      key->tex[tex_idx].swizzle[2] = PIPE_SWIZZLE_Z;
+      key->tex[tex_idx].swizzle[3] = PIPE_SWIZZLE_W;
+   }
+
+   key->num_samplers_used = sampler_map->num_desc;
+   assert(key->num_samplers_used <= V3D_MAX_TEXTURE_SAMPLERS);
    for (uint32_t sampler_idx = 0; sampler_idx < sampler_map->num_desc;
         sampler_idx++) {
-      if (sampler_map->sampler_is_32b[sampler_idx])
-         key->sampler_is_32b |= 1 << sampler_idx;
+      key->sampler[sampler_idx].return_size =
+         sampler_map->return_size[sampler_idx];
+
+      key->sampler[sampler_idx].return_channels =
+         key->sampler[sampler_idx].return_size == 32 ? 4 : 2;
    }
 
    switch (p_stage->stage) {
@@ -1106,35 +1121,13 @@ v3d_fs_key_set_color_attachment(struct v3d_fs_key *key,
    /* If logic operations are enabled then we might emit color reads and we
     * need to know the color buffer format and swizzle for that
     */
-   if (key->logicop_func != PIPE_LOGICOP_COPY ||
-       key->software_blend) {
+   if (key->logicop_func != PIPE_LOGICOP_COPY) {
       /* Framebuffer formats should be single plane */
       assert(vk_format_get_plane_count(fb_format) == 1);
       key->color_fmt[index].format = fb_pipe_format;
       memcpy(key->color_fmt[index].swizzle,
              v3dv_get_format_swizzle(p_stage->pipeline->device, fb_format, 0),
              sizeof(key->color_fmt[index].swizzle));
-   }
-
-   if (key->software_blend) {
-      struct vk_color_blend_attachment_state *att =
-         &p_stage->pipeline->dynamic_graphics_state.cb.attachments[index];
-
-      if (att->blend_enable) {
-         key->blend[index].rgb_func = vk_blend_op_to_pipe(att->color_blend_op);
-         key->blend[index].alpha_func = vk_blend_op_to_pipe(att->alpha_blend_op);
-         key->blend[index].rgb_dst_factor = vk_blend_factor_to_pipe(att->dst_color_blend_factor);
-         key->blend[index].alpha_dst_factor = vk_blend_factor_to_pipe(att->dst_alpha_blend_factor);
-         key->blend[index].rgb_src_factor = vk_blend_factor_to_pipe(att->src_color_blend_factor);
-         key->blend[index].alpha_src_factor = vk_blend_factor_to_pipe(att->src_alpha_blend_factor);
-      } else {
-         key->blend[index].rgb_func = PIPE_BLEND_ADD;
-         key->blend[index].alpha_func = PIPE_BLEND_ADD;
-         key->blend[index].rgb_dst_factor = PIPE_BLENDFACTOR_ZERO;
-         key->blend[index].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
-         key->blend[index].rgb_src_factor = PIPE_BLENDFACTOR_ONE;
-         key->blend[index].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
-      }
    }
 
    const struct util_format_description *desc =
@@ -1145,10 +1138,12 @@ v3d_fs_key_set_color_attachment(struct v3d_fs_key *key,
       key->f32_color_rb |= 1 << index;
    }
 
-   if (util_format_is_pure_uint(fb_pipe_format))
-      key->f32_color_rb |= 1 << index;
-   else if (util_format_is_pure_sint(fb_pipe_format))
-      key->f32_color_rb |= 1 << index;
+   if (p_stage->nir->info.fs.untyped_color_outputs) {
+      if (util_format_is_pure_uint(fb_pipe_format))
+         key->uint_color_rb |= 1 << index;
+      else if (util_format_is_pure_sint(fb_pipe_format))
+         key->int_color_rb |= 1 << index;
+   }
 }
 
 static void
@@ -1219,8 +1214,6 @@ pipeline_populate_v3d_fs_key(struct v3d_fs_key *key,
     * tile buffer load/store swap R/B bit.
     */
    key->swap_color_rb = 0;
-
-   key->software_blend = p_stage->pipeline->blend.use_software;
 
    for (uint32_t i = 0; i < rendering_info->color_attachment_count; i++) {
       if (rendering_info->color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
@@ -1764,10 +1757,10 @@ pipeline_lower_nir(struct v3dv_pipeline *pipeline,
       pipeline->shared_data->maps[p_stage->stage];
 
    UNUSED unsigned index;
-   index = descriptor_map_add(&maps->sampler_map, -1, -1, -1, 0, 0, false, 0);
+   index = descriptor_map_add(&maps->sampler_map, -1, -1, -1, 0, 0, 16, 0);
    assert(index == V3DV_NO_SAMPLER_16BIT_IDX);
 
-   index = descriptor_map_add(&maps->sampler_map, -2, -2, -2, 0, 0, true, 0);
+   index = descriptor_map_add(&maps->sampler_map, -2, -2, -2, 0, 0, 32, 0);
    assert(index == V3DV_NO_SAMPLER_32BIT_IDX);
 
    /* Apply the actual pipeline layout to UBOs, SSBOs, and textures */
@@ -1996,8 +1989,6 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
       key->sample_alpha_to_one = ms_info->alphaToOneEnable;
    }
 
-   key->software_blend = pipeline->blend.use_software;
-
    struct vk_render_pass_state *ri = &pipeline->rendering_info;
    for (uint32_t i = 0; i < ri->color_attachment_count; i++) {
       if (ri->color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
@@ -2011,35 +2002,13 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
       /* If logic operations are enabled then we might emit color reads and we
        * need to know the color buffer format and swizzle for that
        */
-      if (key->logicop_func != PIPE_LOGICOP_COPY ||
-          key->software_blend) {
+      if (key->logicop_func != PIPE_LOGICOP_COPY) {
          /* Framebuffer formats should be single plane */
          assert(vk_format_get_plane_count(fb_format) == 1);
          key->color_fmt[i].format = fb_pipe_format;
          memcpy(key->color_fmt[i].swizzle,
                 v3dv_get_format_swizzle(pipeline->device, fb_format, 0),
                 sizeof(key->color_fmt[i].swizzle));
-      }
-
-      if (key->software_blend) {
-         struct vk_color_blend_attachment_state *att =
-            &pipeline->dynamic_graphics_state.cb.attachments[i];
-
-         if (att->blend_enable) {
-            key->blend[i].rgb_func = vk_blend_op_to_pipe(att->color_blend_op);
-            key->blend[i].alpha_func = vk_blend_op_to_pipe(att->alpha_blend_op);
-            key->blend[i].rgb_dst_factor = vk_blend_factor_to_pipe(att->dst_color_blend_factor);
-            key->blend[i].alpha_dst_factor = vk_blend_factor_to_pipe(att->dst_alpha_blend_factor);
-            key->blend[i].rgb_src_factor = vk_blend_factor_to_pipe(att->src_color_blend_factor);
-            key->blend[i].alpha_src_factor = vk_blend_factor_to_pipe(att->src_alpha_blend_factor);
-         } else {
-            key->blend[i].rgb_func = PIPE_BLEND_ADD;
-            key->blend[i].alpha_func = PIPE_BLEND_ADD;
-            key->blend[i].rgb_dst_factor = PIPE_BLENDFACTOR_ZERO;
-            key->blend[i].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
-            key->blend[i].rgb_src_factor = PIPE_BLENDFACTOR_ONE;
-            key->blend[i].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
-         }
       }
 
       const struct util_format_description *desc =
@@ -2049,11 +2018,6 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
           desc->channel[0].size == 32) {
          key->f32_color_rb |= 1 << i;
       }
-
-      if (util_format_is_pure_uint(fb_pipe_format))
-         key->f32_color_rb |= 1 << i;
-      else if (util_format_is_pure_sint(fb_pipe_format))
-         key->f32_color_rb |= 1 << i;
    }
 
    const VkPipelineVertexInputStateCreateInfo *vi_info =
@@ -3126,8 +3090,10 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 static void
 lower_compute(struct nir_shader *nir)
 {
-   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
-            nir_var_mem_shared, shared_type_info);
+   if (!nir->info.shared_memory_explicit_layout) {
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
+               nir_var_mem_shared, shared_type_info);
+   }
 
    NIR_PASS(_, nir, nir_lower_explicit_io,
             nir_var_mem_shared, nir_address_format_32bit_offset);

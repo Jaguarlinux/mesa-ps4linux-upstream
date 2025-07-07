@@ -27,7 +27,7 @@
       when: on_success
 
 .intel-common-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   rules:
     - changes:
         *intel_common_file_list
@@ -51,7 +51,7 @@
       when: on_success
 
 .i915g-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -75,7 +75,7 @@
       when: on_success
 
 .crocus-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -100,7 +100,7 @@
       when: on_success
 
 .iris-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -131,7 +131,7 @@
     LAVA_S3_ARTIFACT_NAME: mesa-x86_64-default-release
     S3_ARTIFACT_NAME: mesa-python-ci-artifacts
   needs:
-    - debian/x86_64_test-gl
+    - kernel+rootfs_x86_64
     - debian-release
 
 .anv-rules:
@@ -147,7 +147,7 @@
       when: on_success
 
 .anv-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -170,7 +170,7 @@
       when: on_success
 
 .hasvk-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -190,7 +190,7 @@
     - !reference [.anv-rules, rules]
 
 .intel-manual-rules:
-  stage: intel-nightly
+  stage: intel-postmerge
   extends: .no-auto-retry
   rules:
     - !reference [.test, rules]
@@ -337,6 +337,8 @@
 
 
 .intel-common-test:
+  extends:
+    - .lava-test-deqp:x86_64
   variables:
     DTB: ""
     BOOT_METHOD: depthcharge
@@ -354,7 +356,6 @@
 
 .iris-test:
   extends:
-    - .lava-x86_64-test-gl
     - .intel-common-test
     - .iris-rules
   variables:
@@ -368,9 +369,7 @@
 ## ANV only
 .anv-angle-test:
   extends:
-    - .lava-x86_64-test-gl
-    - .intel-common-test
-    - .anv-rules
+    - .anv-test
     - .test-angle
   variables:
     VK_DRIVER: intel
@@ -469,7 +468,6 @@
 ## Intel (anv + iris)
 .intel-adl-test:
   extends:
-    - .lava-x86_64-test-gl
     - .anv-test
     - .intel-test
   variables:
@@ -477,7 +475,6 @@
 
 .intel-tgl-test:
   extends:
-    - .lava-x86_64-test-gl
     - .anv-test
     - .intel-test
   variables:
@@ -485,7 +482,6 @@
 
 .intel-whl-test:
   extends:
-    - .lava-x86_64-test-gl
     - .iris-whl-test
     - .intel-test
   variables:

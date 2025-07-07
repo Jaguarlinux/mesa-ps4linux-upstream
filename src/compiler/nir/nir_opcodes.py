@@ -366,7 +366,7 @@ dst.x |= ((uint32_t) pack_fmt_1x8(src0.w)) << 24;
 def unpack_2x16(fmt):
    unop_horiz("unpack_" + fmt + "_2x16", 2, tfloat32, 1, tuint32, """
 dst.x = unpack_fmt_1x16((uint16_t)(src0.x & 0xffff));
-dst.y = unpack_fmt_1x16((uint16_t)(src0.x << 16));
+dst.y = unpack_fmt_1x16((uint16_t)(src0.x >> 16));
 """.replace("fmt", fmt))
 
 def unpack_4x8(fmt):
@@ -1726,42 +1726,4 @@ opcode("udot_2x16_uadd_sat", 0, tint32, [0, 0, 0], [tuint32, tuint32, tint32],
    const uint64_t tmp = (v0x * v1x) + (v0y * v1y) + src2;
 
    dst = tmp >= UINT32_MAX ? UINT32_MAX : tmp;
-""")
-
-# Bfloat16 operations.
-
-unop_numeric_convert("bf2f", tfloat32, tuint16, "_mesa_bfloat16_bits_to_float(src0)")
-unop_numeric_convert("f2bf", tuint16, tfloat32, "_mesa_float_to_bfloat16_bits_rte(src0)")
-
-binop("bfmul", tuint16, _2src_commutative + associative, """
-   const float a = _mesa_bfloat16_bits_to_float(src0);
-   const float b = _mesa_bfloat16_bits_to_float(src1);
-   dst = _mesa_float_to_bfloat16_bits_rte(a * b);
-""")
-
-triop("bffma", tuint16, _2src_commutative, """
-    const float a = _mesa_bfloat16_bits_to_float(src0);
-    const float b = _mesa_bfloat16_bits_to_float(src1);
-    const float c = _mesa_bfloat16_bits_to_float(src2);
-    dst = _mesa_float_to_bfloat16_bits_rte(fmaf(a, b, c));
-""")
-
-binop_reduce("bfdot", 1, tuint16, tuint16,
-             "_mesa_bfloat16_bits_to_float({src0}) * _mesa_bfloat16_bits_to_float({src1})",
-             "_mesa_bfloat16_bits_to_float({src0}) + _mesa_bfloat16_bits_to_float({src1})",
-             "_mesa_float_to_bfloat16_bits_rte({src})")
-
-# Like bfdot2 but with accumulator
-opcode("bfdot2_bfadd", 1, tint16, [2, 2, 1], [tint16, tint16, tint16],
-       False, _2src_commutative, """
-   const float a0 = _mesa_bfloat16_bits_to_float(src0.x);
-   const float a1 = _mesa_bfloat16_bits_to_float(src0.y);
-   const float b0 = _mesa_bfloat16_bits_to_float(src1.x);
-   const float b1 = _mesa_bfloat16_bits_to_float(src1.y);
-
-   float acc = _mesa_bfloat16_bits_to_float(src2.x);
-   acc = fmaf(a0, b0, acc);
-   acc = fmaf(a1, b1, acc);
-
-   dst.x = _mesa_float_to_bfloat16_bits_rte(acc);
 """)

@@ -1,6 +1,8 @@
 // Copyright © 2023 Collabora, Ltd.
 // SPDX-License-Identifier: MIT
 
+#![allow(unstable_name_collisions)]
+
 use crate::api::{GetDebugFlags, DEBUG};
 use crate::const_tracker::ConstTracker;
 use crate::ir::*;
@@ -9,73 +11,76 @@ use crate::liveness::{
 };
 
 use compiler::bitset::BitSet;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::cmp::{max, Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
+#[derive(Default)]
 struct PhiDstMap {
-    ssa_phi: FxHashMap<SSAValue, Phi>,
+    phi_ssa: HashMap<u32, SSAValue>,
+    ssa_phi: HashMap<SSAValue, u32>,
 }
 
 impl PhiDstMap {
     fn new() -> PhiDstMap {
-        PhiDstMap {
-            ssa_phi: Default::default(),
-        }
+        Default::default()
     }
 
-    fn add_phi_dst(&mut self, phi: Phi, dst: &Dst) {
+    fn add_phi_dst(&mut self, phi_idx: u32, dst: Dst) {
         let vec = dst.as_ssa().expect("Not an SSA destination");
         debug_assert!(vec.comps() == 1);
-        self.ssa_phi.insert(vec[0], phi);
+        self.phi_ssa.insert(phi_idx, vec[0]);
+        self.ssa_phi.insert(vec[0], phi_idx);
     }
 
     pub fn from_block(block: &BasicBlock) -> PhiDstMap {
         let mut map = PhiDstMap::new();
-        if let Some(op) = block.phi_dsts() {
-            for (idx, dst) in op.dsts.iter() {
-                map.add_phi_dst(*idx, dst);
+        if let Some(phi) = block.phi_dsts() {
+            for (idx, dst) in phi.dsts.iter() {
+                map.add_phi_dst(*idx, *dst);
             }
         }
         map
     }
 
-    fn get_phi(&self, ssa: &SSAValue) -> Option<&Phi> {
+    fn get_phi_idx(&self, ssa: &SSAValue) -> Option<&u32> {
         self.ssa_phi.get(ssa)
+    }
+
+    fn get_dst_ssa(&self, phi_idx: &u32) -> Option<&SSAValue> {
+        self.phi_ssa.get(phi_idx)
     }
 }
 
+#[derive(Default)]
 struct PhiSrcMap {
-    phi_src: FxHashMap<Phi, SSAValue>,
+    src_phi: HashMap<SSAValue, u32>,
 }
 
 impl PhiSrcMap {
     fn new() -> PhiSrcMap {
-        PhiSrcMap {
-            phi_src: Default::default(),
-        }
+        Default::default()
     }
 
-    fn add_phi_src(&mut self, phi: Phi, src: &Src) {
+    fn add_phi_src(&mut self, phi_idx: u32, src: Src) {
         debug_assert!(src.is_unmodified());
         let vec = src.src_ref.as_ssa().expect("Not an SSA source");
         debug_assert!(vec.comps() == 1);
-        self.phi_src.insert(phi, vec[0]);
+        self.src_phi.insert(vec[0], phi_idx);
     }
 
     pub fn from_block(block: &BasicBlock) -> PhiSrcMap {
         let mut map = PhiSrcMap::new();
-        if let Some(op) = block.phi_srcs() {
-            for (phi, src) in op.srcs.iter() {
-                map.add_phi_src(*phi, src);
+        if let Some(phi) = block.phi_srcs() {
+            for (idx, src) in phi.srcs.iter() {
+                map.add_phi_src(*idx, *src);
             }
         }
         map
     }
 
-    pub fn get_src_ssa(&self, phi: &Phi) -> &SSAValue {
-        self.phi_src.get(phi).expect("Phi source missing")
+    pub fn get_phi_idx(&self, ssa: &SSAValue) -> Option<&u32> {
+        self.src_phi.get(ssa)
     }
 }
 
@@ -141,7 +146,11 @@ impl Spill for SpillPred<'_> {
         assert!(matches!(dst.file(), RegFile::GPR | RegFile::UGPR));
         self.info.num_spills_to_reg += 1;
         if let Some(b) = src.as_bool() {
-            let u32_src = Src::from(if b { !0 } else { 0 });
+            let u32_src = if b {
+                Src::new_imm_u32(!0)
+            } else {
+                Src::new_zero()
+            };
             Instr::new_boxed(OpCopy {
                 dst: dst.into(),
                 src: u32_src,
@@ -150,7 +159,7 @@ impl Spill for SpillPred<'_> {
             Instr::new_boxed(OpSel {
                 dst: dst.into(),
                 cond: src.bnot(),
-                srcs: [0.into(), (!0).into()],
+                srcs: [Src::new_zero(), Src::new_imm_u32(!0)],
             })
         }
     }
@@ -164,7 +173,7 @@ impl Spill for SpillPred<'_> {
             cmp_op: IntCmpOp::Ne,
             cmp_type: IntCmpType::U32,
             ex: false,
-            srcs: [0.into(), src.into()],
+            srcs: [Src::new_zero(), src.into()],
             accum: true.into(),
             low_cmp: true.into(),
         })
@@ -284,7 +293,7 @@ struct SpillCache<'a, S: Spill> {
     alloc: &'a mut SSAValueAllocator,
     spill: S,
     const_tracker: ConstTracker,
-    val_spill: FxHashMap<SSAValue, SSAValue>,
+    val_spill: HashMap<SSAValue, SSAValue>,
 }
 
 impl<'a, S: Spill> SpillCache<'a, S> {
@@ -293,7 +302,7 @@ impl<'a, S: Spill> SpillCache<'a, S> {
             alloc: alloc,
             spill: spill,
             const_tracker: ConstTracker::new(),
-            val_spill: Default::default(),
+            val_spill: HashMap::new(),
         }
     }
 
@@ -322,7 +331,7 @@ impl<'a, S: Spill> SpillCache<'a, S> {
 
     fn spill(&mut self, ssa: SSAValue) -> Box<Instr> {
         if let Some(c) = self.const_tracker.get(&ssa) {
-            self.spill_src(ssa, c.clone().into())
+            self.spill_src(ssa, (*c).into())
         } else {
             self.spill_src(ssa, ssa.into())
         }
@@ -337,7 +346,7 @@ impl<'a, S: Spill> SpillCache<'a, S> {
         if let Some(c) = self.const_tracker.get(&ssa) {
             Instr::new_boxed(OpCopy {
                 dst: ssa.into(),
-                src: c.clone().into(),
+                src: (*c).into(),
             })
         } else {
             self.fill_dst(ssa.into(), ssa)
@@ -347,7 +356,7 @@ impl<'a, S: Spill> SpillCache<'a, S> {
 
 struct SpillChooser<'a> {
     bl: &'a NextUseBlockLiveness,
-    pinned: &'a FxHashSet<SSAValue>,
+    pinned: &'a HashSet<SSAValue>,
     ip: usize,
     count: usize,
     spills: BinaryHeap<Reverse<SSANextUse>>,
@@ -361,7 +370,7 @@ struct SpillChoiceIter {
 impl<'a> SpillChooser<'a> {
     pub fn new(
         bl: &'a NextUseBlockLiveness,
-        pinned: &'a FxHashSet<SSAValue>,
+        pinned: &'a HashSet<SSAValue>,
         ip: usize,
         count: usize,
     ) -> Self {
@@ -400,7 +409,7 @@ impl<'a> SpillChooser<'a> {
     }
 }
 
-impl IntoIterator for SpillChooser<'_> {
+impl<'a> IntoIterator for SpillChooser<'a> {
     type Item = SSAValue;
     type IntoIter = SpillChoiceIter;
 
@@ -430,9 +439,9 @@ struct SSAState {
     w: LiveSet,
     // The set of variables which have already been spilled.  These don't need
     // to be spilled again.
-    s: FxHashSet<SSAValue>,
+    s: HashSet<SSAValue>,
     // The set of pinned variables
-    p: FxHashSet<SSAValue>,
+    p: HashSet<SSAValue>,
 }
 
 fn spill_values<S: Spill>(
@@ -448,7 +457,7 @@ fn spill_values<S: Spill>(
     // Record the set of SSA values used within each loop
     let mut phi_dst_maps = Vec::new();
     let mut phi_src_maps = Vec::new();
-    let mut loop_uses = FxHashMap::default();
+    let mut loop_uses = HashMap::new();
     for b_idx in 0..blocks.len() {
         phi_dst_maps.push(PhiDstMap::from_block(&blocks[b_idx]));
         phi_src_maps.push(PhiSrcMap::from_block(&blocks[b_idx]));
@@ -456,8 +465,8 @@ fn spill_values<S: Spill>(
         if let Some(lh_idx) = blocks.loop_header_index(b_idx) {
             let uses = loop_uses
                 .entry(lh_idx)
-                .or_insert_with(|| RefCell::new(Default::default()));
-            let uses: &mut FxHashSet<_> = uses.get_mut();
+                .or_insert_with(|| RefCell::new(HashSet::new()));
+            let uses = uses.get_mut();
 
             for instr in &blocks[b_idx].instrs {
                 instr.for_each_ssa_use(|ssa| {
@@ -495,7 +504,7 @@ fn spill_values<S: Spill>(
     }
 
     let mut spill = SpillCache::new(&mut func.ssa_alloc, spill);
-    let mut spilled_phis: BitSet<Phi> = BitSet::new();
+    let mut spilled_phis = BitSet::new();
 
     let mut ssa_state_in: Vec<SSAState> = Vec::new();
     let mut ssa_state_out: Vec<SSAState> = Vec::new();
@@ -534,8 +543,8 @@ fn spill_values<S: Spill>(
             debug_assert!(w.count(file) <= limit);
             w
         } else if blocks.is_loop_header(b_idx) {
-            let mut i_b: FxHashSet<SSAValue> =
-                FxHashSet::from_iter(bl.iter_live_in().cloned());
+            let mut i_b: HashSet<SSAValue> =
+                HashSet::from_iter(bl.iter_live_in().cloned());
 
             if let Some(phi) = blocks[b_idx].phi_dsts() {
                 for (_, dst) in phi.dsts.iter() {
@@ -593,14 +602,14 @@ fn spill_values<S: Spill>(
                 num_preds: usize,
                 next_use: usize,
             }
-            let mut live: FxHashMap<SSAValue, SSAPredInfo> = Default::default();
+            let mut live: HashMap<SSAValue, SSAPredInfo> = HashMap::new();
 
             for p_idx in &preds {
                 let phi_src_map = &phi_src_maps[*p_idx];
 
                 for mut ssa in ssa_state_out[*p_idx].w.iter().cloned() {
-                    if let Some(phi) = phi_dst_map.get_phi(&ssa) {
-                        ssa = *phi_src_map.get_src_ssa(phi);
+                    if let Some(phi) = phi_src_map.get_phi_idx(&ssa) {
+                        ssa = *phi_dst_map.get_dst_ssa(phi).unwrap();
                     }
 
                     if let Some(next_use) = bl.first_use(&ssa) {
@@ -638,14 +647,14 @@ fn spill_values<S: Spill>(
         };
 
         let s = if preds.is_empty() {
-            Default::default()
+            HashSet::new()
         } else if preds.len() == 1 {
             let p_s = &ssa_state_out[preds[0]].s;
-            FxHashSet::from_iter(
+            HashSet::from_iter(
                 p_s.iter().filter(|ssa| bl.is_live_in(ssa)).cloned(),
             )
         } else {
-            let mut s: FxHashSet<_> = Default::default();
+            let mut s = HashSet::new();
             for p_idx in &preds {
                 if *p_idx >= b_idx {
                     continue;
@@ -677,7 +686,7 @@ fn spill_values<S: Spill>(
             s
         };
 
-        let mut p: FxHashSet<_> = Default::default();
+        let mut p = HashSet::new();
         for p_idx in &preds {
             if *p_idx < b_idx {
                 let p_p = &ssa_state_out[*p_idx].p;
@@ -705,16 +714,16 @@ fn spill_values<S: Spill>(
             }
 
             match &mut instr.op {
-                Op::PhiDsts(op) => {
+                Op::PhiDsts(phi) => {
                     // For phis, anything that is not in W needs to be spilled
                     // by setting the destination to some spill value.
-                    for (phi, dst) in op.dsts.iter_mut() {
+                    for (idx, dst) in phi.dsts.iter_mut() {
                         let vec = dst.as_ssa().unwrap();
                         debug_assert!(vec.comps() == 1);
                         let ssa = &vec[0];
 
                         if ssa.file() == file && !b.w.contains(ssa) {
-                            spilled_phis.insert(*phi);
+                            spilled_phis.insert((*idx).try_into().unwrap());
                             b.s.insert(*ssa);
                             *dst = spill.get_spill(*ssa).into();
                         }
@@ -787,8 +796,8 @@ fn spill_values<S: Spill>(
                             }
                         }
 
-                        let spills: FxHashSet<SSAValue> =
-                            FxHashSet::from_iter(spills);
+                        let spills: HashSet<SSAValue> =
+                            HashSet::from_iter(spills);
 
                         for (dst, src) in pcopy.dsts_srcs.iter_mut() {
                             let dst_ssa = &dst.as_ssa().unwrap()[0];
@@ -838,7 +847,7 @@ fn spill_values<S: Spill>(
                                     assert!(spill.is_const(ssa));
                                     instrs.push(spill.spill(*ssa));
                                 }
-                                *ssa = spill.get_spill(*ssa);
+                                *ssa = spill.get_spill(*ssa).into();
                             }
                         });
                     } else if file == RegFile::UPred && !bb.uniform {
@@ -973,8 +982,8 @@ fn spill_values<S: Spill>(
         let mut spills = Vec::new();
         let mut fills = Vec::new();
 
-        if let Some(op) = pb.phi_srcs_mut() {
-            for (phi, src) in op.srcs.iter_mut() {
+        if let Some(phi) = pb.phi_srcs_mut() {
+            for (idx, src) in phi.srcs.iter_mut() {
                 debug_assert!(src.is_unmodified());
                 let vec = src.src_ref.as_ssa().unwrap();
                 debug_assert!(vec.comps() == 1);
@@ -984,7 +993,7 @@ fn spill_values<S: Spill>(
                     continue;
                 }
 
-                if spilled_phis.contains(*phi) {
+                if spilled_phis.get((*idx).try_into().unwrap()) {
                     if !p_out.s.contains(ssa) {
                         spills.push(*ssa);
                     }
@@ -1005,7 +1014,7 @@ fn spill_values<S: Spill>(
         }
 
         for ssa in s_in.w.iter() {
-            if phi_dst_map.get_phi(ssa).is_some() {
+            if phi_dst_map.get_phi_idx(ssa).is_some() {
                 continue;
             }
 
@@ -1035,7 +1044,7 @@ fn spill_values<S: Spill>(
         let ip = pb
             .phi_srcs_ip()
             .or_else(|| pb.branch_ip())
-            .unwrap_or(pb.instrs.len());
+            .unwrap_or_else(|| pb.instrs.len());
         pb.instrs.splice(ip..ip, instrs.into_iter());
     }
 }
@@ -1057,7 +1066,7 @@ impl Function {
     ///
     ///  - S, the set of variables which have been spilled
     ///
-    /// These sets are tracked as we walk instructions and \[un\]spill values to
+    /// These sets are tracked as we walk instructions and [un]spill values to
     /// satisfy the given limit.  When spills are required we spill the value
     /// with the nighest next-use IP.  At block boundaries, Braun and Hack
     /// describe a heuristic for determining the starting W and S sets based on

@@ -53,10 +53,6 @@ extern "C" {
 #define max(x, y) (((x) > (y)) ? (x) : (y))
 #endif
 
-#ifndef int_divide_with_ceil
-#define int_divide_with_ceil(x, y) ((x + (y-1))/y)
-#endif
-
 bool vpe_find_color_space_from_table(
     const struct vpe_color_space *table, int table_size, const struct vpe_color_space *cs);
 

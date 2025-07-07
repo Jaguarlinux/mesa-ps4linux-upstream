@@ -109,9 +109,8 @@ ir3_context_init(struct ir3_compiler *compiler, struct ir3_shader *shader,
    /* Enable the texture pre-fetch feature only a4xx onwards.  But
     * only enable it on generations that have been tested:
     */
-   if ((so->type == MESA_SHADER_FRAGMENT) && compiler->has_fs_tex_prefetch) {
-      NIR_PASS(_, ctx->s, ir3_nir_lower_tex_prefetch, &so->prefetch_bary_type);
-   }
+   if ((so->type == MESA_SHADER_FRAGMENT) && compiler->has_fs_tex_prefetch)
+      NIR_PASS(_, ctx->s, ir3_nir_lower_tex_prefetch);
 
    bool vectorized = false;
    NIR_PASS(vectorized, ctx->s, nir_opt_vectorize, ir3_nir_vectorize_filter,

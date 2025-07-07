@@ -120,6 +120,7 @@ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
     op.lower_fsqrt = dev.sm < 52;
     op.lower_bitfield_extract = dev.sm >= 70;
     op.lower_bitfield_insert = true;
+    op.lower_pack_64_4x16 = true;
     op.lower_pack_half_2x16 = true;
     op.lower_pack_unorm_2x16 = true;
     op.lower_pack_snorm_2x16 = true;
@@ -156,9 +157,6 @@ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
         | nir_lower_shift64
         | nir_lower_imul_2x32_64
         | nir_lower_conv64);
-    if dev.sm < 32 {
-        op.lower_int64_options |= nir_lower_shift64;
-    }
     op.lower_ldexp = true;
     op.lower_fmod = true;
     op.lower_ffract = true;
@@ -314,8 +312,8 @@ impl ShaderBin {
                     writes_point_size: io.attr_written(NAK_ATTR_POINT_SIZE),
                     writes_vprs_table_index: io
                         .attr_written(NAK_ATTR_VPRS_TABLE_INDEX),
-                    clip_enable: io.clip_enable,
-                    cull_enable: io.cull_enable,
+                    clip_enable: io.clip_enable.try_into().unwrap(),
+                    cull_enable: io.cull_enable.try_into().unwrap(),
                     xfb: if let Some(xfb) = &io.xfb {
                         **xfb
                     } else {
@@ -325,7 +323,7 @@ impl ShaderBin {
                 },
                 _ => unsafe { std::mem::zeroed() },
             },
-            hdr: sph::encode_header(sm, info, fs_key),
+            hdr: sph::encode_header(sm, &info, fs_key),
         };
 
         if DEBUG.print() {

@@ -523,12 +523,11 @@ nv50_state_validate_cp(struct nv50_context *nv50, uint32_t mask)
 }
 
 static void
-nv50_compute_upload_input(struct nv50_context *nv50, const uint32_t *input, uint32_t size)
+nv50_compute_upload_input(struct nv50_context *nv50, const uint32_t *input)
 {
    struct nv50_screen *screen = nv50->screen;
    struct nouveau_pushbuf *push = nv50->base.pushbuf;
-
-   assert(util_is_aligned(size, 0x4));
+   unsigned size = align(nv50->compprog->parm_size, 0x4);
 
    BEGIN_NV04(push, NV50_CP(USER_PARAM_COUNT), 1);
    PUSH_DATA (push, (1 + (size / 4)) << 8);
@@ -560,8 +559,7 @@ nv50_compute_upload_input(struct nv50_context *nv50, const uint32_t *input, uint
 }
 
 void
-nv50_launch_grid_with_input(struct pipe_context *pipe, const struct pipe_grid_info *info,
-                            const void *input, uint32_t input_size)
+nv50_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 {
    struct nv50_context *nv50 = nv50_context(pipe);
    struct nouveau_pushbuf *push = nv50->base.pushbuf;
@@ -576,12 +574,12 @@ nv50_launch_grid_with_input(struct pipe_context *pipe, const struct pipe_grid_in
       goto out;
    }
 
-   nv50_compute_upload_input(nv50, input, input_size);
+   nv50_compute_upload_input(nv50, info->input);
 
    BEGIN_NV04(push, NV50_CP(CP_START_ID), 1);
    PUSH_DATA (push, cp->code_base);
 
-   int shared_size = cp->cp.smem_size + info->variable_shared_mem + input_size + 0x14;
+   int shared_size = cp->cp.smem_size + info->variable_shared_mem + cp->parm_size + 0x14;
    BEGIN_NV04(push, NV50_CP(SHARED_SIZE), 1);
    PUSH_DATA (push, align(shared_size, 0x40));
    BEGIN_NV04(push, NV50_CP(CP_REG_ALLOC_TEMP), 1);
@@ -630,10 +628,4 @@ nv50_launch_grid_with_input(struct pipe_context *pipe, const struct pipe_grid_in
 out:
    PUSH_KICK(push);
    simple_mtx_unlock(&nv50->screen->state_lock);
-}
-
-void
-nv50_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
-{
-   nv50_launch_grid_with_input(pipe, info, NULL, 0);
 }

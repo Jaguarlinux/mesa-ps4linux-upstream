@@ -218,7 +218,6 @@ struct radeon_info {
 
    enum vcn_version vcn_ip_version;
    enum sdma_version sdma_ip_version;
-   enum rt_version rt_ip_version;
 
    /* Kernel & winsys capabilities. */
    uint32_t drm_major; /* version */
@@ -241,11 +240,10 @@ struct radeon_info {
    bool has_stable_pstate;
    /* Whether SR-IOV is enabled or amdgpu.mcbp=1 was set on the kernel command line. */
    bool register_shadowing_required;
-   bool has_zerovram_support;
    bool has_tmz_support;
    bool has_trap_handler_support;
    bool kernel_has_modifiers;
-   uint32_t userq_ip_mask; /* AMD_IP_* bits */
+   bool use_userq;
 
    /* If the kernel driver uses CU reservation for high priority compute on gfx10+, it programs
     * a global CU mask in the hw that is AND'ed with CU_EN register fields set by userspace.
@@ -280,8 +278,6 @@ struct radeon_info {
    uint32_t min_wave64_vgpr_alloc;
    uint32_t max_vgpr_alloc;
    uint32_t wave64_vgpr_alloc_granularity;
-   uint32_t scratch_wavesize_granularity_shift;
-   uint32_t scratch_wavesize_granularity;
    uint32_t max_scratch_waves;
    bool has_scratch_base_registers;
 
@@ -293,13 +289,6 @@ struct radeon_info {
    uint32_t prim_ring_offset;             /* GFX12+ */
    uint32_t total_attribute_pos_prim_ring_size; /* GFX11+ */
    bool has_attr_ring;
-
-   /* Tessellation rings. */
-   uint32_t hs_offchip_param;
-   uint32_t hs_offchip_workgroup_dw_size;
-   uint32_t tess_factor_ring_size;
-   uint32_t tess_offchip_ring_size;
-   uint32_t total_tess_ring_size;
 
    /* Render backends (color + depth blocks). */
    uint32_t r300_num_gb_pipes;
@@ -360,6 +349,18 @@ void ac_get_harvested_configs(const struct radeon_info *info, unsigned raster_co
 unsigned ac_get_compute_resource_limits(const struct radeon_info *info,
                                         unsigned waves_per_threadgroup, unsigned max_waves_per_sh,
                                         unsigned threadgroups_per_cu);
+
+struct ac_hs_info {
+   uint32_t tess_offchip_block_dw_size;
+   uint32_t max_offchip_buffers;
+   uint32_t hs_offchip_param;
+   uint32_t tess_factor_ring_size;
+   uint32_t tess_offchip_ring_offset;
+   uint32_t tess_offchip_ring_size;
+};
+
+void ac_get_hs_info(const struct radeon_info *info,
+                    struct ac_hs_info *hs);
 
 /* Task rings BO layout information.
  * This BO is shared between GFX and ACE queues so that the ACE and GFX
