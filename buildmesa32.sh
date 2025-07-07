@@ -55,7 +55,7 @@ meson setup \
   -Dglvnd=disabled  \
   ..&&
 sed -i 's/\/usr\/lib\//\/usr\/lib32\//g' ./build.ninja &&
-BINDGEN_EXTRA_CLANG_ARGS="-m32" ninja -j4
+BINDGEN_EXTRA_CLANG_ARGS="-m32" ninja
 
 DESTDIR=$PWD/DESTDIR ninja install                     &&
 cp -vr DESTDIR/usr/lib32/* /usr/lib32                  &&
