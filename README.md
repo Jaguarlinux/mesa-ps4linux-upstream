@@ -18,9 +18,9 @@ Meson (`docs/meson.rst <https://docs.mesa3d.org/meson.html>`_):
 
 .. code-block:: sh
 
-  $ meson setup build
-  $ ninja -C build/
-  $ sudo ninja -C build/ install
+  $ chmod +x buildmesa32.sh buildmesa64.sh
+  $ ./buildmesa64.sh
+  $ ./buildmesa32.sh
 
 Support
 -------
@@ -52,6 +52,25 @@ Contributing
 
 Contributions are welcome, and step-by-step instructions can be found in our
 documentation (`docs/submittingpatches.rst
+
+
+Screenshots
+------------
+### ![alt text](https://github.com/Jaguarlinux/mesa-ps4linux-upstream/blob/main/mesa.png)
+#BUGS:
+LLVM - everywhere, no matter what distro (vkmark broken) games should work fine tho :)
+#TESTED ON
+
+- Nobara (works)
+- Debian Trixie (works) https://www.youtube.com/watch?v=U56LAP_ZhNM
+
+# Hey! 
+to anyone reading this, if u want to help me, ur a dev, whatever.
+please talk to me either on ps4linux forums (https://ps4linux.com/forums/u/kreciorek)
+or just text me on discord (1cgo)
+or PR, help would be appreciated.
+
+
 <https://docs.mesa3d.org/submittingpatches.html>`_).
 
 Note that Mesa uses gitlab for patches submission, review and discussions.
