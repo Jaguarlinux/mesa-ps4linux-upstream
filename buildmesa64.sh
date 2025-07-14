@@ -1,12 +1,12 @@
 
- mkdir -p build && \
+  mkdir -p build && \
  cd build
   meson setup \
     --buildtype=release \
     -Dprefix=/usr \
     -Dplatforms=x11,wayland \
     -Dvulkan-beta=true \
-    -Dvulkan-drivers=amd, broadcom, freedreno, intel, intel_hasvk,panfrost,swrast,virtio,imagination-experimental,microsoft-experimental,nouveau,asahi,gfxstream \
+    -Dvulkan-drivers=all \
     -Dvulkan-layers=device-select,overlay,screenshot \
     -Dbuild-aco-tests=true \
     -Damdgpu-virtio=true \
@@ -17,18 +17,16 @@
     -Dgallium-vdpau=enabled \
     -Dgallium-va=enabled \
     -Dgallium-extra-hud=true \
-    -Degl-native-platform=x11,wayland \
     -Dopengl=true \
-    -Dgallium-xa=true \
-    -Dgallium-d3d10umd=true \
+    -Dgallium-xa=enabled \
     -Dgallium-rusticl=true \
     -Dgallium-rusticl-enable-drivers=radeonsi \
     -Dimagination-srv=true \
-    -Dglx=dri,xlib \
+    -Dglx=dri \
     -Dgles1=enabled \
     -Dgles2=enabled \
     -Degl=enabled \
-    -Dllvm=auto \
+    -Dllvm=enabled \
     -Dlmsensors=enabled \
     -Dtools=glsl,nir \
     -Dlibunwind=enabled \
@@ -45,7 +43,6 @@
     -Dprecomp-compiler=enabled \
     -Dmicrosoft-clc=disabled \
     -Dvalgrind=disabled \
-    -Dtools=all \
     -Dxlib-lease=true \
     -Dglx-direct=true \
     -Dshader-cache=enabled \
