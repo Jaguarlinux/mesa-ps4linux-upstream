@@ -47,10 +47,10 @@
     -Dglx-direct=true \
     -Dshader-cache=enabled \
     -Dshader-cache-max-size=8G \
-    -Dglvnd=disabled && \
+    -Dglvnd=disabled  \
     ..&&
 
-ninja   && \
+ninja \
 meson configure -D build-tests=true && \
 ninja test && \
 ninja install && \
