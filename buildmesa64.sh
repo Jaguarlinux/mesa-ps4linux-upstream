@@ -48,6 +48,7 @@
     -Dshader-cache=enabled \
     -Dshader-cache-max-size=8G \
     -Dglvnd=disabled && \
+    ..&&
 
 meson configure && \
 ninja   && \

@@ -50,6 +50,7 @@ meson setup \
   -Dshader-cache=enabled \
   -Dshader-cache-max-size=8G \
   -Dglvnd=disabled && \
+  ..&&
 sed -i 's/\/usr\/lib\//\/usr\/lib32\//g' ./build.ninja &&
 BINDGEN_EXTRA_CLANG_ARGS="-m32" ninja
 
