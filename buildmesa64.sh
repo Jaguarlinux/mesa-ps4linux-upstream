@@ -1,5 +1,5 @@
 
-mkdir -p build && \
+mkdir -pv build && \
 cd build
 meson setup \
   --buildtype=release \
