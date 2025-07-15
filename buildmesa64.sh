@@ -1,4 +1,4 @@
-
+#!/bin.sh
 mkdir -pv build && \
 cd build
 meson setup \
