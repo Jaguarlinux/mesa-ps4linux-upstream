@@ -50,7 +50,7 @@
     -Dglvnd=disabled && \
     ..&&
 
-meson configure && \
 ninja   && \
+meson configure && \
 ninja install && \
 cp -rv ../docs -T /usr/share/doc/mesa-25.1.5
