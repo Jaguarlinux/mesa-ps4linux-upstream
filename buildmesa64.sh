@@ -50,8 +50,9 @@ meson setup \
   -Dglvnd=disabled  \
   ..&&
 
-ninja \
-meson configure -D build-tests=true && \
-ninja test && \
-ninja install && \
+ninja
+
+meson configure -D build-tests=true 
+ninja test 
+ninja install 
 cp -rv ../docs -T /usr/share/doc/mesa-25.1.5
