@@ -16,11 +16,11 @@ You can find more information in our documentation (`docs/install.rst
 <https://docs.mesa3d.org/install.html>`_), but the recommended way is to use
 Meson (`docs/meson.rst <https://docs.mesa3d.org/meson.html>`_):
 
-  `$ chmod +x buildmesa32.sh buildmesa64.sh`
+  `# chmod +x buildmesa32.sh buildmesa64.sh`
   
-  `$ ./buildmesa64.sh`
+  `# ./buildmesa64.sh`
   
-  `$ ./buildmesa32.sh`
+  `# ./buildmesa32.sh`
 
 Support
 -------
