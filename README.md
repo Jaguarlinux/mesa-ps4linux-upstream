@@ -55,8 +55,8 @@ documentation (`docs/submittingpatches.rst
 
 # Hey! 
 to anyone reading this, if u want to help me, ur a dev, whatever.
-please talk to me either on ps4linux forums (https://ps4linux.com/forums/u/kreciorek)
-or just text me on discord (1cgo)
+please talk to me either on ps4linux forums (https://ps4linux.com/forums/u/kreciorek) (https://ps4linux.com/forums/u/TigerClips1)
+or just text me on discord (1cgo) or (TigerClips2)
 or PR, help would be appreciated.
 
 
