@@ -544,6 +544,8 @@ static bool do_winsys_init(struct radeon_drm_winsys *ws)
    case CHIP_VERDE:
    case CHIP_OLAND:
    case CHIP_BONAIRE:
+   case CHIP_LIVERPOOL:
+   case CHIP_GLADIUS:
    case CHIP_KAVERI:
       ws->info.max_tcc_blocks = 4;
       break;
@@ -674,6 +676,8 @@ static bool do_winsys_init(struct radeon_drm_winsys *ws)
    case CHIP_VERDE:
    case CHIP_HAINAN:
    case CHIP_BONAIRE:
+   case CHIP_LIVERPOOL:
+   case CHIP_GLADIUS:
    case CHIP_KAVERI:
       ws->info.l2_cache_size = ws->info.num_tcc_blocks * 128 * 1024;
       break;
