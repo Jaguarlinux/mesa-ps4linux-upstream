@@ -44,6 +44,9 @@ dEQP-GLES2.functional.texture.mipmap.cube.projected.linear_nearest,Fail
 
 wayland-dEQP-EGL.functional.create_context.no_config,Fail
 wayland-dEQP-EGL.functional.image.modify.renderbuffer_depth16_renderbuffer_clear_depth,Fail
+wayland-dEQP-EGL.functional.wide_color.pbuffer_fp16_default_colorspace,Fail
+wayland-dEQP-EGL.functional.wide_color.pbuffer_8888_colorspace_srgb,Fail
+wayland-dEQP-EGL.functional.wide_color.pbuffer_888_colorspace_srgb,Fail
 wayland-dEQP-EGL.functional.wide_color.window_fp16_default_colorspace,Fail
 wayland-dEQP-EGL.functional.wide_color.window_8888_colorspace_srgb,Fail
 wayland-dEQP-EGL.functional.wide_color.window_888_colorspace_srgb,Fail
@@ -486,21 +489,6 @@ spec@!opengl 1.0@gl-1.0-drawbuffer-modes,Fail
 spec@!opengl 1.0@gl-1.0-edgeflag-const,Fail
 spec@!opengl 1.0@gl-1.0-edgeflag,Fail
 spec@!opengl 1.0@gl-1.0-edgeflag-quads,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_AND,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_AND_INVERTED,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_AND_REVERSE,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_CLEAR,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_COPY_INVERTED,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_EQUIV,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_INVERT,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_NAND,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_NOOP,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_NOR,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_OR,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_OR_INVERTED,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_OR_REVERSE,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_SET,Fail
-spec@!opengl 1.0@gl-1.0-logicop@GL_XOR,Fail
 spec@!opengl 1.0@gl-1.0-no-op-paths,Fail
 spec@!opengl 1.0@gl-1.0-ortho-pos,Fail
 spec@!opengl 1.0@gl-1.0-rastercolor,Fail
@@ -508,7 +496,6 @@ spec@!opengl 1.0@gl-1.0-scissor-bitmap,Fail
 spec@!opengl 1.0@gl-1.0-swapbuffers-behavior,Fail
 spec@!opengl 1.0@gl-1.0-user-clip-all-planes,Fail
 spec@!opengl 1.1@gl-1.1-xor-copypixels,Fail
-spec@!opengl 1.1@gl-1.1-xor,Fail
 spec@!opengl 1.1@line-flat-clip-color,Fail
 spec@!opengl 1.1@linestipple@Factor 2x,Fail
 spec@!opengl 1.1@linestipple@Factor 3x,Fail
@@ -542,7 +529,6 @@ spec@!opengl 1.1@polygon-mode-offset@config 6: Expected blue pixel in center,Fai
 spec@!opengl 1.1@polygon-mode-offset@config 6: Expected white pixel on right edge,Fail
 spec@!opengl 1.1@polygon-mode-offset@config 6: Expected white pixel on top edge,Fail
 spec@!opengl 1.1@polygon-mode-offset,Fail
-spec@!opengl 1.1@teximage-scale-bias,Fail
 spec@!opengl 1.1@texsubimage,Fail
 spec@!opengl 1.1@texsubimage-unpack,Fail
 spec@!opengl 1.1@user-clip,Fail
@@ -583,10 +569,6 @@ spec@!opengl 1.1@line-smooth-stipple,Fail
 
 # bookworm update
 spec@ext_framebuffer_multisample@renderbufferstorage-samples,Fail
-
-# remove this after https://gitlab.freedesktop.org/mesa/piglit/-/merge_requests/843
-# is merged and piglit is updated
-spec@glsl-1.10@execution@glsl-1.10-built-in-uniform-state,Fail
 
 x11-dEQP-EGL.functional.wide_color.pbuffer_888_colorspace_srgb,Fail
 x11-dEQP-EGL.functional.wide_color.window_888_colorspace_srgb,Fail
@@ -644,7 +626,6 @@ dEQP-GLES2.functional.texture.mipmap.2d.basic.linear_linear_mirror,Fail
 dEQP-GLES2.functional.fragment_ops.depth_stencil.stencil_ops.keep_decr_wrap_invert,Fail
 dEQP-GLES2.functional.fragment_ops.depth_stencil.stencil_ops.decr_wrap_keep_keep,Fail
 dEQP-GLES2.functional.texture.mipmap.2d.projected.nearest_nearest_repeat,Fail
-dEQP-GLES2.functional.texture.mipmap.cube.projected.nearest_linear,Fail
 dEQP-GLES2.functional.fragment_ops.depth_stencil.stencil_ops.decr_incr_decr_wrap,Fail
 dEQP-GLES2.functional.fragment_ops.depth_stencil.stencil_ops.invert_zero_incr_wrap,Fail
 dEQP-GLES2.functional.fragment_ops.depth_stencil.stencil_ops.replace_zero_decr,Fail

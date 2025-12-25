@@ -13,7 +13,7 @@ section_start angle "Building ANGLE"
 # setting up the environment variables locally
 ci_tag_build_time_check "ANGLE_TAG"
 
-ANGLE_REV="db71e8fa7c26d18f76d7b9e9474447b20f1c73b3"
+ANGLE_REV="2ed4b049c064add3109c7b1e0c954a0bce856df8"
 DEPOT_REV="5982a1aeb33dc36382ed8c62eddf52a6135e7dd3"
 
 # Set ANGLE_ARCH based on DEBIAN_ARCH if it hasn't been explicitly defined
@@ -107,6 +107,8 @@ case "$ANGLE_TARGET" in
   linux) cat >> out/Release/args.gn <<EOF
 angle_egl_extension="so.1"
 angle_glesv2_extension="so.2"
+clang_unsafe_buffers_paths=""
+clang_use_chrome_plugins=false
 use_custom_libcxx=false
 custom_toolchain="//build/toolchain/linux/unbundle:default"
 host_toolchain="//build/toolchain/linux/unbundle:default"
@@ -114,8 +116,7 @@ EOF
     ;;
   android) cat >> out/Release/args.gn <<EOF
 android_ndk_version="${ANDROID_NDK_VERSION}"
-android64_ndk_api_level=${ANDROID_SDK_VERSION}
-android32_ndk_api_level=${ANDROID_SDK_VERSION}
+android_ndk_api_level=${ANDROID_SDK_VERSION}
 use_custom_libcxx=true
 EOF
     ;;

@@ -1,3 +1,6 @@
+// Copyright 2020 Red Hat.
+// SPDX-License-Identifier: MIT
+
 use crate::api::icd::*;
 use crate::api::types::IdpAccelProps;
 use crate::api::util::*;
@@ -12,8 +15,8 @@ use rusticl_proc_macros::cl_entrypoint;
 use rusticl_proc_macros::cl_info_entrypoint;
 
 use std::cmp::min;
+use std::ffi::c_char;
 use std::ffi::CStr;
-use std::mem::size_of;
 use std::ptr;
 
 const SPIRV_SUPPORT_STRING: &CStr =
@@ -150,7 +153,13 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
                     )
                 })
             }
-
+            CL_DEVICE_KERNEL_CLOCK_CAPABILITIES_KHR if dev.kernel_clock_supported() => {
+                v.write::<cl_device_kernel_clock_capabilities_khr>(
+                    (CL_DEVICE_KERNEL_CLOCK_SCOPE_DEVICE_KHR
+                        | CL_DEVICE_KERNEL_CLOCK_SCOPE_SUB_GROUP_KHR)
+                        .into(),
+                )
+            }
             CL_DEVICE_LATEST_CONFORMANCE_VERSION_PASSED => {
                 v.write::<&CStr>(dev.screen().cl_cts_version())
             }
@@ -264,6 +273,23 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
                 (CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE).into(),
             ),
             CL_DEVICE_REFERENCE_COUNT => v.write::<cl_uint>(1),
+            CL_DEVICE_SEMAPHORE_EXPORT_HANDLE_TYPES_KHR
+                if dev.are_external_semaphores_supported() =>
+            {
+                v.write::<&[cl_external_semaphore_handle_type_khr]>(&[
+                    CL_SEMAPHORE_HANDLE_SYNC_FD_KHR,
+                ])
+            }
+            CL_DEVICE_SEMAPHORE_IMPORT_HANDLE_TYPES_KHR
+                if dev.are_external_semaphores_supported() =>
+            {
+                v.write::<&[cl_external_semaphore_handle_type_khr]>(&[
+                    CL_SEMAPHORE_HANDLE_SYNC_FD_KHR,
+                ])
+            }
+            CL_DEVICE_SEMAPHORE_TYPES_KHR if dev.are_semaphores_supported() => {
+                v.write::<&[cl_semaphore_type_khr]>(&[CL_SEMAPHORE_TYPE_BINARY_KHR])
+            }
             CL_DEVICE_SHARED_SYSTEM_MEM_CAPABILITIES_INTEL => {
                 v.write::<cl_device_unified_shared_memory_capabilities_intel>(0)
             }
@@ -273,6 +299,17 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_SINGLE_FP_CONFIG => v.write::<cl_device_fp_config>(
                 (CL_FP_ROUND_TO_NEAREST | CL_FP_INF_NAN) as cl_device_fp_config,
             ),
+            CL_DEVICE_SPIRV_CAPABILITIES_KHR => {
+                v.write_iter::<cl_uint>(dev.spirv_caps_vec.iter().map(|&cap| cap as _))
+            }
+            CL_DEVICE_SPIRV_EXTENDED_INSTRUCTION_SETS_KHR => {
+                // use static memory as we hand out pointers to the values here.
+                static instr_sets: [&CStr; 1] = [c"OpenCL.std"];
+                v.write_iter::<*const c_char>(instr_sets.iter().map(|str| str.as_ptr()))
+            }
+            CL_DEVICE_SPIRV_EXTENSIONS_KHR => {
+                v.write_iter::<*const c_char>(dev.spirv_extensions.iter().map(|str| str.as_ptr()))
+            }
             CL_DEVICE_SUB_GROUP_INDEPENDENT_FORWARD_PROGRESS => v.write::<bool>(false),
             CL_DEVICE_SUB_GROUP_SIZES_INTEL => {
                 if dev.subgroups_supported() {
@@ -282,16 +319,17 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
                 }
             }
             CL_DEVICE_SVM_CAPABILITIES | CL_DEVICE_SVM_CAPABILITIES_ARM => {
-                v.write::<cl_device_svm_capabilities>(
-                    if dev.svm_supported() {
-                        CL_DEVICE_SVM_COARSE_GRAIN_BUFFER
-                            | CL_DEVICE_SVM_FINE_GRAIN_BUFFER
-                            | CL_DEVICE_SVM_FINE_GRAIN_SYSTEM
-                    } else {
-                        0
-                    }
-                    .into(),
-                )
+                let mut caps = 0;
+
+                if dev.api_svm_supported() {
+                    caps |= CL_DEVICE_SVM_COARSE_GRAIN_BUFFER;
+                }
+
+                if dev.system_svm_supported() {
+                    caps |= CL_DEVICE_SVM_FINE_GRAIN_BUFFER | CL_DEVICE_SVM_FINE_GRAIN_SYSTEM;
+                }
+
+                v.write::<cl_device_svm_capabilities>(caps.into())
             }
             CL_DEVICE_TYPE => {
                 // CL_DEVICE_TYPE_DEFAULT ... will never be returned in CL_DEVICE_TYPE for any
@@ -372,12 +410,14 @@ fn get_device_ids(
 }
 
 #[cl_entrypoint(clRetainDevice)]
-fn retain_device(_device: cl_device_id) -> CLResult<()> {
+fn retain_device(device: cl_device_id) -> CLResult<()> {
+    let _ = Device::ref_from_raw(device)?;
     Ok(())
 }
 
 #[cl_entrypoint(clReleaseDevice)]
-fn release_device(_device: cl_device_id) -> CLResult<()> {
+fn release_device(device: cl_device_id) -> CLResult<()> {
+    let _ = Device::ref_from_raw(device)?;
     Ok(())
 }
 

@@ -968,6 +968,15 @@ elems=[
    ('exp', 0b1),
 ])
 
+F_UPCK_ELEM = field_enum_type(
+name='upck_elem', num_bits=2,
+elems=[
+   ('e0', 0b00),
+   ('e1', 0b01),
+   ('e2', 0b10),
+   ('e3', 0b11),
+])
+
 F_PCK_FORMAT = field_enum_type(
 name='pck_format', num_bits=5,
 elems=[
@@ -1221,7 +1230,7 @@ fields=[
    ('s0abs_sngl', (F_BOOL, ['s0abs_sngl'])),
 
    ## PCK/UPCK
-   ('upck_elem', (F_UINT2, ['upck_elem'])),
+   ('upck_elem', (F_UPCK_ELEM, ['upck_elem'])),
    ('scale_rtz', (F_BOOL, ['scale_rtz'])),
 
    ('prog', (F_BOOL, ['prog'])),
@@ -1811,8 +1820,8 @@ F_SBMODE = field_enum_type(
 name='sbmode', num_bits=2,
 elems=[
    ('none', 0b00),
-   ('data', 0b01),
-   ('info', 0b10),
+   ('rawdata', 0b01),
+   ('coeffs', 0b10),
    ('both', 0b11),
 ])
 
@@ -2523,30 +2532,7 @@ field_mappings=[
    ('f16', 'f16'),
    ('swap', 'swap'),
    ('cachemode_ld', 'cachemode_smp_ld'),
-   ('w', 'smp_w', 0),
-])
-
-I_SMP_EXTB_W = bit_struct(
-name='smp_extb_w',
-bit_set=I_BACKEND,
-field_mappings=[
-   ('backend_op', 'backend_op', 'dma'),
-
-   ('fcnorm', 'fcnorm'),
-   ('drc', 'drc'),
-   ('dma_op', 'dma_op', 'smp'),
-
-   ('extb', 'extb', 1),
-   ('dmn', 'dmn'),
-   ('exta', 'exta', 0),
-   ('chan', 'chan'),
-   ('lodm', 'lodm'),
-
-   ('rsvd3', 'rsvd3_smp'),
-   ('f16', 'f16'),
-   ('swap', 'swap'),
-   ('cachemode_st', 'cachemode_smp_st'),
-   ('w', 'smp_w', 1),
+   ('w', 'smp_w'),
 ])
 
 I_SMP_EXTAB = bit_struct(
@@ -2577,38 +2563,7 @@ field_mappings=[
    ('f16', 'f16'),
    ('swap', 'swap'),
    ('cachemode_ld', 'cachemode_smp_ld'),
-   ('w', 'smp_w', 0),
-])
-
-I_SMP_EXTAB_W = bit_struct(
-name='smp_extab_w',
-bit_set=I_BACKEND,
-field_mappings=[
-   ('backend_op', 'backend_op', 'dma'),
-
-   ('fcnorm', 'fcnorm'),
-   ('drc', 'drc'),
-   ('dma_op', 'dma_op', 'smp'),
-
-   ('extb', 'extb', 1),
-   ('dmn', 'dmn'),
-   ('exta', 'exta', 1),
-   ('chan', 'chan'),
-   ('lodm', 'lodm'),
-
-   ('pplod', 'pplod'),
-   ('proj', 'proj'),
-   ('sbmode', 'sbmode'),
-   ('nncoords', 'nncoords'),
-   ('sno', 'sno'),
-   ('soo', 'soo'),
-   ('tao', 'tao'),
-
-   ('rsvd3', 'rsvd3_smp'),
-   ('f16', 'f16'),
-   ('swap', 'swap'),
-   ('cachemode_st', 'cachemode_smp_st'),
-   ('w', 'smp_w', 1),
+   ('w', 'smp_w'),
 ])
 
 I_ATOMIC = bit_struct(

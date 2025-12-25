@@ -47,6 +47,7 @@ enum agx_dbg {
    AGX_DBG_NOSOFT = BITFIELD_BIT(19),
    AGX_DBG_FEEDBACK = BITFIELD_BIT(20),
    AGX_DBG_1QUEUE = BITFIELD_BIT(21),
+   AGX_DBG_NOMERGE = BITFIELD_BIT(22),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
@@ -67,6 +68,7 @@ struct nir_shader;
 struct agx_submit_virt {
    uint32_t extres_count;
    struct asahi_ccmd_submit_res *extres;
+   uint32_t ring_idx;
 };
 
 typedef struct {
@@ -133,7 +135,7 @@ struct agx_device {
     */
    uint64_t sparse_ro_offset;
 
-   struct agx_bo *zero_bo;
+   struct agx_bo *zero_bo, *scratch_bo;
 
    struct renderonly *ro;
 

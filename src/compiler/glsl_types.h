@@ -64,6 +64,8 @@ enum glsl_base_type {
    GLSL_TYPE_FLOAT,
    GLSL_TYPE_FLOAT16,
    GLSL_TYPE_BFLOAT16,
+   GLSL_TYPE_FLOAT_E4M3FN,
+   GLSL_TYPE_FLOAT_E5M2,
    GLSL_TYPE_DOUBLE,
    GLSL_TYPE_UINT8,
    GLSL_TYPE_INT8,
@@ -107,6 +109,8 @@ static unsigned glsl_base_type_bit_size(enum glsl_base_type type)
 
    case GLSL_TYPE_UINT8:
    case GLSL_TYPE_INT8:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
       return 8;
 
    case GLSL_TYPE_DOUBLE:
@@ -154,6 +158,16 @@ static inline bool glsl_base_type_is_integer(enum glsl_base_type type)
           type == GLSL_TYPE_IMAGE;
 }
 
+static inline bool glsl_base_type_is_float(enum glsl_base_type type)
+{
+   return type == GLSL_TYPE_FLOAT ||
+          type == GLSL_TYPE_FLOAT16 ||
+          type == GLSL_TYPE_BFLOAT16 ||
+          type == GLSL_TYPE_FLOAT_E4M3FN ||
+          type == GLSL_TYPE_FLOAT_E5M2 ||
+          type == GLSL_TYPE_DOUBLE;
+}
+
 static inline unsigned int
 glsl_base_type_get_bit_size(const enum glsl_base_type base_type)
 {
@@ -176,6 +190,8 @@ glsl_base_type_get_bit_size(const enum glsl_base_type base_type)
 
    case GLSL_TYPE_UINT8:
    case GLSL_TYPE_INT8:
+   case GLSL_TYPE_FLOAT_E4M3FN:
+   case GLSL_TYPE_FLOAT_E5M2:
       return 8;
 
    case GLSL_TYPE_DOUBLE:
@@ -187,7 +203,7 @@ glsl_base_type_get_bit_size(const enum glsl_base_type base_type)
       return 64;
 
    default:
-      unreachable("unknown base type");
+      UNREACHABLE("unknown base type");
    }
 
    return 0;
@@ -270,6 +286,13 @@ enum {
    GLSL_PRECISION_HIGH,
    GLSL_PRECISION_MEDIUM,
    GLSL_PRECISION_LOW
+};
+
+enum {
+   GLSL_PIXEL_LOCAL_STORAGE_NONE = 0,
+   GLSL_PIXEL_LOCAL_STORAGE_IN,
+   GLSL_PIXEL_LOCAL_STORAGE_OUT,
+   GLSL_PIXEL_LOCAL_STORAGE_INOUT
 };
 
 enum glsl_cmat_use {
@@ -451,6 +474,11 @@ struct glsl_struct_field {
          unsigned precision:2;
 
          /**
+          * Pixel local storage qualifier
+          */
+         unsigned pixel_local_storage:2;
+
+         /**
           * Memory qualifiers, applicable to buffer variables defined in shader
           * storage buffer objects (SSBOs)
           */
@@ -468,6 +496,12 @@ struct glsl_struct_field {
          unsigned explicit_xfb_buffer:1;
 
          unsigned implicit_sized_array:1;
+
+         /**
+          * For interface blocks, 1 if this variable is a per-primitive input or output
+          * (as in ir_variable::patch). 0 otherwise.
+          */
+         unsigned per_primitive:1;
       };
       unsigned flags;
    };
@@ -628,6 +662,18 @@ static inline bool
 glsl_type_is_bfloat_16(const glsl_type *t)
 {
    return t->base_type == GLSL_TYPE_BFLOAT16;
+}
+
+static inline bool
+glsl_type_is_e4m3fn(const glsl_type *t)
+{
+   return t->base_type == GLSL_TYPE_FLOAT_E4M3FN;
+}
+
+static inline bool
+glsl_type_is_e5m2(const glsl_type *t)
+{
+   return t->base_type == GLSL_TYPE_FLOAT_E5M2;
 }
 
 static inline bool
@@ -947,6 +993,8 @@ static inline const glsl_type *glsl_uint8_t_type(void) { return &glsl_type_built
 static inline const glsl_type *glsl_bool_type(void) { return &glsl_type_builtin_bool; }
 static inline const glsl_type *glsl_atomic_uint_type(void) { return &glsl_type_builtin_atomic_uint; }
 static inline const glsl_type *glsl_bfloat16_t_type(void) { return &glsl_type_builtin_bfloat16_t; }
+static inline const glsl_type *glsl_e4m3fn_t_type(void) { return &glsl_type_builtin_e4m3fn_t; }
+static inline const glsl_type *glsl_e5m2_t_type(void) { return &glsl_type_builtin_e5m2_t; }
 
 static inline const glsl_type *
 glsl_floatN_t_type(unsigned bit_size)
@@ -956,7 +1004,7 @@ glsl_floatN_t_type(unsigned bit_size)
    case 32: return &glsl_type_builtin_float;
    case 64: return &glsl_type_builtin_double;
    default:
-      unreachable("Unsupported bit size");
+      UNREACHABLE("Unsupported bit size");
    }
 }
 
@@ -966,7 +1014,7 @@ glsl_bfloatN_t_type(unsigned bit_size)
    switch (bit_size) {
    case 16: return &glsl_type_builtin_bfloat16_t;
    default:
-      unreachable("Unsupported bit size");
+      UNREACHABLE("Unsupported bit size");
    }
 }
 
@@ -979,7 +1027,7 @@ glsl_intN_t_type(unsigned bit_size)
    case 32: return &glsl_type_builtin_int;
    case 64: return &glsl_type_builtin_int64_t;
    default:
-      unreachable("Unsupported bit size");
+      UNREACHABLE("Unsupported bit size");
    }
 }
 
@@ -992,13 +1040,15 @@ glsl_uintN_t_type(unsigned bit_size)
    case 32: return &glsl_type_builtin_uint;
    case 64: return &glsl_type_builtin_uint64_t;
    default:
-      unreachable("Unsupported bit size");
+      UNREACHABLE("Unsupported bit size");
    }
 }
 
 const glsl_type *glsl_vec_type(unsigned components);
 const glsl_type *glsl_f16vec_type(unsigned components);
 const glsl_type *glsl_bf16vec_type(unsigned components);
+const glsl_type *glsl_e4m3fnvec_type(unsigned components);
+const glsl_type *glsl_e5m2vec_type(unsigned components);
 const glsl_type *glsl_dvec_type(unsigned components);
 const glsl_type *glsl_ivec_type(unsigned components);
 const glsl_type *glsl_uvec_type(unsigned components);

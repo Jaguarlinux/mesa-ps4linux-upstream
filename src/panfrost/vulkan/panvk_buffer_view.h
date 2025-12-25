@@ -20,13 +20,18 @@
 
 struct panvk_buffer_view {
    struct vk_buffer_view vk;
+
+#if PAN_ARCH < 9
    struct panvk_priv_mem mem;
+#endif
 
    struct {
+#if PAN_ARCH >= 9
+      struct mali_buffer_packed buf;
+#else
+      /* TODO: move Bifrost over to using BufferDescriptor as well. */
       struct mali_texture_packed tex;
 
-#if PAN_ARCH <= 7
-      /* Valhall passes a texture descriptor to the LEA_TEX instruction. */
       struct mali_attribute_buffer_packed img_attrib_buf[2];
 #endif
    } descs;

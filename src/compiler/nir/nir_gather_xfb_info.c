@@ -348,10 +348,14 @@ nir_gather_xfb_info_from_intrinsics(nir_shader *nir)
                out.component_mask =
                   BITFIELD_RANGE(index, xfb.out[index % 2].num_components);
                out.location = sem.location;
+               out.data_is_16bit = intr->src[0].ssa->bit_size == 16;
                out.high_16bits = sem.high_16bits;
+               out.mediump = sem.medium_precision;
+               out.mediump_upconvert_type = nir_intrinsic_src_type(intr) &
+                                            (nir_type_float | nir_type_int | nir_type_uint);
                out.buffer = xfb.out[index % 2].buffer;
                out.offset = (uint32_t)xfb.out[index % 2].offset * 4;
-               util_dynarray_append(&array, nir_xfb_output_info, out);
+               util_dynarray_append(&array, out);
 
                uint8_t stream = (sem.gs_streams >> (i * 2)) & 0x3;
                buffer_to_stream[out.buffer] = stream;
@@ -387,7 +391,10 @@ nir_gather_xfb_info_from_intrinsics(nir_shader *nir)
               j < count &&
               cur->buffer == outputs[j].buffer &&
               cur->location == outputs[j].location &&
-              cur->high_16bits == outputs[j].high_16bits;
+              cur->data_is_16bit == outputs[j].data_is_16bit &&
+              cur->high_16bits == outputs[j].high_16bits &&
+              cur->mediump == outputs[j].mediump &&
+              cur->mediump_upconvert_type == outputs[j].mediump_upconvert_type;
               j++) {
             if (outputs[j].component_mask &&
                 outputs[j].offset - outputs[j].component_offset * 4 ==
@@ -497,12 +504,19 @@ nir_print_xfb_info(nir_xfb_info *info, FILE *fp)
    fprintf(fp, "output_count: %u\n", info->output_count);
 
    for (unsigned i = 0; i < info->output_count; i++) {
-      fprintf(fp, "output%u: buffer=%u, offset=%u, location=%u, high_16bits=%u, "
+      nir_alu_type type = info->outputs[i].mediump_upconvert_type;
+      fprintf(fp, "output%u: buffer=%u, offset=%u, location=%u, data_is_16bit=%u, "
+                  "high_16bits=%u, mediump=%u, upconvert=%s, "
                   "component_offset=%u, component_mask=0x%x\n",
               i, info->outputs[i].buffer,
               info->outputs[i].offset,
               info->outputs[i].location,
+              info->outputs[i].data_is_16bit,
               info->outputs[i].high_16bits,
+              info->outputs[i].mediump,
+              type == nir_type_float ? "float" :
+                  type == nir_type_int ? "int" :
+                  type == nir_type_uint ? "uint" : "none",
               info->outputs[i].component_offset,
               info->outputs[i].component_mask);
    }

@@ -31,10 +31,6 @@
 
 #include "vk_standard_sample_locations.h"
 
-#if GFX_VERx10 >= 125 && ANV_SUPPORT_RT_GRL
-#include "grl/genX_grl.h"
-#endif
-
 #include "genX_mi_builder.h"
 
 #include "vk_util.h"
@@ -110,7 +106,7 @@ genX(emit_slice_hashing_state)(struct anv_device *device,
       else if (ppipes_of[2] == 1 && ppipes_of[1] == 1 && ppipes_of[0] == 1)
          intel_compute_pixel_hash_table_3way(8, 16, 3, 3, 0, p.ThreeWayTableEntry[0]);
       else
-         unreachable("Illegal fusing.");
+         UNREACHABLE("Illegal fusing.");
    }
 
    anv_batch_emit(batch, GENX(3DSTATE_3D_MODE), p) {
@@ -204,7 +200,14 @@ init_common_queue_state(struct anv_queue *queue, struct anv_batch *batch)
     */
    const struct intel_l3_config *cfg = intel_get_default_l3_config(device->info);
    genX(emit_l3_config)(batch, device, cfg);
-   device->l3_config = cfg;
+   device->l3_config = device->l3_slm_config = cfg;
+#else
+   device->l3_config = intel_get_l3_config(
+      device->info,
+      intel_get_default_l3_weights(device->info, true, false /* slm */));
+   device->l3_slm_config = intel_get_l3_config(
+      device->info,
+      intel_get_default_l3_weights(device->info, true, true /* slm */));
 #endif
 
 #if GFX_VERx10 == 125
@@ -282,10 +285,12 @@ init_common_queue_state(struct anv_queue *queue, struct anv_batch *batch)
       sba.IndirectObjectBufferSizeModifyEnable = true;
 
       sba.InstructionBaseAddress =
-         (struct anv_address) { .offset =
-         device->physical->va.instruction_state_pool.addr,
-      };
-      sba.InstructionBufferSize = device->physical->va.instruction_state_pool.size / 4096;
+         (struct anv_address) {
+            .offset = device->physical->va.instruction_state_pool.addr,
+         };
+      sba.InstructionBufferSize =
+         device->physical->va.instruction_state_pool.size / 4096;
+
       sba.InstructionMOCS = mocs;
       sba.InstructionBaseAddressModifyEnable = true;
       sba.InstructionBuffersizeModifyEnable = true;
@@ -374,6 +379,12 @@ init_common_queue_state(struct anv_queue *queue, struct anv_batch *batch)
       }
    }
 #endif
+
+   /* Always use Thread Group Preemption granularity level for Media/GPGPU */
+   anv_batch_write_reg(batch, GENX(CS_CHICKEN1), cc1) {
+      cc1.MediaAndGPGPUPreemptionControl = ThreadGroupPreemption;
+      cc1.MediaAndGPGPUPreemptionControlMask = 0x3;
+   }
 
    state_system_mem_fence_address_emit(device, batch);
 }
@@ -504,9 +515,24 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
     * corruption.
     */
    anv_batch_write_reg(batch, GENX(CS_CHICKEN1), cc1) {
+#if GFX_VERx10 < 200
       cc1.ReplayMode = MidcmdbufferPreemption;
       cc1.ReplayModeMask = true;
+#endif
+#if GFX_VERx10 == 120
+      cc1.DisablePreemptionandHighPriorityPausingdueto3DPRIMITIVECommand = true;
+      cc1.DisablePreemptionandHighPriorityPausingdueto3DPRIMITIVECommandMask = true;
+#endif
    }
+
+#if GFX_VER == 20
+   if (intel_device_info_is_bmg_g31(devinfo)) {
+      anv_batch_write_reg(batch, GENX(CACHE_MODE_0), cm0) {
+         cm0.MsaaFastClearEnabled = true;
+         cm0.MsaaFastClearEnabledMask = true;
+      }
+   }
+#endif
 
 #if INTEL_NEEDS_WA_1806527549
    /* Wa_1806527549 says to disable the following HiZ optimization when the
@@ -635,11 +661,12 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
 #if GFX_VERx10 >= 125
    anv_batch_emit(batch, GENX(STATE_COMPUTE_MODE), cm) {
 #if GFX_VER >= 30
-      cm.EnableVariableRegisterSizeAllocation = true;
+      cm.EnableVariableRegisterSizeAllocation = !INTEL_DEBUG(DEBUG_NO_VRT);
 #endif
       cm.Mask1 = 0xffff;
 #if GFX_VERx10 >= 200
       cm.Mask2 = 0xffff;
+      cm.UAVCoherencyMode = FlushDataportL1;
 #endif
    }
    anv_batch_emit(batch, GENX(3DSTATE_MESH_CONTROL), zero);
@@ -773,7 +800,7 @@ init_compute_queue_state(struct anv_queue *queue)
    anv_batch_emit(batch, GENX(STATE_COMPUTE_MODE), cm) {
 #if GFX_VER >= 30
       cm.EnableVariableRegisterSizeAllocationMask = 1;
-      cm.EnableVariableRegisterSizeAllocation = true;
+      cm.EnableVariableRegisterSizeAllocation = !INTEL_DEBUG(DEBUG_NO_VRT);
 #endif
 #if GFX_VER >= 20
       cm.AsyncComputeThreadLimit = ACTL_Max8;
@@ -782,6 +809,8 @@ init_compute_queue_state(struct anv_queue *queue)
       cm.AsyncComputeThreadLimitMask = 0x7;
       cm.ZPassAsyncComputeThreadLimitMask = 0x7;
       cm.ZAsyncThrottlesettingsMask = 0x3;
+      cm.Mask2 = 0xffff;
+      cm.UAVCoherencyMode = FlushDataportL1;
 #else
       cm.PixelAsyncComputeThreadLimit = PACTL_Max24;
       cm.ZPassAsyncComputeThreadLimit = ZPACTL_Max60;
@@ -895,34 +924,20 @@ genX(init_physical_device_state)(ASSERTED struct anv_physical_device *pdevice)
    assert(pdevice->info.verx10 == GFX_VERx10);
 
 #if GFX_VERx10 >= 125 && ANV_SUPPORT_RT
-#if ANV_SUPPORT_RT_GRL
-   genX(grl_load_rt_uuid)(pdevice->rt_uuid);
-   pdevice->max_grl_scratch_size = genX(grl_max_scratch_size)();
-#else
    STATIC_ASSERT(sizeof(ANV_RT_UUID_MACRO) == VK_UUID_SIZE);
    memcpy(pdevice->rt_uuid, ANV_RT_UUID_MACRO, VK_UUID_SIZE);
-#endif
 #endif
 
    pdevice->cmd_emit_timestamp = genX(cmd_emit_timestamp);
    pdevice->cmd_capture_data = genX(cmd_capture_data);
 
    pdevice->gpgpu_pipeline_value = GPGPU;
-
-   struct GENX(VERTEX_ELEMENT_STATE) empty_ve = {
-      .Valid = true,
-      .Component0Control = VFCOMP_STORE_0,
-      .Component1Control = VFCOMP_STORE_0,
-      .Component2Control = VFCOMP_STORE_0,
-      .Component3Control = VFCOMP_STORE_0,
-   };
-   GENX(VERTEX_ELEMENT_STATE_pack)(NULL, pdevice->empty_vs_input, &empty_ve);
 }
 
 VkResult
 genX(init_device_state)(struct anv_device *device)
 {
-   VkResult res;
+   VkResult res = VK_SUCCESS;
 
    device->slice_hash = (struct anv_state) { 0 };
    for (uint32_t i = 0; i < device->queue_count; i++) {
@@ -1071,7 +1086,7 @@ genX(emit_l3_config)(struct anv_batch *batch,
 #if GFX_VER >= 12
          l3cr.L3FullWayAllocationEnable = true;
 #else
-         unreachable("Invalid L3$ config");
+         UNREACHABLE("Invalid L3$ config");
 #endif
       } else {
 #if GFX_VER < 11
@@ -1128,11 +1143,11 @@ genX(emit_sample_pattern)(struct anv_batch *batch,
       for (uint32_t i = 1; i <= 16; i *= 2) {
          switch (i) {
          case VK_SAMPLE_COUNT_1_BIT:
-            if (sl && sl->per_pixel == i) {
-               INTEL_SAMPLE_POS_1X_ARRAY(sp._1xSample, sl->locations);
-            } else {
-               INTEL_SAMPLE_POS_1X(sp._1xSample);
-            }
+            /* We don't do 1x MSAA, and we can't support custom sample
+             * positions without MSAA, so always program the default for this
+             * case.
+             */
+            INTEL_SAMPLE_POS_1X(sp._1xSample);
             break;
          case VK_SAMPLE_COUNT_2_BIT:
             if (sl && sl->per_pixel == i) {
@@ -1163,7 +1178,7 @@ genX(emit_sample_pattern)(struct anv_batch *batch,
             }
             break;
          default:
-            unreachable("Invalid sample count");
+            UNREACHABLE("Invalid sample count");
          }
       }
    }
@@ -1174,7 +1189,7 @@ vk_to_intel_tex_filter(VkFilter filter, bool anisotropyEnable)
 {
    switch (filter) {
    default:
-      unreachable("Invalid filter");
+      UNREACHABLE("Invalid filter");
    case VK_FILTER_NEAREST:
       return anisotropyEnable ?
 #if GFX_VER >= 30
@@ -1279,21 +1294,21 @@ VkResult genX(CreateSampler)(
                                  OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT);
          if (opaque_info) {
             uint32_t alloc_idx = *((const uint32_t *)opaque_info->opaqueCaptureDescriptorData);
-            sampler->custom_border_color =
+            sampler->custom_border_color_state =
                anv_state_reserved_array_pool_alloc_index(&device->custom_border_colors, alloc_idx);
          } else {
-            sampler->custom_border_color =
+            sampler->custom_border_color_state =
                anv_state_reserved_array_pool_alloc(&device->custom_border_colors, true);
          }
       } else {
-         sampler->custom_border_color =
+         sampler->custom_border_color_state =
             anv_state_reserved_array_pool_alloc(&device->custom_border_colors, false);
       }
-      if (sampler->custom_border_color.alloc_size == 0)
+      if (sampler->custom_border_color_state.alloc_size == 0)
          return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-      border_color_offset = sampler->custom_border_color.offset;
-      border_color_ptr = sampler->custom_border_color.map;
+      border_color_offset = sampler->custom_border_color_state.offset;
+      border_color_ptr = sampler->custom_border_color_state.map;
 
       union isl_color_value color = { .u32 = {
          sampler->vk.border_color_value.uint32[0],
@@ -1319,9 +1334,6 @@ VkResult genX(CreateSampler)(
 
    const bool seamless_cube =
       !(pCreateInfo->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT);
-
-   struct mesa_sha1 ctx;
-   _mesa_sha1_init(&ctx);
 
    for (unsigned p = 0; p < sampler->n_planes; p++) {
       const bool plane_has_chroma =
@@ -1405,7 +1417,6 @@ VkResult genX(CreateSampler)(
        * use it to store into the shader cache and also for hashing.
        */
       GENX(SAMPLER_STATE_pack)(NULL, sampler->state_no_bc[p], &sampler_state);
-      _mesa_sha1_update(&ctx, sampler->state_no_bc[p], sizeof(sampler->state_no_bc[p]));
 
       /* Put border color after the hashing, we don't want the allocation
        * order of border colors to influence the hash. We just need th
@@ -1414,6 +1425,13 @@ VkResult genX(CreateSampler)(
       sampler_state.BorderColorPointer = border_color_offset;
       GENX(SAMPLER_STATE_pack)(NULL, sampler->state[p], &sampler_state);
    }
+
+   memcpy(sampler->embedded_key.sampler,
+          sampler->state_no_bc[0],
+          sizeof(sampler->embedded_key.sampler));
+   memcpy(sampler->embedded_key.color,
+          sampler->vk.border_color_value.uint32,
+          sizeof(sampler->embedded_key.color));
 
    /* If we have bindless, allocate enough samplers.  We allocate 32 bytes
     * for each sampler instead of 16 bytes because we want all bindless
@@ -1427,12 +1445,6 @@ VkResult genX(CreateSampler)(
       memcpy(sampler->bindless_state.map, sampler->state,
              sampler->n_planes * GENX(SAMPLER_STATE_length) * 4);
    }
-
-   /* Hash the border color */
-   _mesa_sha1_update(&ctx, border_color_ptr,
-                     sizeof(union isl_color_value));
-
-   _mesa_sha1_final(&ctx, sampler->sha1);
 
    *pSampler = anv_sampler_to_handle(sampler);
 

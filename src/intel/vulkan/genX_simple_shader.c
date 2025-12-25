@@ -30,6 +30,7 @@
 
 #include "genxml/gen_macros.h"
 #include "genxml/genX_pack.h"
+#include "common/intel_common.h"
 #include "common/intel_compute_slm.h"
 #include "common/intel_genX_state_brw.h"
 
@@ -115,17 +116,23 @@ genX(emit_simpler_shader_init_fragment)(struct anv_simple_shader *state)
     * allocate space for the VS.  Even though one isn't run, we need VUEs to
     * store the data that VF is going to pass to SOL.
     */
-   struct intel_urb_config urb_cfg_out = {
+   struct intel_urb_config urb_cfg = {
       .size = { DIV_ROUND_UP(32, 64), 1, 1, 1 },
    };
 
-   genX(emit_l3_config)(batch, device, state->l3_config);
-   state->cmd_buffer->state.current_l3_config = state->l3_config;
+   genX(emit_l3_config)(batch, device, device->l3_config);
+   state->cmd_buffer->state.current_l3_config = device->l3_config;
 
-   enum intel_urb_deref_block_size deref_block_size;
-   genX(emit_urb_setup)(device, batch, state->l3_config,
-                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                        state->urb_cfg, &urb_cfg_out, &deref_block_size);
+   bool constrained;
+   intel_get_urb_config(device->info, device->l3_config, false, false,
+                        &urb_cfg, &constrained);
+
+   if (genX(need_wa_16014912113)(&state->cmd_buffer->state.gfx.urb_cfg,
+                                 &urb_cfg)) {
+      genX(batch_emit_wa_16014912113)(
+         batch, &state->cmd_buffer->state.gfx.urb_cfg);
+   }
+   genX(emit_urb_setup)(batch, device, &urb_cfg);
 
    anv_batch_emit(batch, GENX(3DSTATE_PS_BLEND), ps_blend) {
       ps_blend.HasWriteableRT = true;
@@ -168,7 +175,7 @@ genX(emit_simpler_shader_init_fragment)(struct anv_simple_shader *state)
 
    anv_batch_emit(batch, GENX(3DSTATE_SF), sf) {
 #if GFX_VER >= 12
-      sf.DerefBlockSize = deref_block_size;
+      sf.DerefBlockSize = urb_cfg.deref_block_size;
 #endif
    }
 
@@ -339,45 +346,45 @@ genX(emit_simpler_shader_init_fragment)(struct anv_simple_shader *state)
    struct anv_gfx_dynamic_state *hw_state =
       &state->cmd_buffer->state.gfx.dyn_state;
 
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_URB);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF_STATISTICS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF_TOPOLOGY);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VERTEX_INPUT);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF_SGVS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_URB);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VF_STATISTICS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VF);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VF_TOPOLOGY);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VERTEX_INPUT);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VF_SGVS);
 #if GFX_VER >= 11
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VF_SGVS_2);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VF_SGVS_2);
 #endif
 #if GFX_VER >= 12
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_PRIMITIVE_REPLICATION);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_PRIMITIVE_REPLICATION);
 #endif
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_STREAMOUT);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VIEWPORT_CC);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_CLIP);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_RASTER);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_SAMPLE_MASK);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_MULTISAMPLE);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_DEPTH_BOUNDS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_WM);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_WM_DEPTH_STENCIL);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_SF);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_SBE);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_VS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_HS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_DS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_TE);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_GS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_PS);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_PS_EXTRA);
-   BITSET_SET(hw_state->dirty, ANV_GFX_STATE_PS_BLEND);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_STREAMOUT);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VIEWPORT_CC);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_CLIP);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_RASTER);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_SAMPLE_MASK);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_MULTISAMPLE);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_DEPTH_BOUNDS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_WM);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_WM_DEPTH_STENCIL);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_SF);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_SBE);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_VS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_HS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_DS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_TE);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_GS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_PS);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_PS_EXTRA);
+   BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_PS_BLEND);
    if (device->vk.enabled_extensions.EXT_mesh_shader) {
-      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_MESH_CONTROL);
-      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_TASK_CONTROL);
+      BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_MESH_CONTROL);
+      BITSET_SET(hw_state->emit_dirty, ANV_GFX_STATE_TASK_CONTROL);
    }
 
    /* Update urb config after simple shader. */
-   memcpy(&state->cmd_buffer->state.gfx.urb_cfg, &urb_cfg_out,
-          sizeof(struct intel_urb_config));
+   memcpy(&state->cmd_buffer->state.gfx.urb_cfg, &urb_cfg,
+          sizeof(urb_cfg));
 
    state->cmd_buffer->state.gfx.vb_dirty = BITFIELD_BIT(0);
    state->cmd_buffer->state.gfx.dirty |= ~(ANV_CMD_DIRTY_INDEX_BUFFER |
@@ -395,7 +402,7 @@ genX(emit_simpler_shader_init_compute)(struct anv_simple_shader *state)
           state->cmd_buffer->state.current_pipeline == GPGPU);
 
 #if GFX_VERx10 >= 125
-   struct anv_shader_bin *cs_bin = state->kernel;
+   struct anv_shader_internal *cs_bin = state->kernel;
    const struct brw_cs_prog_data *prog_data =
       (const struct brw_cs_prog_data *) cs_bin->prog_data;
    /* Currently our simple shaders are simple enough that they never spill. */
@@ -585,6 +592,39 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
          brw_cs_get_dispatch_info(devinfo, prog_data, NULL);
 
 #if GFX_VERx10 >= 125
+
+/* Not need with VRT enabled */
+#if GFX_VERx10 < 300
+      uint8_t pixel_async_compute_thread_limit, z_pass_async_compute_thread_limit,
+              np_z_async_throttle_settings;
+      bool slm_or_barrier_enabled = prog_data->base.total_shared != 0 || prog_data->uses_barrier;
+
+      intel_compute_engine_async_threads_limit(devinfo, dispatch.threads,
+                                               slm_or_barrier_enabled,
+                                               &pixel_async_compute_thread_limit,
+                                               &z_pass_async_compute_thread_limit,
+                                               &np_z_async_throttle_settings);
+      anv_batch_emit(batch, GENX(STATE_COMPUTE_MODE), cm) {
+   #if GFX_VER >= 20
+         cm.AsyncComputeThreadLimit = pixel_async_compute_thread_limit;
+         cm.ZPassAsyncComputeThreadLimit = z_pass_async_compute_thread_limit;
+         cm.ZAsyncThrottlesettings = np_z_async_throttle_settings;
+         cm.AsyncComputeThreadLimitMask = 0x7;
+         cm.ZPassAsyncComputeThreadLimitMask = 0x7;
+         cm.ZAsyncThrottlesettingsMask = 0x3;
+   #else
+         cm.PixelAsyncComputeThreadLimit = pixel_async_compute_thread_limit;
+         cm.ZPassAsyncComputeThreadLimit = z_pass_async_compute_thread_limit;
+         cm.PixelAsyncComputeThreadLimitMask = 0x7;
+         cm.ZPassAsyncComputeThreadLimitMask = 0x7;
+         if (intel_device_info_is_mtl_or_arl(devinfo)) {
+            cm.ZAsyncThrottlesettings = np_z_async_throttle_settings;
+            cm.ZAsyncThrottlesettingsMask = 0x3;
+         }
+   #endif
+      }
+#endif /* GFX_VERx10 < 300 */
+
       struct GENX(COMPUTE_WALKER_BODY) body = {
          .SIMDSize                       = dispatch.simd_size / 16,
          .MessageSIMD                    = dispatch.simd_size / 16,
@@ -613,6 +653,7 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
             .BindingTablePointer               = 0,
             .BindingTableEntryCount            = 0,
             .NumberofThreadsinGPGPUThreadGroup = dispatch.threads,
+            .ThreadGroupDispatchSize           = intel_compute_threads_group_dispatch_size(dispatch.threads),
             .SharedLocalMemorySize             = intel_compute_slm_encode_size(GFX_VER,
                                                                                prog_data->base.total_shared),
             .NumberOfBarriers                  = prog_data->uses_barrier,
@@ -625,9 +666,22 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
       anv_batch_emit(batch, GENX(COMPUTE_WALKER), cw) {
          cw.body = body;
       }
+
+      if (state->cmd_buffer) {
+         genX(cmd_buffer_post_dispatch_wa)(state->cmd_buffer);
+      } else {
+         /* TODO: switch to use INTEL_NEEDS_WA_14025112257 */
+         if (device->info->ver >= 20 &&
+             batch->engine_class == INTEL_ENGINE_CLASS_COMPUTE) {
+            genX(batch_emit_pipe_control)(batch, devinfo, GPGPU,
+                                          ANV_PIPE_STATE_CACHE_INVALIDATE_BIT,
+                                          "Wa_14025112257");
+         }
+      }
+
 #else /* GFX_VERx10 < 125 */
       const uint32_t vfe_curbe_allocation =
-         ALIGN(prog_data->push.per_thread.regs * dispatch.threads +
+         align(prog_data->push.per_thread.regs * dispatch.threads +
                prog_data->push.cross_thread.regs, 2);
 
       /* From the Sky Lake PRM Vol 2a, MEDIA_VFE_STATE:
@@ -638,15 +692,9 @@ genX(emit_simple_shader_dispatch)(struct anv_simple_shader *state,
        *     these scoreboard related states, a MEDIA_STATE_FLUSH is
        *     sufficient."
        */
-      enum anv_pipe_bits emitted_bits = 0;
-      genX(emit_apply_pipe_flushes)(batch, device, GPGPU, ANV_PIPE_CS_STALL_BIT,
-                                    &emitted_bits);
-
-      /* If we have a command buffer allocated with the emission, update the
-       * pending bits.
-       */
-      if (state->cmd_buffer)
-         anv_cmd_buffer_update_pending_query_bits(state->cmd_buffer, emitted_bits);
+      genX(batch_emit_pipe_control)(batch, devinfo, GPGPU,
+                                    ANV_PIPE_CS_STALL_BIT,
+                                    "pre MEDIA_VFE_STATE");
 
       anv_batch_emit(batch, GENX(MEDIA_VFE_STATE), vfe) {
          vfe.StackSize              = 0;

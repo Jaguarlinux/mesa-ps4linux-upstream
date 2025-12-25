@@ -8,7 +8,6 @@
 #include "ac_surface.h"
 
 #include "radv_meta.h"
-#include "vk_common_entrypoints.h"
 
 static VkResult
 get_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
@@ -111,6 +110,7 @@ radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
 {
    struct radv_meta_saved_state saved_state;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
    VkPipelineLayout layout;
    VkPipeline pipeline;
    VkResult result;
@@ -136,7 +136,7 @@ radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
 
    const uint64_t va = image->bindings[0].addr;
 
-   radv_cs_add_buffer(device->ws, cmd_buffer->cs, image->bindings[0].bo);
+   radv_cs_add_buffer(device->ws, cs->b, image->bindings[0].bo);
 
    radv_meta_bind_descriptors(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 2,
                               (VkDescriptorGetInfoEXT[]){
@@ -176,8 +176,17 @@ radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
       image->planes[0].surface.u.gfx9.color.display_dcc_pitch_max + 1,
       image->planes[0].surface.u.gfx9.color.display_dcc_height,
    };
-   vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16,
-                              constants);
+
+   const VkPushConstantsInfoKHR pc_info = {
+      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+      .layout = layout,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .offset = 0,
+      .size = sizeof(constants),
+      .pValues = constants,
+   };
+
+   radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
 
    radv_unaligned_dispatch(cmd_buffer, dcc_width, dcc_height, 1);
 

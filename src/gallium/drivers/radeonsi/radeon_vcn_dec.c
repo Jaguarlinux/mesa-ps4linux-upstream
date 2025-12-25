@@ -13,7 +13,6 @@
 #include "util/u_memory.h"
 #include "util/u_video.h"
 #include "util/vl_zscan_data.h"
-#include "vl/vl_probs_table.h"
 #include "pspdecryptionparam.h"
 #include "cencdecryptionparam.h"
 
@@ -77,10 +76,16 @@ static rvcn_dec_message_avc_t get_h264_msg(struct radeon_decoder *dec,
    result.level = dec->base.level;
 
    result.sps_info_flags = 0;
-   result.sps_info_flags |= pic->pps->sps->direct_8x8_inference_flag << 0;
-   result.sps_info_flags |= pic->pps->sps->mb_adaptive_frame_field_flag << 1;
-   result.sps_info_flags |= pic->pps->sps->frame_mbs_only_flag << 2;
-   result.sps_info_flags |= pic->pps->sps->delta_pic_order_always_zero_flag << 3;
+   result.sps_info_flags |= pic->pps->sps->direct_8x8_inference_flag
+                            << RDECODE_SPS_INFO_H264_DIRECT_8X8_INFERENCE_FLAG_SHIFT;
+   result.sps_info_flags |= pic->pps->sps->mb_adaptive_frame_field_flag
+                            << RDECODE_SPS_INFO_H264_MB_ADAPTIVE_FRAME_FIELD_FLAG_SHIFT;
+   result.sps_info_flags |= pic->pps->sps->frame_mbs_only_flag
+                            << RDECODE_SPS_INFO_H264_FRAME_MBS_ONLY_FLAG_SHIFT;
+   result.sps_info_flags |= pic->pps->sps->delta_pic_order_always_zero_flag
+                            << RDECODE_SPS_INFO_H264_DELTA_PIC_ORDER_ALWAYS_ZERO_FLAG_SHIFT;
+   result.sps_info_flags |= pic->pps->sps->gaps_in_frame_num_value_allowed_flag
+                            << RDECODE_SPS_INFO_H264_GAPS_IN_FRAME_NUM_VALUE_ALLOWED_FLAG_SHIFT;
    result.sps_info_flags |= ((dec->dpb_type >= DPB_DYNAMIC_TIER_2) ? 0 : 1)
                               << RDECODE_SPS_INFO_H264_EXTENSION_SUPPORT_FLAG_SHIFT;
 
@@ -259,8 +264,6 @@ static rvcn_dec_message_hevc_t get_h265_msg(struct radeon_decoder *dec,
    result.sps_info_flags |= pic->pps->sps->sps_temporal_mvp_enabled_flag << 6;
    result.sps_info_flags |= pic->pps->sps->strong_intra_smoothing_enabled_flag << 7;
    result.sps_info_flags |= pic->pps->sps->separate_colour_plane_flag << 8;
-   if (((struct si_screen *)dec->screen)->info.family == CHIP_CARRIZO)
-      result.sps_info_flags |= 1 << 9;
    if (pic->NumShortTermPictureSliceHeaderBits != 0) {
       result.sps_info_flags |= 1 << 11;
       result.st_rps_bits = pic->NumShortTermPictureSliceHeaderBits;
@@ -420,33 +423,6 @@ static rvcn_dec_message_hevc_t get_h265_msg(struct radeon_decoder *dec,
    return result;
 }
 
-static void fill_probs_table(void *ptr)
-{
-   rvcn_dec_vp9_probs_t *probs = (rvcn_dec_vp9_probs_t *)ptr;
-
-   memcpy(&probs->coef_probs[0], default_coef_probs_4x4, sizeof(default_coef_probs_4x4));
-   memcpy(&probs->coef_probs[1], default_coef_probs_8x8, sizeof(default_coef_probs_8x8));
-   memcpy(&probs->coef_probs[2], default_coef_probs_16x16, sizeof(default_coef_probs_16x16));
-   memcpy(&probs->coef_probs[3], default_coef_probs_32x32, sizeof(default_coef_probs_32x32));
-   memcpy(probs->y_mode_prob, default_if_y_probs, sizeof(default_if_y_probs));
-   memcpy(probs->uv_mode_prob, default_if_uv_probs, sizeof(default_if_uv_probs));
-   memcpy(probs->single_ref_prob, default_single_ref_p, sizeof(default_single_ref_p));
-   memcpy(probs->switchable_interp_prob, default_switchable_interp_prob,
-          sizeof(default_switchable_interp_prob));
-   memcpy(probs->partition_prob, default_partition_probs, sizeof(default_partition_probs));
-   memcpy(probs->inter_mode_probs, default_inter_mode_probs, sizeof(default_inter_mode_probs));
-   memcpy(probs->mbskip_probs, default_skip_probs, sizeof(default_skip_probs));
-   memcpy(probs->intra_inter_prob, default_intra_inter_p, sizeof(default_intra_inter_p));
-   memcpy(probs->comp_inter_prob, default_comp_inter_p, sizeof(default_comp_inter_p));
-   memcpy(probs->comp_ref_prob, default_comp_ref_p, sizeof(default_comp_ref_p));
-   memcpy(probs->tx_probs_32x32, default_tx_probs_32x32, sizeof(default_tx_probs_32x32));
-   memcpy(probs->tx_probs_16x16, default_tx_probs_16x16, sizeof(default_tx_probs_16x16));
-   memcpy(probs->tx_probs_8x8, default_tx_probs_8x8, sizeof(default_tx_probs_8x8));
-   memcpy(probs->mv_joints, default_nmv_joints, sizeof(default_nmv_joints));
-   memcpy(&probs->mv_comps[0], default_nmv_components, sizeof(default_nmv_components));
-   memset(&probs->nmvc_mask, 0, sizeof(rvcn_dec_vp9_nmv_ctx_mask_t));
-}
-
 static rvcn_dec_message_vp9_t get_vp9_msg(struct radeon_decoder *dec,
                                           struct pipe_video_buffer *target,
                                           struct pipe_vp9_picture_desc *pic)
@@ -518,6 +494,10 @@ static rvcn_dec_message_vp9_t get_vp9_msg(struct radeon_decoder *dec,
                                  << RDECODE_FRAME_HDR_INFO_VP9_SEGMENTATION_TEMPORAL_UPDATE_SHIFT) &
                                 RDECODE_FRAME_HDR_INFO_VP9_SEGMENTATION_TEMPORAL_UPDATE_MASK;
 
+   result.frame_header_flags |= (pic->picture_parameter.pic_fields.segmentation_update_data
+                                 << RDECODE_FRAME_HDR_INFO_VP9_SEGMENTATION_UPDATE_DATA_SHIFT) &
+                                RDECODE_FRAME_HDR_INFO_VP9_SEGMENTATION_UPDATE_DATA_MASK;
+
    result.frame_header_flags |= (pic->picture_parameter.mode_ref_delta_enabled
                                  << RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_ENABLED_SHIFT) &
                                 RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_ENABLED_MASK;
@@ -526,12 +506,9 @@ static rvcn_dec_message_vp9_t get_vp9_msg(struct radeon_decoder *dec,
                                  << RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_UPDATE_SHIFT) &
                                 RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_UPDATE_MASK;
 
-   result.frame_header_flags |=
-      ((dec->show_frame && !pic->picture_parameter.pic_fields.error_resilient_mode &&
-        dec->last_width == dec->base.width && dec->last_height == dec->base.height)
-       << RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_SHIFT) &
-      RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_MASK;
-   dec->show_frame = pic->picture_parameter.pic_fields.show_frame;
+   result.frame_header_flags |= (pic->picture_parameter.pic_fields.use_prev_frame_mvs
+                                 << RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_SHIFT) &
+                                RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_MASK;
 
    result.frame_header_flags |=  (1 << RDECODE_FRAME_HDR_INFO_VP9_USE_UNCOMPRESSED_HEADER_SHIFT) &
                                  RDECODE_FRAME_HDR_INFO_VP9_USE_UNCOMPRESSED_HEADER_MASK;
@@ -628,9 +605,6 @@ static rvcn_dec_message_vp9_t get_vp9_msg(struct radeon_decoder *dec,
       memcpy(dec->ref_codec.ref_list, result.ref_frame_map, sizeof(result.ref_frame_map));
    }
 
-   dec->last_width = dec->base.width;
-   dec->last_height = dec->base.height;
-
    return result;
 }
 
@@ -722,6 +696,7 @@ static rvcn_dec_message_av1_t get_av1_msg(struct radeon_decoder *dec,
                                           struct pipe_video_buffer *target,
                                           struct pipe_av1_picture_desc *pic)
 {
+   struct si_screen *sscreen = (struct si_screen *)dec->screen;
    rvcn_dec_message_av1_t result;
    unsigned i, j, num_refs = 0, valid_ref = UINT32_MAX;
    uint16_t tile_count = pic->picture_parameter.tile_cols * pic->picture_parameter.tile_rows;
@@ -1100,6 +1075,8 @@ static rvcn_dec_message_av1_t get_av1_msg(struct radeon_decoder *dec,
       }
    }
 
+   result.av1_intrabc_workaround = sscreen->info.family == CHIP_GFX1153;
+
    return result;
 }
 
@@ -1339,6 +1316,7 @@ static void rvcn_dec_message_create(struct radeon_decoder *dec)
    header->total_size = sizes;
    header->num_buffers = 1;
    header->msg_type = RDECODE_MSG_CREATE;
+   header->stream_handle = dec->stream_handle;
    header->status_report_feedback_number = 0;
 
    header->index[0].message_id = RDECODE_MESSAGE_CREATE;
@@ -1586,6 +1564,7 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
    header->header_size = sizeof(rvcn_dec_message_header_t);
    header->total_size = sizes;
    header->msg_type = RDECODE_MSG_DECODE;
+   header->stream_handle = dec->stream_handle;
    header->status_report_feedback_number = dec->frame_number;
 
    header->index[0].message_id = RDECODE_MESSAGE_DECODE;
@@ -1638,18 +1617,14 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
 
    if (dec->dpb_type < DPB_DYNAMIC_TIER_2) {
       bool r;
-      if (!dec->dpb.res && dec->dpb_size) {
-         if (encrypted) {
-            r = si_vid_create_tmz_buffer(dec->screen, &dec->dpb, dec->dpb_size, PIPE_USAGE_DEFAULT);
-         } else {
-            r = si_vid_create_buffer(dec->screen, &dec->dpb, dec->dpb_size, PIPE_USAGE_DEFAULT);
-         }
-         assert(encrypted == (bool)(dec->dpb.res->flags & RADEON_FLAG_ENCRYPTED));
-         if (!r) {
+      if (!dec->dpb && dec->dpb_size) {
+         unsigned bind = encrypted ? PIPE_BIND_PROTECTED : 0;
+         dec->dpb = si_resource(pipe_buffer_create(dec->screen, bind, PIPE_USAGE_DEFAULT, dec->dpb_size));
+         if (!dec->dpb) {
             RADEON_DEC_ERR("Can't allocate dpb.\n");
             return NULL;
          }
-      } else if (dec->dpb_type == DPB_DYNAMIC_TIER_1 && dec->dpb.res &&
+      } else if (dec->dpb_type == DPB_DYNAMIC_TIER_1 && dec->dpb &&
                  (dec->max_width < dec->base.width || dec->max_height < dec->base.height)) {
          struct rvid_buf_offset_info buf_offset_info;
 
@@ -1671,26 +1646,22 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
       }
    }
 
-   if (!dec->ctx.res) {
+   if (!dec->ctx) {
       enum pipe_video_format fmt = u_reduce_video_profile(picture->profile);
       if (dec->stream_type == RDECODE_CODEC_H264_PERF) {
          unsigned ctx_size = calc_ctx_size_h264_perf(dec);
-         bool r;
-         if (encrypted && dec->tmz_ctx) {
-            r = si_vid_create_tmz_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         } else {
-            r = si_vid_create_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         }
-         assert((encrypted && dec->tmz_ctx) == (bool)(dec->ctx.res->flags & RADEON_FLAG_ENCRYPTED));
-
-         if (!r) {
+         unsigned bind = 0;
+         if (encrypted && dec->tmz_ctx)
+            bind |= PIPE_BIND_PROTECTED;
+         dec->ctx = si_resource(pipe_buffer_create(dec->screen, bind, PIPE_USAGE_DEFAULT, ctx_size));
+         if (!dec->ctx) {
             RADEON_DEC_ERR("Can't allocate context buffer.\n");
             return NULL;
          }
+         assert((encrypted && dec->tmz_ctx) == (bool)(dec->ctx->flags & RADEON_FLAG_ENCRYPTED));
       } else if (fmt == PIPE_VIDEO_FORMAT_VP9) {
          unsigned ctx_size;
          uint8_t *ptr;
-         bool r;
 
          /* default probability + probability data */
          ctx_size = 2304 * 5;
@@ -1711,36 +1682,33 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
          if (dec->base.profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2)
             ctx_size += 8 * 2 * 4096;
 
-         if (encrypted && dec->tmz_ctx) {
-            r = si_vid_create_tmz_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         } else {
-            r = si_vid_create_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         }
-         if (!r) {
+         unsigned bind = 0;
+         if (encrypted && dec->tmz_ctx)
+            bind |= PIPE_BIND_PROTECTED;
+         dec->ctx = si_resource(pipe_buffer_create(dec->screen, bind, PIPE_USAGE_DEFAULT, ctx_size));
+         if (!dec->ctx) {
             RADEON_DEC_ERR("Can't allocate context buffer.\n");
             return NULL;
          }
 
          /* ctx needs probs table */
-         ptr = dec->ws->buffer_map(dec->ws, dec->ctx.res->buf, NULL,
+         ptr = dec->ws->buffer_map(dec->ws, dec->ctx->buf, NULL,
                                    PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
-         fill_probs_table(ptr);
-         dec->ws->buffer_unmap(dec->ws, dec->ctx.res->buf);
+         ac_vcn_vp9_fill_probs_table(ptr);
+         dec->ws->buffer_unmap(dec->ws, dec->ctx->buf);
          dec->bs_ptr = NULL;
       } else if (fmt == PIPE_VIDEO_FORMAT_HEVC) {
          unsigned ctx_size;
-         bool r;
          if (dec->base.profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10)
             ctx_size = calc_ctx_size_h265_main10(dec, (struct pipe_h265_picture_desc *)picture);
          else
             ctx_size = calc_ctx_size_h265_main(dec);
 
-         if (encrypted && dec->tmz_ctx) {
-            r = si_vid_create_tmz_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         } else {
-            r = si_vid_create_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT);
-         }
-         if (!r) {
+         unsigned bind = 0;
+         if (encrypted && dec->tmz_ctx)
+            bind |= PIPE_BIND_PROTECTED;
+         dec->ctx = si_resource(pipe_buffer_create(dec->screen, bind, PIPE_USAGE_DEFAULT, ctx_size));
+         if (!dec->ctx) {
             RADEON_DEC_ERR("Can't allocate context buffer.\n");
             return NULL;
          }
@@ -1754,7 +1722,7 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
       set_drm_keyblob(drm_keyblob, secure_buf);
    }
 
-   decode->dpb_size = (dec->dpb_type < DPB_DYNAMIC_TIER_2) ? dec->dpb.res->buf->size : 0;
+   decode->dpb_size = (dec->dpb_type < DPB_DYNAMIC_TIER_2) ? dec->dpb->buf->size : 0;
 
    /* When texture being created, the bo will be created with total size of planes,
     * and all planes point to the same buffer */
@@ -1788,43 +1756,42 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
    decode->dt_tiling_mode = 0;
    decode->dt_swizzle_mode = luma->surface.u.gfx9.swizzle_mode;
    decode->dt_array_mode = dec->addr_gfx_mode;
-   decode->dt_field_mode = ((struct vl_video_buffer *)out_surf)->base.interlaced;
    decode->dt_surf_tile_config = 0;
    decode->dt_uv_surf_tile_config = 0;
 
-   decode->dt_luma_top_offset = luma->surface.u.gfx9.surf_offset;
-   decode->dt_chroma_top_offset = chroma->surface.u.gfx9.surf_offset;
-   if (decode->dt_field_mode) {
-      decode->dt_luma_bottom_offset =
-         luma->surface.u.gfx9.surf_offset + luma->surface.u.gfx9.surf_slice_size;
-      decode->dt_chroma_bottom_offset =
-         chroma->surface.u.gfx9.surf_offset + chroma->surface.u.gfx9.surf_slice_size;
-   } else {
-      decode->dt_luma_bottom_offset = decode->dt_luma_top_offset;
-      decode->dt_chroma_bottom_offset = decode->dt_chroma_top_offset;
-   }
+   decode->dt_luma_top_offset = luma->surface.u.gfx9.surf_offset | (luma->surface.tile_swizzle << 8);
+   decode->dt_chroma_top_offset = chroma->surface.u.gfx9.surf_offset| (chroma->surface.tile_swizzle << 8);
+   decode->dt_luma_bottom_offset = decode->dt_luma_top_offset;
+   decode->dt_chroma_bottom_offset = decode->dt_chroma_top_offset;
    decode->mif_wrc_en = sscreen->info.vcn_ip_version >= VCN_3_0_0;
    if (dec->stream_type == RDECODE_CODEC_AV1)
       decode->db_pitch_uv = chroma->surface.u.gfx9.surf_pitch * chroma->surface.blk_w;
 
    if (picture->cenc) {
-      if (!dec->subsample.res && !si_vid_create_buffer(dec->screen, &dec->subsample,
-                                                       RDECODE_MAX_SUBSAMPLE_SIZE,
-                                                       PIPE_USAGE_DEFAULT)) {
+      if (!dec->subsample)
+         dec->subsample = si_resource(pipe_buffer_create(dec->screen, 0, PIPE_USAGE_DEFAULT, RDECODE_MAX_SUBSAMPLE_SIZE));
+      if (!dec->subsample) {
          RADEON_DEC_ERR("Can't allocate subsample buffer.\n");
          return NULL;
       }
       int ss_length = MIN2(secure_buf->desc.subsamples_length, MAX_SUBSAMPLES);
-      uint32_t *ss_ptr = dec->ws->buffer_map(dec->ws, dec->subsample.res->buf, &dec->cs,
+      int total_ss_size = 0;
+      uint32_t *ss_ptr = dec->ws->buffer_map(dec->ws, dec->subsample->buf, &dec->cs,
                                              PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
       if (!ss_ptr) {
          RADEON_DEC_ERR("Failed to map subsample buffer memory.\n");
          return NULL;
       }
-      for (int i = 0; i < ss_length; i++)
+      for (int i = 0; i < ss_length; i++) {
          memcpy(&ss_ptr[i * 2], &secure_buf->desc.subsamples[i].num_bytes_clear, 8);
-      ss_ptr[ss_length * 2 - 1] = align(ss_ptr[ss_length * 2 - 1], 256);
-      dec->ws->buffer_unmap(dec->ws, dec->subsample.res->buf);
+         total_ss_size += ss_ptr[i * 2] + ss_ptr[i * 2 + 1];
+      }
+      assert(total_ss_size <= decode->bsd_size);
+      if (ss_ptr[ss_length * 2 - 1] != 0)
+         ss_ptr[ss_length * 2 - 1] += (decode->bsd_size - total_ss_size);
+      else
+         ss_ptr[ss_length * 2 - 2] += (decode->bsd_size - total_ss_size);
+      dec->ws->buffer_unmap(dec->ws, dec->subsample->buf);
    }
 
    if (encrypted) {
@@ -1923,17 +1890,21 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
       index_codec->message_id = RDECODE_MESSAGE_AV1;
       index_codec->size = sizeof(rvcn_dec_message_av1_t);
 
-      if (dec->ctx.res == NULL) {
+      if (!dec->ctx) {
          unsigned ctx_size = ac_vcn_dec_calc_ctx_size_av1(dec->av1_version);
          uint8_t *ptr;
 
-         if (!si_vid_create_buffer(dec->screen, &dec->ctx, ctx_size, PIPE_USAGE_DEFAULT))
+         unsigned bind = 0;
+         if (encrypted && dec->tmz_ctx)
+            bind |= PIPE_BIND_PROTECTED;
+         dec->ctx = si_resource(pipe_buffer_create(dec->screen, bind, PIPE_USAGE_DEFAULT, ctx_size));
+         if (dec->ctx) {
+            ptr = dec->ws->buffer_map(dec->ws, dec->ctx->buf, NULL, PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
+            ac_vcn_av1_init_probs(dec->av1_version, ptr);
+            dec->ws->buffer_unmap(dec->ws, dec->ctx->buf);
+         } else {
             RADEON_DEC_ERR("Can't allocate context buffer.\n");
-
-         ptr = dec->ws->buffer_map(dec->ws, dec->ctx.res->buf, NULL, PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
-
-         ac_vcn_av1_init_probs(dec->av1_version, ptr);
-         dec->ws->buffer_unmap(dec->ws, dec->ctx.res->buf);
+         }
       }
 
       break;
@@ -1945,8 +1916,8 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
 
    header->total_size += index_codec->size;
 
-   if (dec->ctx.res)
-      decode->hw_ctxt_size = dec->ctx.res->buf->size;
+   if (dec->ctx)
+      decode->hw_ctxt_size = dec->ctx->buf->size;
 
    if (dec->dpb_type == DPB_DYNAMIC_TIER_2) {
       if (rvcn_dec_dynamic_dpb_t2_message(dec, decode, dynamic_dpb_t2, encrypted))
@@ -1967,6 +1938,7 @@ static void rvcn_dec_message_destroy(struct radeon_decoder *dec)
    header->total_size = sizeof(rvcn_dec_message_header_t) - sizeof(rvcn_dec_message_index_t);
    header->num_buffers = 0;
    header->msg_type = RDECODE_MSG_DESTROY;
+   header->stream_handle = dec->stream_handle;
    header->status_report_feedback_number = 0;
 }
 
@@ -2124,15 +2096,15 @@ static bool have_probs(struct radeon_decoder *dec)
 /* map the next available message/feedback/itscaling buffer */
 static void map_msg_fb_it_probs_buf(struct radeon_decoder *dec)
 {
-   struct rvid_buffer *buf;
+   struct si_resource *buf;
    uint8_t *ptr;
 
    /* grab the current message/feedback buffer */
-   buf = &dec->msg_fb_it_probs_buffers[dec->cur_buffer];
+   buf = dec->msg_fb_it_probs_buffers[dec->cur_buffer];
 
    /* and map it for CPU access */
    ptr =
-      dec->ws->buffer_map(dec->ws, buf->res->buf, NULL, PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
+      dec->ws->buffer_map(dec->ws, buf->buf, NULL, PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
 
    /* calc buffer offsets */
    dec->msg = ptr;
@@ -2147,28 +2119,28 @@ static void map_msg_fb_it_probs_buf(struct radeon_decoder *dec)
 /* unmap and send a message command to the VCPU */
 static void send_msg_buf(struct radeon_decoder *dec)
 {
-   struct rvid_buffer *buf;
+   struct si_resource *buf;
 
    /* ignore the request if message/feedback buffer isn't mapped */
    if (!dec->msg || !dec->fb)
       return;
 
    /* grab the current message buffer */
-   buf = &dec->msg_fb_it_probs_buffers[dec->cur_buffer];
+   buf = dec->msg_fb_it_probs_buffers[dec->cur_buffer];
 
    /* unmap the buffer */
-   dec->ws->buffer_unmap(dec->ws, buf->res->buf);
+   dec->ws->buffer_unmap(dec->ws, buf->buf);
    dec->bs_ptr = NULL;
    dec->msg = NULL;
    dec->fb = NULL;
    dec->it = NULL;
    dec->probs = NULL;
 
-   send_cmd(dec, RDECODE_CMD_SESSION_CONTEXT_BUFFER, dec->sessionctx.res->buf, 0,
+   send_cmd(dec, RDECODE_CMD_SESSION_CONTEXT_BUFFER, dec->sessionctx->buf, 0,
             RADEON_USAGE_READWRITE, RADEON_DOMAIN_VRAM);
 
    /* and send it to the hardware */
-   send_cmd(dec, RDECODE_CMD_MSG_BUFFER, buf->res->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
+   send_cmd(dec, RDECODE_CMD_MSG_BUFFER, buf->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
 }
 
 /* cycle to the next set of buffers */
@@ -2381,12 +2353,12 @@ static void radeon_dec_destroy(struct pipe_video_codec *decoder)
    assert(decoder);
 
    if (dec->bs_ptr) {
-      dec->ws->buffer_unmap(dec->ws, dec->bs_buffers[dec->cur_buffer].res->buf);
+      dec->ws->buffer_unmap(dec->ws, dec->bs_buffers[dec->cur_buffer]->buf);
       dec->bs_ptr = NULL;
    }
 
    if (dec->msg) {
-      dec->ws->buffer_unmap(dec->ws, dec->msg_fb_it_probs_buffers[dec->cur_buffer].res->buf);
+      dec->ws->buffer_unmap(dec->ws, dec->msg_fb_it_probs_buffers[dec->cur_buffer]->buf);
       dec->msg = NULL;
    }
 
@@ -2403,6 +2375,8 @@ static void radeon_dec_destroy(struct pipe_video_codec *decoder)
    dec->ws->cs_destroy(&dec->cs);
    if (dec->ectx)
       dec->ectx->destroy(dec->ectx);
+   if (dec->vpe)
+      dec->vpe->destroy(dec->vpe);
 
    if (dec->stream_type == RDECODE_CODEC_JPEG) {
       for (i = 0; i < dec->njctx; i++) {
@@ -2413,26 +2387,26 @@ static void radeon_dec_destroy(struct pipe_video_codec *decoder)
 
    if (dec->msg_fb_it_probs_buffers && dec->bs_buffers) {
       for (i = 0; i < dec->num_dec_bufs; ++i) {
-            si_vid_destroy_buffer(&dec->msg_fb_it_probs_buffers[i]);
-            si_vid_destroy_buffer(&dec->bs_buffers[i]);
+         si_resource_reference(&dec->msg_fb_it_probs_buffers[i], NULL);
+         si_resource_reference(&dec->bs_buffers[i], NULL);
       }
       FREE(dec->msg_fb_it_probs_buffers);
       FREE(dec->bs_buffers);
    }
    dec->num_dec_bufs = 0;
 
-   if (dec->dpb_type != DPB_DYNAMIC_TIER_2) {
-      si_vid_destroy_buffer(&dec->dpb);
-   } else {
+   si_resource_reference(&dec->dpb, NULL);
+
+   if (dec->dpb_type == DPB_DYNAMIC_TIER_2) {
       list_for_each_entry_safe(struct rvcn_dec_dynamic_dpb_t2, d, &dec->dpb_ref_list, list) {
          list_del(&d->list);
          pipe_resource_reference(&d->buf, NULL);
          FREE(d);
       }
    }
-   si_vid_destroy_buffer(&dec->ctx);
-   si_vid_destroy_buffer(&dec->sessionctx);
-   si_vid_destroy_buffer(&dec->subsample);
+   si_resource_reference(&dec->ctx, NULL);
+   si_resource_reference(&dec->sessionctx, NULL);
+   si_resource_reference(&dec->subsample, NULL);
 
    FREE(dec->jcs);
    FREE(dec->jctx);
@@ -2478,7 +2452,7 @@ static void radeon_dec_begin_frame(struct pipe_video_codec *decoder,
    }
 
    dec->bs_size = 0;
-   dec->bs_ptr = dec->ws->buffer_map(dec->ws, dec->bs_buffers[dec->cur_buffer].res->buf, NULL,
+   dec->bs_ptr = dec->ws->buffer_map(dec->ws, dec->bs_buffers[dec->cur_buffer]->buf, NULL,
                                      PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
 }
 
@@ -2520,27 +2494,29 @@ static void radeon_dec_decode_bitstream(struct pipe_video_codec *decoder,
    for (i = 0; i < num_buffers; ++i)
       total_bs_size += sizes[i];
 
-   struct rvid_buffer *buf = &dec->bs_buffers[dec->cur_buffer];
+   struct si_resource *buf = dec->bs_buffers[dec->cur_buffer];
 
-   if (total_bs_size > buf->res->buf->size) {
-      dec->ws->buffer_unmap(dec->ws, buf->res->buf);
+   if (total_bs_size > buf->buf->size) {
+      dec->ws->buffer_unmap(dec->ws, buf->buf);
       dec->bs_ptr = NULL;
 
       total_bs_size = align(total_bs_size, 128);
 
       if (!dec->bs_size) {
-         struct rvid_buffer old_buf = *buf;
-         if (!si_vid_create_buffer(dec->screen, buf, total_bs_size, buf->usage)) {
+         buf = si_resource(pipe_buffer_create(dec->screen, buf->b.b.bind, buf->b.b.usage, total_bs_size));
+         if (!buf) {
             RADEON_DEC_ERR("Can't create bitstream buffer!");
             return;
          }
-         si_vid_destroy_buffer(&old_buf);
-      } else if (!si_vid_resize_buffer(dec->base.context, buf, total_bs_size, NULL)) {
+         si_resource_reference(&dec->bs_buffers[dec->cur_buffer], NULL);
+         dec->bs_buffers[dec->cur_buffer] = buf;
+      } else if (!si_vid_resize_buffer(dec->base.context, &dec->bs_buffers[dec->cur_buffer], total_bs_size, NULL)) {
          RADEON_DEC_ERR("Can't resize bitstream buffer!");
          return;
       }
 
-      dec->bs_ptr = dec->ws->buffer_map(dec->ws, buf->res->buf, NULL,
+      buf = dec->bs_buffers[dec->cur_buffer];
+      dec->bs_ptr = dec->ws->buffer_map(dec->ws, buf->buf, NULL,
                                         PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
       if (!dec->bs_ptr)
          return;
@@ -2599,6 +2575,34 @@ static void send_ref_buffers(struct radeon_decoder *dec)
    dec->decode_buffer->valid_buf_flag |= RDECODE_CMDBUF_FLAGS_REF_BUFFER;
 }
 
+static int radeon_dec_process_frame(struct pipe_video_codec *decoder,
+                                    struct pipe_video_buffer *source,
+                                    const struct pipe_vpp_desc *vpp)
+{
+   struct radeon_decoder *dec = (struct radeon_decoder *)decoder;
+   struct si_screen *sscreen = (struct si_screen *)dec->screen;
+
+   if (!dec->vpe && sscreen->info.ip[AMD_IP_VPE].num_queues) {
+      struct pipe_video_codec templat = {
+         .profile = PIPE_VIDEO_PROFILE_UNKNOWN,
+         .entrypoint = PIPE_VIDEO_ENTRYPOINT_PROCESSING,
+      };
+      dec->vpe = si_uvd_create_decoder(dec->base.context, &templat);
+   }
+
+   if (!dec->vpe)
+      return 1;
+
+   struct pipe_picture_desc pic = {
+      .out_fence = vpp->base.out_fence,
+   };
+   dec->vpe->begin_frame(dec->vpe, vpp->dst, &pic);
+   int ret = dec->vpe->process_frame(dec->vpe, source, vpp);
+   if (ret != 0)
+      return ret;
+   return dec->vpe->end_frame(dec->vpe, vpp->dst, &pic);
+}
+
 /**
  * send cmd for vcn dec
  */
@@ -2606,13 +2610,13 @@ bool send_cmd_dec(struct radeon_decoder *dec, struct pipe_video_buffer *target,
                   struct pipe_picture_desc *picture)
 {
    struct pb_buffer_lean *dt;
-   struct rvid_buffer *msg_fb_it_probs_buf, *bs_buf;
+   struct si_resource *msg_fb_it_probs_buf, *bs_buf;
 
-   msg_fb_it_probs_buf = &dec->msg_fb_it_probs_buffers[dec->cur_buffer];
-   bs_buf = &dec->bs_buffers[dec->cur_buffer];
+   msg_fb_it_probs_buf = dec->msg_fb_it_probs_buffers[dec->cur_buffer];
+   bs_buf = dec->bs_buffers[dec->cur_buffer];
 
    memset(dec->bs_ptr, 0, align(dec->bs_size, 128) - dec->bs_size);
-   dec->ws->buffer_unmap(dec->ws, bs_buf->res->buf);
+   dec->ws->buffer_unmap(dec->ws, bs_buf->buf);
    dec->bs_ptr = NULL;
 
    map_msg_fb_it_probs_buf(dec);
@@ -2623,24 +2627,24 @@ bool send_cmd_dec(struct radeon_decoder *dec, struct pipe_video_buffer *target,
    send_msg_buf(dec);
 
    if (dec->dpb_type < DPB_DYNAMIC_TIER_2)
-      send_cmd(dec, RDECODE_CMD_DPB_BUFFER, dec->dpb.res->buf, 0, RADEON_USAGE_READWRITE,
+      send_cmd(dec, RDECODE_CMD_DPB_BUFFER, dec->dpb->buf, 0, RADEON_USAGE_READWRITE,
             RADEON_DOMAIN_VRAM);
-   if (dec->ctx.res)
-      send_cmd(dec, RDECODE_CMD_CONTEXT_BUFFER, dec->ctx.res->buf, 0, RADEON_USAGE_READWRITE,
+   if (dec->ctx)
+      send_cmd(dec, RDECODE_CMD_CONTEXT_BUFFER, dec->ctx->buf, 0, RADEON_USAGE_READWRITE,
                RADEON_DOMAIN_VRAM);
-   send_cmd(dec, RDECODE_CMD_BITSTREAM_BUFFER, bs_buf->res->buf, 0, RADEON_USAGE_READ,
+   send_cmd(dec, RDECODE_CMD_BITSTREAM_BUFFER, bs_buf->buf, 0, RADEON_USAGE_READ,
             RADEON_DOMAIN_GTT);
    send_cmd(dec, RDECODE_CMD_DECODING_TARGET_BUFFER, dt, 0, RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
-   send_cmd(dec, RDECODE_CMD_FEEDBACK_BUFFER, msg_fb_it_probs_buf->res->buf, FB_BUFFER_OFFSET,
+   send_cmd(dec, RDECODE_CMD_FEEDBACK_BUFFER, msg_fb_it_probs_buf->buf, FB_BUFFER_OFFSET,
             RADEON_USAGE_WRITE, RADEON_DOMAIN_GTT);
    if (have_it(dec))
-      send_cmd(dec, RDECODE_CMD_IT_SCALING_TABLE_BUFFER, msg_fb_it_probs_buf->res->buf,
+      send_cmd(dec, RDECODE_CMD_IT_SCALING_TABLE_BUFFER, msg_fb_it_probs_buf->buf,
                FB_BUFFER_OFFSET + FB_BUFFER_SIZE, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
    else if (have_probs(dec))
-      send_cmd(dec, RDECODE_CMD_PROB_TBL_BUFFER, msg_fb_it_probs_buf->res->buf,
+      send_cmd(dec, RDECODE_CMD_PROB_TBL_BUFFER, msg_fb_it_probs_buf->buf,
                FB_BUFFER_OFFSET + FB_BUFFER_SIZE, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
    if (picture->cenc)
-      send_cmd(dec, RDECODE_CMD_SUBSAMPLE, dec->subsample.res->buf, 0, RADEON_USAGE_READ,
+      send_cmd(dec, RDECODE_CMD_SUBSAMPLE, dec->subsample->buf, 0, RADEON_USAGE_READ,
                RADEON_DOMAIN_VRAM);
 
    if (dec->dpb_type == DPB_DYNAMIC_TIER_3)
@@ -2670,7 +2674,7 @@ static int radeon_dec_end_frame(struct pipe_video_codec *decoder, struct pipe_vi
    if (!dec->send_cmd(dec, target, picture))
       return 1;
 
-   flush(dec, picture->flush_flags, picture->fence);
+   flush(dec, picture->flush_flags, picture->out_fence);
 
    next_buffer(dec);
    return 0;
@@ -2742,7 +2746,7 @@ static int radeon_dec_jpeg_end_frame(struct pipe_video_codec *decoder, struct pi
    if (dec->jpg.crop_y + dec->jpg.crop_height > pic->picture_parameter.picture_height)
       dec->jpg.crop_height = 0;
    dec->send_cmd(dec, target, picture);
-   dec->ws->cs_flush(&dec->jcs[dec->cb_idx], picture->flush_flags, NULL);
+   dec->ws->cs_flush(&dec->jcs[dec->cb_idx], picture->flush_flags, picture->out_fence);
    next_buffer(dec);
    dec->cb_idx = (dec->cb_idx+1) % dec->njctx;
    return 0;
@@ -2770,6 +2774,40 @@ static void radeon_dec_destroy_fence(struct pipe_video_codec *decoder,
    struct radeon_decoder *dec = (struct radeon_decoder *)decoder;
 
    dec->ws->fence_reference(dec->ws, &fence, NULL);
+}
+
+static bool radeon_dec_enable_tier3(struct si_context *sctx, uint32_t codec)
+{
+   if (sctx->screen->multimedia_debug_flags & DBG(NO_DECODE_TIER3))
+      return false;
+
+   if (sctx->vcn_ip_ver < VCN_5_0_0)
+      return false;
+
+   return true;
+}
+
+static bool radeon_dec_enable_tier2(struct si_context *sctx, uint32_t codec)
+{
+   if (sctx->screen->multimedia_debug_flags & DBG(NO_DECODE_TIER2))
+      return false;
+
+   if (sctx->vcn_ip_ver < VCN_3_0_0)
+      return false;
+
+   return codec == RDECODE_CODEC_VP9 || codec == RDECODE_CODEC_AV1 ||
+          codec == RDECODE_CODEC_H265 || codec == RDECODE_CODEC_H264_PERF;
+}
+
+static bool radeon_dec_enable_tier1(struct si_context *sctx, uint32_t codec)
+{
+   if (sctx->screen->multimedia_debug_flags & DBG(NO_DECODE_TIER1))
+      return false;
+
+   if (sctx->vcn_ip_ver > VCN_2_6_0)
+      return false;
+
+   return codec == RDECODE_CODEC_VP9;
 }
 
 /**
@@ -2841,12 +2879,14 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
    dec->base.begin_frame = radeon_dec_begin_frame;
    dec->base.decode_macroblock = radeon_dec_decode_macroblock;
    dec->base.decode_bitstream = radeon_dec_decode_bitstream;
+   dec->base.process_frame = radeon_dec_process_frame;
    dec->base.end_frame = radeon_dec_end_frame;
    dec->base.flush = radeon_dec_flush;
    dec->base.fence_wait = radeon_dec_fence_wait;
    dec->base.destroy_fence = radeon_dec_destroy_fence;
 
    dec->stream_type = stream_type;
+   dec->stream_handle = si_vid_alloc_stream_handle();
    dec->screen = context->screen;
    dec->ws = ws;
 
@@ -2856,8 +2896,6 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
       ring = AMD_IP_VCN_UNIFIED;
    }
 
-   dec->sq.signature_ib_total_size_in_dw = NULL;
-   dec->sq.signature_ib_checksum = NULL;
    dec->sq.engine_ib_size_of_packages = NULL;
 
    if (!ws->cs_create(&dec->cs,
@@ -2882,9 +2920,8 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
          goto err;
       for (i = 0; i < dec->njctx; i++) {
       /* Initialize the context handle and the command stream. */
-         dec->jctx[i] = dec->ws->ctx_create(dec->ws, RADEON_CTX_PRIORITY_MEDIUM,
-                                            sctx->context_flags & PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET);
-         if (!sctx->ctx)
+         dec->jctx[i] = dec->ws->ctx_create(dec->ws, sctx->context_flags);
+         if (!dec->jctx[i])
             goto error;
          if (!dec->ws->cs_create(&dec->jcs[i], dec->jctx[i], ring, NULL, NULL)) {
             RADEON_DEC_ERR("Can't get additional command submission context for mJPEG.\n");
@@ -2911,8 +2948,8 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
       dec->num_dec_bufs = NUM_BUFFERS;
 
    bs_buf_size = align(width * height / 32, 128);
-   dec->msg_fb_it_probs_buffers = (struct rvid_buffer *) CALLOC(dec->num_dec_bufs, sizeof(struct rvid_buffer));
-   dec->bs_buffers = (struct rvid_buffer *) CALLOC(dec->num_dec_bufs, sizeof(struct rvid_buffer));
+   dec->msg_fb_it_probs_buffers = CALLOC(dec->num_dec_bufs, sizeof(struct si_resource *));
+   dec->bs_buffers = CALLOC(dec->num_dec_bufs, sizeof(struct si_resource *));
    if(!dec->msg_fb_it_probs_buffers || !dec->bs_buffers)
       goto error;
 
@@ -2925,41 +2962,38 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
                                  VP9_PROBS_TABLE_SIZE :
                                  sizeof(rvcn_dec_av1_segment_fg_t);
       /* use vram to improve performance, workaround an unknown bug */
-      if (!si_vid_create_buffer(dec->screen, &dec->msg_fb_it_probs_buffers[i], msg_fb_it_probs_size,
-                                PIPE_USAGE_DEFAULT)) {
+      dec->msg_fb_it_probs_buffers[i] = si_resource(pipe_buffer_create(dec->screen, PIPE_BIND_CUSTOM,
+                                                                       PIPE_USAGE_DEFAULT, msg_fb_it_probs_size));
+      if (!dec->msg_fb_it_probs_buffers[i]) {
          RADEON_DEC_ERR("Can't allocate message buffers.\n");
          goto error;
       }
 
-      if (!si_vid_create_buffer(dec->screen, &dec->bs_buffers[i], bs_buf_size,
-                                PIPE_USAGE_STAGING)) {
+      dec->bs_buffers[i] = si_resource(pipe_buffer_create(dec->screen, 0, PIPE_USAGE_STAGING, bs_buf_size));
+      if (!dec->bs_buffers[i]) {
          RADEON_DEC_ERR("Can't allocate bitstream buffers.\n");
          goto error;
       }
 
       if (have_probs(dec) && dec->stream_type == RDECODE_CODEC_VP9) {
-         struct rvid_buffer *buf;
+         struct si_resource *buf;
          void *ptr;
 
-         buf = &dec->msg_fb_it_probs_buffers[i];
-         ptr = dec->ws->buffer_map(dec->ws, buf->res->buf, NULL,
+         buf = dec->msg_fb_it_probs_buffers[i];
+         ptr = dec->ws->buffer_map(dec->ws, buf->buf, NULL,
                                    PIPE_MAP_WRITE | RADEON_MAP_TEMPORARY);
          ptr += FB_BUFFER_OFFSET + FB_BUFFER_SIZE;
-         fill_probs_table(ptr);
-         dec->ws->buffer_unmap(dec->ws, buf->res->buf);
+         ac_vcn_vp9_fill_probs_table(ptr);
+         dec->ws->buffer_unmap(dec->ws, buf->buf);
          dec->bs_ptr = NULL;
       }
    }
 
-   if (sctx->vcn_ip_ver >= VCN_5_0_0)
+   if (radeon_dec_enable_tier3(sctx, stream_type))
       dec->dpb_type = DPB_DYNAMIC_TIER_3;
-   else if ((sctx->vcn_ip_ver >= VCN_3_0_0) &&
-         (stream_type == RDECODE_CODEC_VP9 ||
-          stream_type == RDECODE_CODEC_AV1 ||
-        ((stream_type == RDECODE_CODEC_H265) && templ->expect_chunked_decode) ||
-        ((stream_type == RDECODE_CODEC_H264_PERF) && templ->expect_chunked_decode)))
+   else if (radeon_dec_enable_tier2(sctx, stream_type))
       dec->dpb_type = DPB_DYNAMIC_TIER_2;
-   else if (sctx->vcn_ip_ver <= VCN_2_6_0 && stream_type == RDECODE_CODEC_VP9)
+   else if (radeon_dec_enable_tier1(sctx, stream_type))
       dec->dpb_type = DPB_DYNAMIC_TIER_1;
    else
       dec->dpb_type = DPB_MAX_RES;
@@ -2980,8 +3014,9 @@ struct pipe_video_codec *radeon_create_decoder(struct pipe_context *context,
    if (dec->dpb_type < DPB_DYNAMIC_TIER_2)
       dec->dpb_size = calc_dpb_size(dec);
 
-   if (!si_vid_create_buffer(dec->screen, &dec->sessionctx, RDECODE_SESSION_CONTEXT_SIZE,
-                             PIPE_USAGE_DEFAULT)) {
+   dec->sessionctx = si_resource(pipe_buffer_create(dec->screen, 0, PIPE_USAGE_DEFAULT,
+                                                    RDECODE_SESSION_CONTEXT_SIZE));
+   if (!dec->sessionctx) {
       RADEON_DEC_ERR("Can't allocate session ctx.\n");
       goto error;
    }
@@ -3133,23 +3168,20 @@ error:
 
    if (dec->msg_fb_it_probs_buffers && dec->bs_buffers) {
       for (i = 0; i < dec->num_dec_bufs; ++i) {
-            si_vid_destroy_buffer(&dec->msg_fb_it_probs_buffers[i]);
-            si_vid_destroy_buffer(&dec->bs_buffers[i]);
+         si_resource_reference(&dec->msg_fb_it_probs_buffers[i], NULL);
+         si_resource_reference(&dec->bs_buffers[i], NULL);
       }
       FREE(dec->msg_fb_it_probs_buffers);
       FREE(dec->bs_buffers);
    }
 
-   if (dec->dpb_type < DPB_DYNAMIC_TIER_2)
-      si_vid_destroy_buffer(&dec->dpb);
-   si_vid_destroy_buffer(&dec->ctx);
-   si_vid_destroy_buffer(&dec->sessionctx);
+   si_resource_reference(&dec->dpb, NULL);
+   si_resource_reference(&dec->ctx, NULL);
+   si_resource_reference(&dec->sessionctx, NULL);
 
 err:
-   if (dec->jcs)
-      FREE(dec->jcs);
-   if (dec->jctx)
-      FREE(dec->jctx);
+   FREE(dec->jcs);
+   FREE(dec->jctx);
    FREE(dec);
 
    return NULL;

@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 bool nak_should_print_nir(void);
+bool nak_debug_no_ugpr(void);
 
 struct nak_compiler {
    uint8_t sm;
@@ -132,6 +133,9 @@ enum ENUM_PACKED nak_sv {
 
 bool nak_nir_workgroup_has_one_subgroup(const nir_shader *nir);
 
+nir_def *nak_nir_load_sysval(nir_builder *b, enum nak_sv idx,
+                             enum gl_access_qualifier access);
+
 struct nak_xfb_info
 nak_xfb_from_nir(const struct nak_compiler *nak,
                  const struct nir_xfb_info *nir_xfb);
@@ -198,16 +202,65 @@ static_assert(sizeof(struct nak_nir_tex_flags) == 4,
    _u; \
 })
 
-bool nak_nir_lower_scan_reduce(nir_shader *shader);
+bool nak_nir_lower_scan_reduce(nir_shader *shader, const struct nak_compiler *nak);
 bool nak_nir_lower_tex(nir_shader *nir, const struct nak_compiler *nak);
 bool nak_nir_lower_gs_intrinsics(nir_shader *shader);
 bool nak_nir_lower_algebraic_late(nir_shader *nir, const struct nak_compiler *nak);
+bool nak_nir_lower_kepler_shared_atomics(nir_shader *shader);
 
 struct nak_nir_attr_io_flags {
    bool output : 1;
    bool patch : 1;
    bool phys : 1;
    uint32_t pad:29;
+};
+
+enum nak_suclamp_mode {
+   NAK_SUCLAMP_MODE_STORED_DESCRIPTOR,
+   NAK_SUCLAMP_MODE_PITCH_LINEAR,
+   NAK_SUCLAMP_MODE_BLOCK_LINEAR,
+};
+
+enum nak_suclamp_round {
+   NAK_SUCLAMP_ROUND_R1,
+   NAK_SUCLAMP_ROUND_R2,
+   NAK_SUCLAMP_ROUND_R4,
+   NAK_SUCLAMP_ROUND_R8,
+   NAK_SUCLAMP_ROUND_R16,
+};
+
+struct nak_nir_suclamp_flags {
+   enum nak_suclamp_mode mode : 2;
+   enum nak_suclamp_round round : 3;
+   bool is_s32 : 1;
+   bool is_2d : 1;
+   uint32_t pad:25;
+};
+
+enum nak_su_ga_offset_mode {
+   NAK_SUGA_OFF_MODE_U32,
+   NAK_SUGA_OFF_MODE_S32,
+   NAK_SUGA_OFF_MODE_U8,
+   NAK_SUGA_OFF_MODE_S8,
+};
+
+enum nak_imad_src_type {// 3 bits
+   NAK_IMAD_TYPE_U32,
+   NAK_IMAD_TYPE_U24,
+   NAK_IMAD_TYPE_U16_LO,
+   NAK_IMAD_TYPE_U16_HI,
+   NAK_IMAD_TYPE_S32,
+   NAK_IMAD_TYPE_S24,
+   NAK_IMAD_TYPE_S16_LO,
+   NAK_IMAD_TYPE_S16_HI,
+};
+
+struct nak_nir_imadsp_flags {
+   enum nak_imad_src_type src0 : 3;
+   enum nak_imad_src_type src1 : 3;
+   enum nak_imad_src_type src2 : 3;
+   bool params_from_src1 : 1;
+   uint32_t pad:22;
 };
 
 bool nak_nir_lower_vtg_io(nir_shader *nir, const struct nak_compiler *nak);
@@ -238,6 +291,32 @@ struct nak_nir_ipa_flags {
    uint32_t pad:26;
 };
 
+enum nak_cmat_type {
+   NAK_CMAT_TYPE_M8N8K16_INT,
+   NAK_CMAT_TYPE_M16N8K16_INT,
+   NAK_CMAT_TYPE_M16N8K32_INT,
+
+   NAK_CMAT_TYPE_M16N8K8_FLOAT,
+   NAK_CMAT_TYPE_M16N8K16_FLOAT,
+
+   /* Software emulated cmat layouts
+    *
+    * Those aren't supported as a single native *MMA invocation on any hardware,
+    * so in order to support those we execute multiple *MMA instructions with a
+    * register layout defined by us.
+    */
+   NAK_CMAT_TYPE_M16N16K32_INT_SW,
+   NAK_CMAT_TYPE_M16N16K16_FLOAT_SW,
+};
+
+struct nak_nir_cmat_mul_add_flags {
+   enum nak_cmat_type cmat_type:3;
+   enum glsl_base_type a_type:5;
+   enum glsl_base_type b_type:5;
+   bool sat:1;
+   uint32_t pad:18;
+};
+
 bool nak_nir_lower_fs_inputs(nir_shader *nir,
                              const struct nak_compiler *nak,
                              const struct nak_fs_key *fs_key);
@@ -259,9 +338,20 @@ enum nak_fs_out {
 
 bool nak_nir_rematerialize_load_const(nir_shader *nir);
 bool nak_nir_mark_lcssa_invariants(nir_shader *nir);
-bool nak_nir_lower_non_uniform_ldcx(nir_shader *nir);
+bool nak_nir_lower_non_uniform_ldcx(nir_shader *nir, const struct nak_compiler *nak);
 bool nak_nir_add_barriers(nir_shader *nir, const struct nak_compiler *nak);
 bool nak_nir_lower_cf(nir_shader *nir);
+bool nak_nir_lower_cmat(nir_shader *shader, const struct nak_compiler *nak);
+
+/**
+ * Check if, for nak's purposes, a block is divergent
+ *
+ * Note that this differs from block->divergent because in nir's terms, the
+ * start block of a loop with divergent continues can be non-divergent but nak
+ * will always consider this divergent. This matters because nak does not allow
+ * writing uregs from these blocks.
+ */
+bool nak_block_is_divergent(const nir_block *block);
 
 void nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak);
 

@@ -20,7 +20,7 @@ struct si_shader_context {
    struct si_shader *shader;
    struct si_screen *screen;
 
-   gl_shader_stage stage;
+   mesa_shader_stage stage;
 
    struct si_shader_args *args;
    struct ac_shader_abi abi;
@@ -29,9 +29,6 @@ struct si_shader_context {
    LLVMTypeRef return_type;
 
    struct ac_llvm_compiler *compiler;
-
-   LLVMValueRef gs_ngg_emit;
-   struct ac_llvm_pointer gs_ngg_scratch;
    LLVMValueRef return_value;
 };
 
@@ -64,7 +61,6 @@ void si_llvm_gs_build_end(struct si_shader_context *ctx);
 
 /* si_shader_llvm_tess.c */
 void si_llvm_ls_build_end(struct si_shader_context *ctx);
-void si_llvm_tcs_build_end(struct si_shader_context *ctx);
 void si_llvm_init_tcs_callbacks(struct si_shader_context *ctx);
 
 /* si_shader_llvm_ps.c */

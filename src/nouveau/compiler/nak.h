@@ -32,6 +32,8 @@ nak_nir_options(const struct nak_compiler *nak);
 
 void nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak);
 
+bool nak_nir_lower_image_addrs(nir_shader *nir, const struct nak_compiler *nak);
+
 struct nak_sample_location {
    uint8_t x_u4 : 4;
    uint8_t y_u4 : 4;
@@ -118,7 +120,7 @@ struct nak_xfb_info {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wpadded"
 struct nak_shader_info {
-   gl_shader_stage stage;
+   mesa_shader_stage stage;
 
    /** Shader model */
    uint8_t sm;
@@ -144,7 +146,7 @@ struct nak_shader_info {
    uint32_t num_instrs;
 
    /** Number of cycles used by fixed-latency instructions */
-   uint32_t num_static_cycles;
+   uint64_t num_static_cycles;
 
    /** Number of spills from GPRs to Memory */
    uint32_t num_spills_to_mem;
@@ -209,6 +211,8 @@ struct nak_shader_info {
       struct nak_xfb_info xfb;
    } vtg;
 
+   uint8_t _pad1[4];
+
    /** Shader header for 3D stages */
    uint32_t hdr[32];
 };
@@ -240,14 +244,19 @@ struct nak_qmd_cbuf {
 struct nak_qmd_info {
    uint64_t addr;
 
-   uint16_t smem_size;
-   uint16_t smem_max;
+   uint32_t smem_size;
 
    uint32_t global_size[3];
 
    uint32_t num_cbufs;
    struct nak_qmd_cbuf cbufs[8];
 };
+
+#define NAK_QMD_ALIGN_B 256
+#define NAK_MAX_QMD_SIZE_B 384
+#define NAK_MAX_QMD_DWORDS (NAK_MAX_QMD_SIZE_B / 4)
+
+uint32_t nak_qmd_size_B(const struct nv_device_info *dev);
 
 void nak_fill_qmd(const struct nv_device_info *dev,
                   const struct nak_shader_info *info,

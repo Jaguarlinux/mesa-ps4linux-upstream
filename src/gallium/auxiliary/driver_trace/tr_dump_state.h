@@ -103,6 +103,8 @@ void trace_dump_draw_vertex_state_info(struct pipe_draw_vertex_state_info state)
 
 void trace_dump_draw_start_count(const struct pipe_draw_start_count_bias *state);
 
+void trace_dump_draw_start_count_indexed(const struct pipe_draw_start_count_bias *state);
+
 void trace_dump_draw_indirect_info(const struct pipe_draw_indirect_info *state);
 
 void trace_dump_blit_info(const struct pipe_blit_info *);
@@ -119,4 +121,6 @@ void trace_dump_image_view(const struct pipe_image_view *view);
 void trace_dump_memory_info(const struct pipe_memory_info *state);
 
 void trace_dump_winsys_handle(const struct winsys_handle *whandle);
+
+void trace_dump_vm_allocation(struct pipe_vm_allocation *alloc);
 #endif /* TR_STATE_H */

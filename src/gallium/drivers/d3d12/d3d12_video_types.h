@@ -42,8 +42,6 @@ using Microsoft::WRL::ComPtr;
 
 #define D3D12_VIDEO_ANY_DECODER_ENABLED (VIDEO_CODEC_H264DEC || VIDEO_CODEC_H265DEC || VIDEO_CODEC_AV1DEC || VIDEO_CODEC_VP9DEC)
 
-#define D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE (USE_D3D12_PREVIEW_HEADERS && (D3D12_PREVIEW_SDK_VERSION >= 716))
-
 #if !defined(_WIN32) || defined(_MSC_VER)
 inline D3D12_VIDEO_DECODER_HEAP_DESC
 GetDesc(ID3D12VideoDecoderHeap *heap)
@@ -66,16 +64,7 @@ GetDesc(ID3D12VideoDecoderHeap *heap)
 */
 const bool D3D12_VIDEO_ENC_CBR_FORCE_VBV_EQUAL_BITRATE = debug_get_bool_option("D3D12_VIDEO_ENC_CBR_FORCE_VBV_EQUAL_BITRATE", false);
 
-/**
- * This indicates how many in-flight encode commands can happen before blocking on the next request
- */
-const size_t D3D12_VIDEO_ENC_ASYNC_DEPTH = static_cast<size_t>(debug_get_num_option("D3D12_VIDEO_ENC_ASYNC_DEPTH", 8));
-
-const size_t D3D12_VIDEO_ENC_METADATA_BUFFERS_COUNT = static_cast<size_t>(debug_get_num_option("D3D12_VIDEO_ENC_METADATA_BUFFERS_COUNT", 2 * D3D12_VIDEO_ENC_ASYNC_DEPTH));
-
 constexpr unsigned int D3D12_VIDEO_H264_MB_IN_PIXELS = 16;
-
-constexpr size_t D3D12_DEFAULT_COMPBIT_STAGING_SIZE = (1024 /*1K*/ * 1024/*1MB*/) * 8/*8 MB*/; // 8MB 
 
 /* If enabled, the D3D12 AV1 encoder will use always ...CONFIGURABLE_GRID_PARTITION mode */
 /* If disabled, the D3D12 AV1 encoder will try to use ...UNIFORM_GRID_PARTITION first and then fallback to ...CONFIGURABLE_GRID_PARTITION if not possible */
@@ -162,8 +151,6 @@ uint8_t
 d3d12_video_encoder_convert_12tusize_to_pixel_size_hevc(const D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE& TUSize);
 D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT
 ConvertHEVCSupportFromProfile(D3D12_VIDEO_ENCODER_PROFILE_HEVC profile, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1* pSupport1);
-D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA
-ConvertHEVCPicParamsFromProfile(D3D12_VIDEO_ENCODER_PROFILE_HEVC profile, D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1* pPictureParams1);
 bool
 d3d12_video_encode_requires_texture_array_dpb(struct d3d12_screen* pScreen, enum pipe_video_profile profile);
 

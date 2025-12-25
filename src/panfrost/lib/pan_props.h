@@ -32,111 +32,73 @@
 
 #include "util/macros.h"
 
+#include "pan_model.h"
+
 struct pan_kmod_dev;
 struct pan_kmod_dev_props;
+struct pan_kmod_vm;
 
-/** Implementation-defined tiler features */
-struct panfrost_tiler_features {
-   /** Number of bytes per tiler bin */
-   unsigned bin_size;
+#define ARM_VENDOR_ID 0x13B5
 
-   /** Maximum number of levels that may be simultaneously enabled.
-    * Invariant: bitcount(hierarchy_mask) <= max_levels */
-   unsigned max_levels;
-};
+unsigned pan_query_l2_slices(const struct pan_kmod_dev_props *props);
 
-struct panfrost_model {
-   /* GPU ID */
-   uint32_t gpu_id;
+struct pan_tiler_features
+pan_query_tiler_features(const struct pan_kmod_dev_props *props);
 
-   /* GPU variant. */
-   uint32_t gpu_variant;
+unsigned pan_query_thread_tls_alloc(const struct pan_kmod_dev_props *props);
 
-   /* Marketing name for the GPU, used as the GL_RENDERER */
-   const char *name;
+uint32_t pan_query_compressed_formats(const struct pan_kmod_dev_props *props);
 
-   /* Set of associated performance counters */
-   const char *performance_counters;
+unsigned pan_query_core_count(const struct pan_kmod_dev_props *props,
+                              unsigned *core_id_range);
 
-   /* Minimum GPU revision required for anisotropic filtering. ~0 and 0
-    * means "no revisions support anisotropy" and "all revisions support
-    * anistropy" respectively -- so checking for anisotropy is simply
-    * comparing the reivsion.
-    */
-   uint32_t min_rev_anisotropic;
+bool pan_query_afbc(const struct pan_kmod_dev_props *props);
 
-   /* Default tilebuffer size in bytes for the model. */
-   unsigned tilebuffer_size;
+bool pan_query_afrc(const struct pan_kmod_dev_props *props);
 
-   /* Default tilebuffer depth size in bytes for the model. */
-   unsigned tilebuffer_z_size;
+unsigned pan_query_tib_size(const struct pan_model *model);
 
-   struct {
-      /* The GPU lacks the capability for hierarchical tiling, without
-       * an "Advanced Tiling Unit", instead requiring a single bin
-       * size for the entire framebuffer be selected by the driver
-       */
-      bool no_hierarchical_tiling;
-   } quirks;
-};
-
-const struct panfrost_model *panfrost_get_model(uint32_t gpu_id,
-                                                uint32_t gpu_variant);
-
-unsigned panfrost_query_l2_slices(const struct pan_kmod_dev_props *props);
-
-struct panfrost_tiler_features
-panfrost_query_tiler_features(const struct pan_kmod_dev_props *props);
-
-unsigned
-panfrost_query_thread_tls_alloc(const struct pan_kmod_dev_props *props);
-
-uint32_t
-panfrost_query_compressed_formats(const struct pan_kmod_dev_props *props);
-
-unsigned panfrost_query_core_count(const struct pan_kmod_dev_props *props,
-                                   unsigned *core_id_range);
-
-bool panfrost_query_afbc(const struct pan_kmod_dev_props *props);
-
-bool panfrost_query_afrc(const struct pan_kmod_dev_props *props);
-
-unsigned panfrost_query_optimal_tib_size(const struct panfrost_model *model);
-
-unsigned panfrost_query_optimal_z_tib_size(const struct panfrost_model *model);
-
-uint64_t panfrost_clamp_to_usable_va_range(const struct pan_kmod_dev *dev,
-                                           uint64_t va);
-
-unsigned
-panfrost_compute_max_thread_count(const struct pan_kmod_dev_props *props,
-                                  unsigned work_reg_count);
-
-/* Returns the architecture version given a GPU ID, either from a table for
- * old-style Midgard versions or directly for new-style Bifrost/Valhall
- * versions */
+unsigned pan_query_z_tib_size(const struct pan_model *model);
 
 static inline unsigned
-pan_arch(unsigned gpu_id)
+pan_query_optimal_tib_size(unsigned arch, const struct pan_model *model)
 {
-   switch (gpu_id) {
-   case 0x600:
-   case 0x620:
-   case 0x720:
-      return 4;
-   case 0x750:
-   case 0x820:
-   case 0x830:
-   case 0x860:
-   case 0x880:
-      return 5;
-   default:
-      return gpu_id >> 12;
-   }
+   unsigned tib_size = pan_query_tib_size(model);
+
+   /* On V5, as well as V7 and later, we can disable pipelining to gain some
+    * extra tib memory.
+    */
+   if (arch > 4 && arch != 6)
+      return tib_size / 2;
+
+   return tib_size;
 }
 
 static inline unsigned
-panfrost_max_effective_tile_size(unsigned arch)
+pan_query_optimal_z_tib_size(unsigned arch, const struct pan_model *model)
+{
+   unsigned tib_size = pan_query_z_tib_size(model);
+
+   /* On V5, as well as V7 and later, we can disable pipelining to gain some
+    * extra tib memory.
+    */
+   if (arch > 4 && arch != 6)
+      return tib_size / 2;
+
+   return tib_size;
+}
+
+uint64_t pan_clamp_to_usable_va_range(const struct pan_kmod_dev *dev,
+                                      uint64_t va);
+
+uint64_t pan_choose_gpu_va_alignment(const struct pan_kmod_vm *vm,
+                                     uint64_t size);
+
+unsigned pan_compute_max_thread_count(const struct pan_kmod_dev_props *props,
+                                      unsigned work_reg_count);
+
+static inline unsigned
+pan_max_effective_tile_size(unsigned arch)
 {
    if (arch >= 12)
       return 64 * 64;
@@ -148,29 +110,12 @@ panfrost_max_effective_tile_size(unsigned arch)
 }
 
 static inline unsigned
-panfrost_meta_tile_size(unsigned arch)
+pan_meta_tile_size(unsigned arch)
 {
    if (arch >= 12)
       return 64;
 
    return 32;
-}
-
-/* Returns the maximum usable color tilebuffer-size. This is *usually* twice
- * the optimal tilebuffer-size, but not always.
- */
-static inline unsigned
-pan_get_max_tib_size(unsigned arch, const struct panfrost_model *model)
-{
-   unsigned tib_size = panfrost_query_optimal_tib_size(model);
-
-   /* On V5, as well as V6 and later, we can disable pipelining to gain some
-    * extra tib memory.
-    */
-   if (arch > 4 && arch != 6)
-      return tib_size * 2;
-
-   return tib_size;
 }
 
 static inline uint32_t
@@ -193,12 +138,16 @@ static inline unsigned
 pan_get_max_msaa(unsigned arch, unsigned max_tib_size, unsigned max_cbuf_atts,
                  unsigned format_size)
 {
+   if (arch < 5)
+      return 8;
+
    assert(max_cbuf_atts > 0);
    assert(format_size > 0);
+
    const unsigned min_tile_size = 4 * 4;
    unsigned max_msaa = max_tib_size / (max_cbuf_atts * format_size *
                                        min_tile_size);
-   return MIN2(max_msaa, arch >= 5 ? 16 : 8);
+   return MIN2(max_msaa, 16);
 }
 
 #endif

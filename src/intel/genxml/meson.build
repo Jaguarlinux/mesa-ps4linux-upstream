@@ -54,6 +54,8 @@ genX_bits_included_symbols = [
   '3DSTATE_SO_BUFFER::Stream Offset',
   '3DSTATE_CPSIZE_CONTROL_BUFFER::Surface Base Address',
   '3DSTATE_CPSIZE_CONTROL_BUFFER::Surface Pitch',
+  'COMPUTE_WALKER::body',
+  'EXECUTE_INDIRECT_DISPATCH::body',
   # structures
   'RENDER_SURFACE_STATE::Surface Base Address',
   'RENDER_SURFACE_STATE::Surface Pitch',
@@ -68,6 +70,7 @@ genX_bits_included_symbols = [
   'RENDER_SURFACE_STATE::Width',
   'RENDER_SURFACE_STATE::Height',
   'RENDER_SURFACE_STATE::Depth',
+  'RENDER_SURFACE_STATE::Surface Format',
   'RENDER_SURFACE_STATE::Surface Type',
   'RENDER_SURFACE_STATE::Render Target View Extent',
   'RENDER_SURFACE_STATE::Tile Mode',
@@ -154,7 +157,9 @@ idep_genxml = declare_dependency(
   sources : [gen_xml_pack, gen_xml_video_pack, gen_cl_xml_pack, genX_bits_h, genX_xml_h]
 )
 
-foreach f : gen_xml_files + gen_xml_rt_files
+gen_xml_test_files = ['../decoder/tests/gentest.xml']
+
+foreach f : gen_xml_files + gen_xml_rt_files + gen_xml_test_files
   test(
     'genxml sort @0@'.format(f),
     prog_python,

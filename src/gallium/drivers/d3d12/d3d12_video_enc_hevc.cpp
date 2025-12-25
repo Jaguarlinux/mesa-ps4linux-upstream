@@ -42,9 +42,12 @@ d3d12_video_encoder_update_current_rate_control_hevc(struct d3d12_video_encoder 
    struct D3D12EncodeRateControlState m_prevRCState = pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id];
    pD3D12Enc->m_currentEncodeConfig.m_activeRateControlIndex = picture->pic.temporal_id;
    bool wasDeltaQPRequested = (pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id].m_Flags & D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_DELTA_QP) != 0;
+   bool wasFrameAnalysisRequested = (pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id].m_Flags & D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_FRAME_ANALYSIS) != 0;
    pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id] = {};
    if (wasDeltaQPRequested)
       pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id].m_Flags |= D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_DELTA_QP;
+   if (wasFrameAnalysisRequested)
+      pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id].m_Flags |= D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_FRAME_ANALYSIS;
 
    pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[picture->pic.temporal_id].m_FrameRate.Numerator =
       picture->rc[picture->pic.temporal_id].frame_rate_num;
@@ -304,7 +307,7 @@ d3d12_video_encoder_update_current_rate_control_hevc(struct d3d12_video_encoder 
             } break;
             default:
             {
-               unreachable("Unsupported pipe_h2645_enc_picture_type");
+               UNREACHABLE("Unsupported pipe_h2645_enc_picture_type");
             } break;
          }
 
@@ -345,7 +348,7 @@ void
 d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video_encoder *pD3D12Enc,
                                                               struct pipe_video_buffer *srcTexture,
                                                               struct pipe_picture_desc *picture,
-                                                              D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA &picParams,
+                                                              D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 *pHEVCPicData,
                                                               bool &bUsedAsReference)
 {
    struct pipe_h265_enc_picture_desc *hevcPic = (struct pipe_h265_enc_picture_desc *) picture;
@@ -359,7 +362,7 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
    if (pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.SupportFlags &
        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE_FLAG_SLICE_SUPPORT)
    {
-      picParams.pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_REQUEST_NUM_REF_IDX_ACTIVE_OVERRIDE_FLAG_SLICE;
+      pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_REQUEST_NUM_REF_IDX_ACTIVE_OVERRIDE_FLAG_SLICE;
    }
 
    if ((hevcPic->base.profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_444) ||
@@ -367,25 +370,25 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
        (hevcPic->base.profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_422) ||
        (hevcPic->base.profile == PIPE_VIDEO_PROFILE_HEVC_MAIN10_422))
    {
-      assert(picParams.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1));
+      assert(sizeof(*pHEVCPicData) == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2));
 
       if (hevcPic->pic.pps_range_extension.pps_range_extension_flag)
       {
          //
          // Clear pps_range_extension() params if pps_range_extension_flag not enabled
          //
-         picParams.pHEVCPicData1->log2_max_transform_skip_block_size_minus2 = 0u;
-         picParams.pHEVCPicData1->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
-         picParams.pHEVCPicData1->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
-         picParams.pHEVCPicData1->diff_cu_chroma_qp_offset_depth = 0u;
-         picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1 = 0u;
-         for (uint32_t i = 0; i < ARRAY_SIZE(picParams.pHEVCPicData1->cb_qp_offset_list) ; i++)
+         pHEVCPicData->log2_max_transform_skip_block_size_minus2 = 0u;
+         pHEVCPicData->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
+         pHEVCPicData->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
+         pHEVCPicData->diff_cu_chroma_qp_offset_depth = 0u;
+         pHEVCPicData->chroma_qp_offset_list_len_minus1 = 0u;
+         for (uint32_t i = 0; i < ARRAY_SIZE(pHEVCPicData->cb_qp_offset_list) ; i++)
          {
-            picParams.pHEVCPicData1->cb_qp_offset_list[i] = 0u;
-            picParams.pHEVCPicData1->cr_qp_offset_list[i] = 0u;
+            pHEVCPicData->cb_qp_offset_list[i] = 0u;
+            pHEVCPicData->cr_qp_offset_list[i] = 0u;
          }
-         picParams.pHEVCPicData1->log2_sao_offset_scale_luma = 0u;
-         picParams.pHEVCPicData1->log2_sao_offset_scale_chroma = 0u;
+         pHEVCPicData->log2_sao_offset_scale_luma = 0u;
+         pHEVCPicData->log2_sao_offset_scale_chroma = 0u;
       }
       else
       {
@@ -399,10 +402,10 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
          {
             if (hevcPic->pic.transform_skip_enabled_flag)
             {
-               picParams.pHEVCPicData1->log2_max_transform_skip_block_size_minus2 = static_cast<CHAR>(hevcPic->pic.pps_range_extension.log2_max_transform_skip_block_size_minus2);
-               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_max_transform_skip_block_size_minus2_values & (1 << picParams.pHEVCPicData1->log2_max_transform_skip_block_size_minus2)) == 0)
+               pHEVCPicData->log2_max_transform_skip_block_size_minus2 = static_cast<CHAR>(hevcPic->pic.pps_range_extension.log2_max_transform_skip_block_size_minus2);
+               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_max_transform_skip_block_size_minus2_values & (1 << pHEVCPicData->log2_max_transform_skip_block_size_minus2)) == 0)
                {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - log2_max_transform_skip_block_size_minus2 %d is not supported.\n", picParams.pHEVCPicData1->log2_max_transform_skip_block_size_minus2);
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - log2_max_transform_skip_block_size_minus2 %d is not supported.\n", pHEVCPicData->log2_max_transform_skip_block_size_minus2);
                   assert(false);
                }
             }
@@ -413,24 +416,24 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
          //
          {
             if (hevcPic->pic.pps_range_extension.cross_component_prediction_enabled_flag)
-               picParams.pHEVCPicData1->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
+               pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
 
-            if(((picParams.pHEVCPicData1->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION) != 0)
+            if(((pHEVCPicData->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION) != 0)
                   && ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CROSS_COMPONENT_PREDICTION_ENABLED_FLAG_SUPPORT) == 0))
             {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION is not supported."
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION is not supported."
                   " Ignoring the request for this feature flag on this encode session\n");
                   // Disable it and keep going with a warning
-                  picParams.pHEVCPicData1->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
+                  pHEVCPicData->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
             }
 
-            if(((picParams.pHEVCPicData1->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION) == 0)
+            if(((pHEVCPicData->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION) == 0)
                   && ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CROSS_COMPONENT_PREDICTION_ENABLED_FLAG_REQUIRED) != 0))
             {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION is required to be set."
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION is required to be set."
                   " Enabling this HW required feature flag on this encode session\n");
                   // HW doesn't support otherwise, so set it
-                  picParams.pHEVCPicData1->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
+                  pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
             }
          }
 
@@ -439,66 +442,66 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
          //
          if (hevcPic->pic.pps_range_extension.chroma_qp_offset_list_enabled_flag)
          {
-            picParams.pHEVCPicData1->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
-            if(((picParams.pHEVCPicData1->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST) != 0)
+            pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
+            if(((pHEVCPicData->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST) != 0)
                   && ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CHROMA_QP_OFFSET_LIST_ENABLED_FLAG_SUPPORT) == 0))
             {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST is not supported."
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST is not supported."
                   " Ignoring the request for this feature flag on this encode session\n");
                   // Disable it and keep going with a warning
-                  picParams.pHEVCPicData1->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
+                  pHEVCPicData->Flags &= ~D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
             }
 
-            if(((picParams.pHEVCPicData1->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST) == 0)
+            if(((pHEVCPicData->Flags & D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST) == 0)
                   && ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CHROMA_QP_OFFSET_LIST_ENABLED_FLAG_REQUIRED) != 0))
             {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST is required to be set."
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST is required to be set."
                   " Enabling this HW required feature flag on this encode session\n");
                   // HW doesn't support otherwise, so set it
-                  picParams.pHEVCPicData1->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
+                  pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
             }
 
             //
             // Set and validate diff_cu_chroma_qp_offset_depth
             //
-            picParams.pHEVCPicData1->diff_cu_chroma_qp_offset_depth = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.diff_cu_chroma_qp_offset_depth);
-            if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_diff_cu_chroma_qp_offset_depth_values & (1 << picParams.pHEVCPicData1->diff_cu_chroma_qp_offset_depth)) == 0)
+            pHEVCPicData->diff_cu_chroma_qp_offset_depth = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.diff_cu_chroma_qp_offset_depth);
+            if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_diff_cu_chroma_qp_offset_depth_values & (1 << pHEVCPicData->diff_cu_chroma_qp_offset_depth)) == 0)
             {
-               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - diff_cu_chroma_qp_offset_depth %d is not supported.\n", picParams.pHEVCPicData1->diff_cu_chroma_qp_offset_depth);
+               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - diff_cu_chroma_qp_offset_depth %d is not supported.\n", pHEVCPicData->diff_cu_chroma_qp_offset_depth);
                assert(false);
             }
 
             //
             // Set and validate chroma_qp_offset_list_len_minus1
             //
-            picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1 = static_cast<CHAR>(hevcPic->pic.pps_range_extension.chroma_qp_offset_list_len_minus1);
+            pHEVCPicData->chroma_qp_offset_list_len_minus1 = static_cast<CHAR>(hevcPic->pic.pps_range_extension.chroma_qp_offset_list_len_minus1);
             if (hevcPic->pic.pps_range_extension.chroma_qp_offset_list_len_minus1 > 5)
             {
-               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - chroma_qp_offset_list_len_minus1 %d is not supported.\n", hevcPic->pic.pps_range_extension.chroma_qp_offset_list_len_minus1);
+               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - chroma_qp_offset_list_len_minus1 %d is not supported.\n", hevcPic->pic.pps_range_extension.chroma_qp_offset_list_len_minus1);
                assert(false);
             }
 
-            if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_chroma_qp_offset_list_len_minus1_values & (1 << picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1)) == 0)
+            if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_chroma_qp_offset_list_len_minus1_values & (1 << pHEVCPicData->chroma_qp_offset_list_len_minus1)) == 0)
             {
-               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - chroma_qp_offset_list_len_minus1 %d is not supported.\n", picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1);
+               debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - chroma_qp_offset_list_len_minus1 %d is not supported.\n", pHEVCPicData->chroma_qp_offset_list_len_minus1);
                assert(false);
             }
 
             //
             // Set and validate cb_qp_offset_list, cr_qp_offset_list
             //
-            for (uint32_t i = 0; i < picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1 ; i++)
+            for (uint32_t i = 0; i < pHEVCPicData->chroma_qp_offset_list_len_minus1 ; i++)
             {
-               picParams.pHEVCPicData1->cb_qp_offset_list[i] = static_cast<CHAR>(hevcPic->pic.pps_range_extension.cb_qp_offset_list[i]);
-               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_cb_qp_offset_list_values[i] & (1 << (picParams.pHEVCPicData1->cb_qp_offset_list[i] + 12))) == 0)
+               pHEVCPicData->cb_qp_offset_list[i] = static_cast<CHAR>(hevcPic->pic.pps_range_extension.cb_qp_offset_list[i]);
+               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_cb_qp_offset_list_values[i] & (1 << (pHEVCPicData->cb_qp_offset_list[i] + 12))) == 0)
                {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - cb_qp_offset_list[%d] %d is not supported.\n", i, picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1);
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - cb_qp_offset_list[%d] %d is not supported.\n", i, pHEVCPicData->chroma_qp_offset_list_len_minus1);
                   assert(false);
                }
-               picParams.pHEVCPicData1->cr_qp_offset_list[i] = static_cast<CHAR>(hevcPic->pic.pps_range_extension.cr_qp_offset_list[i]);
-               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_cr_qp_offset_list_values[i] & (1 << (picParams.pHEVCPicData1->cr_qp_offset_list[i] + 12))) == 0)
+               pHEVCPicData->cr_qp_offset_list[i] = static_cast<CHAR>(hevcPic->pic.pps_range_extension.cr_qp_offset_list[i]);
+               if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_cr_qp_offset_list_values[i] & (1 << (pHEVCPicData->cr_qp_offset_list[i] + 12))) == 0)
                {
-                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - cr_qp_offset_list[%d] %d is not supported.\n", i, picParams.pHEVCPicData1->chroma_qp_offset_list_len_minus1);
+                  debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - cr_qp_offset_list[%d] %d is not supported.\n", i, pHEVCPicData->chroma_qp_offset_list_len_minus1);
                   assert(false);
                }
             }
@@ -507,64 +510,112 @@ d3d12_video_encoder_update_current_frame_pic_params_info_hevc(struct d3d12_video
          //
          // Set and validate log2_sao_offset_scale_luma
          //
-         picParams.pHEVCPicData1->log2_sao_offset_scale_luma = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.log2_sao_offset_scale_luma);
-         if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_sao_offset_scale_luma_values & (1 << picParams.pHEVCPicData1->log2_sao_offset_scale_luma)) == 0)
+         pHEVCPicData->log2_sao_offset_scale_luma = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.log2_sao_offset_scale_luma);
+         if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_sao_offset_scale_luma_values & (1 << pHEVCPicData->log2_sao_offset_scale_luma)) == 0)
          {
-            debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - log2_sao_offset_scale_luma %d is not supported.\n", picParams.pHEVCPicData1->log2_sao_offset_scale_luma);
+            debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - log2_sao_offset_scale_luma %d is not supported.\n", pHEVCPicData->log2_sao_offset_scale_luma);
             assert(false);
          }
 
          //
          // Set and validate log2_sao_offset_scale_chroma
          //
-         picParams.pHEVCPicData1->log2_sao_offset_scale_chroma = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.log2_sao_offset_scale_chroma);
-         if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_sao_offset_scale_chroma_values & (1 << picParams.pHEVCPicData1->log2_sao_offset_scale_chroma)) == 0)
+         pHEVCPicData->log2_sao_offset_scale_chroma = static_cast<UCHAR>(hevcPic->pic.pps_range_extension.log2_sao_offset_scale_chroma);
+         if ((pD3D12Enc->m_currentEncodeCapabilities.m_encoderCodecSpecificConfigCaps.m_HEVCCodecCaps.allowed_log2_sao_offset_scale_chroma_values & (1 << pHEVCPicData->log2_sao_offset_scale_chroma)) == 0)
          {
-            debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 arguments are not supported - log2_sao_offset_scale_chroma %d is not supported.\n", picParams.pHEVCPicData1->log2_sao_offset_scale_chroma);
+            debug_printf("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC2 arguments are not supported - log2_sao_offset_scale_chroma %d is not supported.\n", pHEVCPicData->log2_sao_offset_scale_chroma);
             assert(false);
          }
       }
    }
 
-   picParams.pHEVCPicData->slice_pic_parameter_set_id = pHEVCBitstreamBuilder->get_active_pps().pps_pic_parameter_set_id;
+   pHEVCPicData->slice_pic_parameter_set_id = pHEVCBitstreamBuilder->get_active_pps().pps_pic_parameter_set_id;
+
+   unsigned ref_list0_count = 0u;
+   unsigned ref_list1_count = 0u;
+   d3d12_video_encoder_count_valid_reflist_entries_hevc(hevcPic,
+                                                        ref_list0_count,
+                                                        ref_list1_count);
 
    //
    // These need to be set here so they're available for SPS/PPS header building (reference manager updates after that, for slice header params)
    //
-   picParams.pHEVCPicData->TemporalLayerIndex = hevcPic->pic.temporal_id;
-   picParams.pHEVCPicData->List0ReferenceFramesCount = 0;
-   picParams.pHEVCPicData->List1ReferenceFramesCount = 0;
+   pHEVCPicData->TemporalLayerIndex = hevcPic->pic.temporal_id;
+   pHEVCPicData->num_ref_idx_l0_active_minus1 = 0;
+   pHEVCPicData->num_ref_idx_l1_active_minus1 = 0;
+   pHEVCPicData->List0ReferenceFramesCount = 0;
+   pHEVCPicData->List1ReferenceFramesCount = 0;
    if ((hevcPic->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_P) ||
        (hevcPic->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_B))
-      picParams.pHEVCPicData->List0ReferenceFramesCount = hevcPic->num_ref_idx_l0_active_minus1 + 1;
+   {
+      // Assume legacy behavior for now and override below if new SDK/interfaces are used
+      pHEVCPicData->List0ReferenceFramesCount = hevcPic->num_ref_idx_l0_active_minus1 + 1;
+      // Only set pHEVCPicData->num_ref_idx_l0_active_minus1/List0ReferenceFramesCount
+      // differently on the newer interfaces that support it
+      // Otherwise fallback to the legacy behavior using List0ReferenceFramesCount
+      // equal to num_ref_idx_l0_active_minus1 + 1
+      if (pD3D12Enc->m_spEncodeCommandList4)
+      {
+         pHEVCPicData->num_ref_idx_l0_active_minus1 = hevcPic->num_ref_idx_l0_active_minus1;
+         pHEVCPicData->List0ReferenceFramesCount = ref_list0_count;
+      }
+   }
+
    if (hevcPic->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_B)
-      picParams.pHEVCPicData->List1ReferenceFramesCount = hevcPic->num_ref_idx_l1_active_minus1 + 1;
+   {
+      // Assume legacy behavior for now and override below if new SDK/interfaces are used
+      pHEVCPicData->List1ReferenceFramesCount = hevcPic->num_ref_idx_l1_active_minus1 + 1;
+      // Only set pHEVCPicData->num_ref_idx_l1_active_minus1/List1ReferenceFramesCount
+      // differently on the newer interfaces that support it
+      // Otherwise fallback to the legacy behavior using List1ReferenceFramesCount
+      // equal to num_ref_idx_l1_active_minus1 + 1
+      if (pD3D12Enc->m_spEncodeCommandList4)
+      {
+         pHEVCPicData->num_ref_idx_l1_active_minus1 = hevcPic->num_ref_idx_l1_active_minus1;
+         pHEVCPicData->List1ReferenceFramesCount = ref_list1_count;
+      }
+   }
 
    if ((pD3D12Enc->m_currentEncodeConfig.m_encoderCodecSpecificConfigDesc.m_HEVCConfig.ConfigurationFlags 
       & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_ALLOW_REQUEST_INTRA_CONSTRAINED_SLICES) != 0)
-      picParams.pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_REQUEST_INTRA_CONSTRAINED_SLICES;
-#if D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE
+      pHEVCPicData->Flags |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_REQUEST_INTRA_CONSTRAINED_SLICES;
    if (pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.AppRequested)
    {
-      // Use 8 bit qpmap array for HEVC picparams (-51, 51 range and int8_t pRateControlQPMap type)
-      const int32_t hevc_min_delta_qp = -51;
-      const int32_t hevc_max_delta_qp = 51;
+      // Use 8-bit QP map entries (int8), but clamp to bit-depth dependent HEVC delta QP range (int8_t pRateControlQPMap type)
+      // HEVC spec: 7.4.9.14 Delta QP semantics : CUQpDeltaVal in [-(26 + QpBdOffsetY/2), 25 + QpBdOffsetY/2]
+      // where QpBdOffsetY = 6 * bit_depth_luma_minus8
+      const int32_t qp_bd_offset_y = 6 * static_cast<int32_t>(hevcPic->seq.bit_depth_luma_minus8);
+      const int32_t hevc_min_delta_qp = -(26 + (qp_bd_offset_y / 2));
+      const int32_t hevc_max_delta_qp = 25 + (qp_bd_offset_y / 2);
       d3d12_video_encoder_update_picparams_region_of_interest_qpmap(
          pD3D12Enc,
          &hevcPic->roi,
          hevc_min_delta_qp,
          hevc_max_delta_qp,
          pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.m_pRateControlQPMap8Bit);
-      picParams.pHEVCPicData->pRateControlQPMap = pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.m_pRateControlQPMap8Bit.data();
-      picParams.pHEVCPicData->QPMapValuesCount = static_cast<UINT>(pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.m_pRateControlQPMap8Bit.size());
+      pHEVCPicData->pRateControlQPMap =
+         pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.m_pRateControlQPMap8Bit.data();
+      pHEVCPicData->QPMapValuesCount = static_cast<UINT>(
+         pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInput.m_pRateControlQPMap8Bit.size());
+   } else if (pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInputBuffer.AppRequested &&
+              pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInputBuffer.m_qp_map_count > 0 &&
+              pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInputBuffer.m_p_qp_map_cpu) {
+      pHEVCPicData->pRateControlQPMap =
+         static_cast<INT8*>(pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInputBuffer.m_p_qp_map_cpu);
+      pHEVCPicData->QPMapValuesCount =
+         static_cast<UINT>(pD3D12Enc->m_currentEncodeConfig.m_QuantizationMatrixDesc.CPUInputBuffer.m_qp_map_count);
+      debug_printf("[d3d12_video_encoder_update_current_frame_pic_params_info_hevc] Using user-provided CPU 8-bit QP map buffer with %d entries ptr = %p\n",
+                  pHEVCPicData->QPMapValuesCount, pHEVCPicData->pRateControlQPMap);
    }
-#endif // D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE
 
-   pD3D12Enc->m_upDPBManager->begin_frame(picParams, bUsedAsReference, picture);
-   pD3D12Enc->m_upDPBManager->get_current_frame_picture_control_data(picParams);
+   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA1 picParams1 = {};
+   picParams1.pHEVCPicData = pHEVCPicData;
+   picParams1.DataSize = sizeof(*pHEVCPicData);
+   pD3D12Enc->m_upDPBManager->begin_frame(picParams1, bUsedAsReference, picture);
+   pD3D12Enc->m_upDPBManager->get_current_frame_picture_control_data(picParams1);
 
    // Save state snapshot from record time to resolve headers at get_feedback time
-   size_t current_metadata_slot = static_cast<size_t>(pD3D12Enc->m_fenceValue % D3D12_VIDEO_ENC_METADATA_BUFFERS_COUNT);
+   size_t current_metadata_slot = static_cast<size_t>(pD3D12Enc->m_fenceValue % pD3D12Enc->m_MaxMetadataBuffersCount);
    pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].m_associatedEncodeCapabilities =
       pD3D12Enc->m_currentEncodeCapabilities;
    pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].m_associatedEncodeConfig =
@@ -593,11 +644,11 @@ d3d12_video_encoder_negotiate_current_hevc_slices_configuration(struct d3d12_vid
    if ((picture->slice_mode == PIPE_VIDEO_SLICE_MODE_BLOCKS) && (picture->num_slice_descriptors > 1)) {
       /* Some apps send all same size slices minus 1 slice in any position in the descriptors */
       /* Lets validate that there are at most 2 different slice sizes in all the descriptors */
-      std::vector<int> slice_sizes(picture->num_slice_descriptors);
+      pD3D12Enc->m_TempSliceSizesBuffer.resize(picture->num_slice_descriptors);
       for (uint32_t i = 0; i < picture->num_slice_descriptors; i++)
-         slice_sizes[i] = picture->slices_descriptors[i].num_ctu_in_slice;
-      std::sort(slice_sizes.begin(), slice_sizes.end());
-      bool bUniformSizeSlices = (std::unique(slice_sizes.begin(), slice_sizes.end()) - slice_sizes.begin()) <= 2;
+         pD3D12Enc->m_TempSliceSizesBuffer[i] = picture->slices_descriptors[i].num_ctu_in_slice;
+      std::sort(pD3D12Enc->m_TempSliceSizesBuffer.begin(), pD3D12Enc->m_TempSliceSizesBuffer.end());
+      bool bUniformSizeSlices = (std::unique(pD3D12Enc->m_TempSliceSizesBuffer.begin(), pD3D12Enc->m_TempSliceSizesBuffer.end()) - pD3D12Enc->m_TempSliceSizesBuffer.begin()) <= 2;
 
       uint32_t subregion_block_pixel_size = pD3D12Enc->m_currentEncodeCapabilities.m_currentResolutionSupportCaps.SubregionBlockPixelsSize;
       uint32_t num_subregions_per_scanline =
@@ -683,7 +734,6 @@ d3d12_video_encoder_negotiate_current_hevc_slices_configuration(struct d3d12_vid
          return false;
       }
    }
-#if D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE
    else if(picture->slice_mode == PIPE_VIDEO_SLICE_MODE_AUTO) {
       if (d3d12_video_encoder_check_subregion_mode_support(
          pD3D12Enc,
@@ -699,7 +749,6 @@ d3d12_video_encoder_negotiate_current_hevc_slices_configuration(struct d3d12_vid
          return false;
       }
    }
-#endif // D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE
    else {
       requestedSlicesMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
       requestedSlicesConfig.NumberOfSlicesPerFrame = 1;
@@ -775,27 +824,6 @@ ConvertHEVCSupportFromProfile(D3D12_VIDEO_ENCODER_PROFILE_HEVC profile, D3D12_VI
       capCodecConfigData.pHEVCSupport1 = pSupport1;
    }
    return capCodecConfigData;
-}
-
-D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA
-ConvertHEVCPicParamsFromProfile(D3D12_VIDEO_ENCODER_PROFILE_HEVC profile, D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1* pPictureParams1)
-{
-   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA curPicParamsData = {};
-   if (profile <= D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN10)
-   {
-      // Profiles defined up to D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN10 use D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC
-      curPicParamsData.pHEVCPicData  = reinterpret_cast<D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC*>(pPictureParams1);
-      // D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 binary-compatible with D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC
-      curPicParamsData.DataSize      = sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC);
-   }
-   else
-   {
-      // Profiles defined between D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN12 and D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN16_444 use D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1
-      assert (profile <= D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN16_444);
-      curPicParamsData.pHEVCPicData1 = pPictureParams1;
-      curPicParamsData.DataSize      = sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1);
-   }
-   return curPicParamsData;
 }
 
 D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC
@@ -1161,7 +1189,7 @@ d3d12_video_encoder_convert_hevc_codec_configuration(struct d3d12_video_encoder 
 
 static bool
 d3d12_video_encoder_update_intra_refresh_hevc(struct d3d12_video_encoder *pD3D12Enc,
-                                                        D3D12_VIDEO_SAMPLE srcTextureDesc,
+                                                        const D3D12_VIDEO_SAMPLE& srcTextureDesc,
                                                         struct pipe_h265_enc_picture_desc *  picture)
 {
    if (picture->intra_refresh.mode != INTRA_REFRESH_MODE_NONE)
@@ -1203,7 +1231,7 @@ d3d12_video_encoder_update_intra_refresh_hevc(struct d3d12_video_encoder *pD3D12
 
 bool
 d3d12_video_encoder_update_current_encoder_config_state_hevc(struct d3d12_video_encoder *pD3D12Enc,
-                                                             D3D12_VIDEO_SAMPLE srcTextureDesc,
+                                                             const D3D12_VIDEO_SAMPLE& srcTextureDesc,
                                                              struct pipe_picture_desc *picture)
 {
    struct pipe_h265_enc_picture_desc *hevcPic = (struct pipe_h265_enc_picture_desc *) picture;
@@ -1252,16 +1280,16 @@ d3d12_video_encoder_update_current_encoder_config_state_hevc(struct d3d12_video_
    DXGI_FORMAT targetFmt = d3d12_convert_pipe_video_profile_to_dxgi_format(pD3D12Enc->base.profile);
    if (pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo.Format != targetFmt) {
       pD3D12Enc->m_currentEncodeConfig.m_ConfigDirtyFlags |= d3d12_video_encoder_config_dirty_flag_input_format;
-   }
 
-   pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo = {};
-   pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo.Format = targetFmt;
-   HRESULT hr = pD3D12Enc->m_pD3D12Screen->dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
-                                                          &pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo,
-                                                          sizeof(pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo));
-   if (FAILED(hr)) {
-      debug_printf("CheckFeatureSupport failed with HR %x\n", hr);
-      return false;
+      pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo = {};
+      pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo.Format = targetFmt;
+      HRESULT hr = pD3D12Enc->m_pD3D12Screen->dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
+                                                             &pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo,
+                                                             sizeof(pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo));
+      if (FAILED(hr)) {
+         debug_printf("CheckFeatureSupport failed with HR %x\n", (unsigned)hr);
+         return false;
+      }
    }
 
    // Set resolution
@@ -1329,11 +1357,7 @@ d3d12_video_encoder_update_current_encoder_config_state_hevc(struct d3d12_video_
 
    // Will call for d3d12 driver support based on the initial requested features, then
    // try to fallback if any of them is not supported and return the negotiated d3d12 settings
-#if D3D12_VIDEO_USE_NEW_ENCODECMDLIST4_INTERFACE
-   D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT2 capEncoderSupportData1 = {};
-#else
-   D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT1 capEncoderSupportData1 = {};
-#endif
+   D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT2 capEncoderSupportData2 = {};
    // Get max number of slices per frame supported
    if (hevcPic->num_slice_descriptors > 1)
       pD3D12Enc->m_currentEncodeConfig.m_encoderSliceConfigMode =
@@ -1348,14 +1372,73 @@ d3d12_video_encoder_update_current_encoder_config_state_hevc(struct d3d12_video_
       return false;
    }
 
-   if (!d3d12_video_encoder_negotiate_requested_features_and_d3d12_driver_caps(pD3D12Enc, capEncoderSupportData1)) {
-      debug_printf("[d3d12_video_encoder_hevc] After negotiating caps, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1 "
-                      "arguments are not supported - "
-                      "ValidationFlags: 0x%x - SupportFlags: 0x%x\n",
-                      capEncoderSupportData1.ValidationFlags,
-                      capEncoderSupportData1.SupportFlags);
+   // Set motion estimation config BEFORE caps query
+   auto targetMotionLimit = d3d12_video_encoder_convert_hevc_motion_configuration(pD3D12Enc, hevcPic);
+   if (pD3D12Enc->m_currentEncodeConfig.m_encoderMotionPrecisionLimit != targetMotionLimit) {
+      pD3D12Enc->m_currentEncodeConfig.m_ConfigDirtyFlags |=
+         d3d12_video_encoder_config_dirty_flag_motion_precision_limit;
+   }
+   pD3D12Enc->m_currentEncodeConfig.m_encoderMotionPrecisionLimit = targetMotionLimit;
+
+   // Set intra-refresh config BEFORE caps query
+   if(!d3d12_video_encoder_update_intra_refresh_hevc(pD3D12Enc, srcTextureDesc, hevcPic)) {
+      debug_printf("d3d12_video_encoder_update_intra_refresh_hevc failed!\n");
       return false;
    }
+
+   // Define flags that require re-querying driver capabilities
+   static const d3d12_video_encoder_config_dirty_flags caps_affecting_flags = 
+      (d3d12_video_encoder_config_dirty_flags)(
+         d3d12_video_encoder_config_dirty_flag_codec |
+         d3d12_video_encoder_config_dirty_flag_profile |
+         d3d12_video_encoder_config_dirty_flag_level |
+         d3d12_video_encoder_config_dirty_flag_codec_config |
+         d3d12_video_encoder_config_dirty_flag_input_format |
+         d3d12_video_encoder_config_dirty_flag_resolution |
+         d3d12_video_encoder_config_dirty_flag_slices |
+         d3d12_video_encoder_config_dirty_flag_gop |
+         d3d12_video_encoder_config_dirty_flag_motion_precision_limit |
+         d3d12_video_encoder_config_dirty_flag_intra_refresh
+      );
+
+   // Calculate effective dirty flags including configuration changes not tracked by dirty flags
+   // as there are set in d3d12_video_enc.cpp later in the encoding process
+   d3d12_video_encoder_config_dirty_flags effective_dirty_flags = pD3D12Enc->m_currentEncodeConfig.m_ConfigDirtyFlags;
+   if (!pD3D12Enc->m_prevFrameEncodeConfig.m_encoderRateControlDesc[pD3D12Enc->m_currentEncodeConfig.m_activeRateControlIndex]
+         .CompareEqual(pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc[pD3D12Enc->m_currentEncodeConfig.m_activeRateControlIndex])) {
+      effective_dirty_flags |= d3d12_video_encoder_config_dirty_flag_rate_control;
+   }
+   if (memcmp(&pD3D12Enc->m_prevFrameEncodeConfig.m_DirtyRectsDesc,
+              &pD3D12Enc->m_currentEncodeConfig.m_DirtyRectsDesc,
+              sizeof(pD3D12Enc->m_currentEncodeConfig.m_DirtyRectsDesc)) != 0) {
+      effective_dirty_flags |= d3d12_video_encoder_config_dirty_flag_dirty_regions;
+   }
+
+   // Only query driver caps if configuration parameters that affect capabilities have changed
+   if ((effective_dirty_flags & (caps_affecting_flags | d3d12_video_encoder_config_dirty_flag_rate_control | d3d12_video_encoder_config_dirty_flag_dirty_regions)) != 0) {
+      
+      debug_printf("[d3d12_video_encoder_hevc] Configuration changed - performing CheckFeatureSupport driver capability query (fenceValue: %" PRIu64 ", effectiveDirtyFlags: 0x%x)\n", 
+                   pD3D12Enc->m_fenceValue, 
+                   effective_dirty_flags);
+      if (!d3d12_video_encoder_negotiate_requested_features_and_d3d12_driver_caps(pD3D12Enc, capEncoderSupportData2)) {
+         debug_printf("[d3d12_video_encoder_hevc] After negotiating caps, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT2 "
+                         "arguments are not supported - "
+                         "ValidationFlags: 0x%x - SupportFlags: 0x%x\n",
+                         capEncoderSupportData2.ValidationFlags,
+                         capEncoderSupportData2.SupportFlags);
+         return false;
+      }
+   } else {
+      debug_printf("[d3d12_video_encoder_hevc] No configuration changes detected - skipping expensive driver query and reusing cached capabilities (fenceValue: %" PRIu64 ")\n", pD3D12Enc->m_fenceValue);
+      // Copy capabilities from previous frame to avoid expensive driver query
+      capEncoderSupportData2.SupportFlags = pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags;
+      capEncoderSupportData2.ValidationFlags = pD3D12Enc->m_currentEncodeCapabilities.m_ValidationFlags;
+      // Note: m_currentResolutionSupportCaps and other capability data remain valid from previous query
+   }
+
+   // Use the max worst case of the reported max slices per frame in caps in general and for this frame's configuration
+   pD3D12Enc->m_currentEncodeCapabilities.m_currentResolutionSupportCaps.MaxSubregionsNumber =
+      std::max (pD3D12Enc->m_currentEncodeCapabilities.m_currentResolutionSupportCaps.MaxSubregionsNumber, pD3D12Enc->screen_max_slices_per_frame);
 
    ///
    // Calculate current settings based on the returned values from the caps query
@@ -1368,22 +1451,8 @@ d3d12_video_encoder_update_current_encoder_config_state_hevc(struct d3d12_video_
          pD3D12Enc->m_currentEncodeConfig.m_currentResolution,
          pD3D12Enc->m_currentEncodeCapabilities.m_currentResolutionSupportCaps.SubregionBlockPixelsSize);
 
-   // Set intra-refresh config
-   if(!d3d12_video_encoder_update_intra_refresh_hevc(pD3D12Enc, srcTextureDesc, hevcPic)) {
-      debug_printf("d3d12_video_encoder_update_intra_refresh_hevc failed!\n");
-      return false;
-   }
-
    // m_currentEncodeConfig.m_encoderPicParamsDesc pic params are set in d3d12_video_encoder_reconfigure_encoder_objects
    // after re-allocating objects if needed
-
-   // Set motion estimation config
-   auto targetMotionLimit = d3d12_video_encoder_convert_hevc_motion_configuration(pD3D12Enc, hevcPic);
-   if (pD3D12Enc->m_currentEncodeConfig.m_encoderMotionPrecisionLimit != targetMotionLimit) {
-      pD3D12Enc->m_currentEncodeConfig.m_ConfigDirtyFlags |=
-         d3d12_video_encoder_config_dirty_flag_motion_precision_limit;
-   }
-   pD3D12Enc->m_currentEncodeConfig.m_encoderMotionPrecisionLimit = targetMotionLimit;
 
    //
    // Validate caps support returned values against current settings
@@ -1453,7 +1522,7 @@ d3d12_video_encoder_convert_profile_to_d3d12_enc_profile_hevc(enum pipe_video_pr
       } break;
       default:
       {
-         unreachable("Unsupported pipe_video_profile");
+         UNREACHABLE("Unsupported pipe_video_profile");
       } break;
    }
 }
@@ -1461,9 +1530,9 @@ d3d12_video_encoder_convert_profile_to_d3d12_enc_profile_hevc(enum pipe_video_pr
 bool
 d3d12_video_encoder_isequal_slice_config_hevc(
    D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE targetMode,
-   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES targetConfig,
+   const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES& targetConfig,
    D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE otherMode,
-   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES otherConfig)
+   const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES& otherConfig)
 {
    return (targetMode == otherMode) &&
           (memcmp(&targetConfig,
@@ -1499,7 +1568,7 @@ uint32_t
 d3d12_video_encoder_build_codec_headers_hevc(struct d3d12_video_encoder *pD3D12Enc,
                                              std::vector<uint64_t> &pWrittenCodecUnitsSizes)
 {
-   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA currentPicParams =
+   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA1 currentPicParams =
       d3d12_video_encoder_get_current_picture_param_settings(pD3D12Enc);
 
    auto profDesc = d3d12_video_encoder_get_current_profile_desc(pD3D12Enc);
@@ -1574,7 +1643,7 @@ d3d12_video_encoder_build_codec_headers_hevc(struct d3d12_video_encoder *pD3D12E
                                                                         pHEVCBitstreamBuilder->get_active_sps(),
                                                                         static_cast<uint8_t>(currentPicParams.pHEVCPicData->slice_pic_parameter_set_id),
                                                                         *codecConfigDesc.pHEVCConfig,
-                                                                        *currentPicParams.pHEVCPicData1,
+                                                                        *currentPicParams.pHEVCPicData,
                                                                         pD3D12Enc->m_StagingHeadersBuffer,
                                                                         pD3D12Enc->m_StagingHeadersBuffer.begin(),
                                                                         writtenPPSBytesCount);
@@ -1599,4 +1668,26 @@ d3d12_video_encoder_build_codec_headers_hevc(struct d3d12_video_encoder *pD3D12E
    assert(std::accumulate(pWrittenCodecUnitsSizes.begin(), pWrittenCodecUnitsSizes.end(), 0ull) ==
       pD3D12Enc->m_BitstreamHeadersBuffer.size());
    return static_cast<uint32_t>(pD3D12Enc->m_BitstreamHeadersBuffer.size());
+}
+
+void
+d3d12_video_encoder_count_valid_reflist_entries_hevc(const pipe_h265_enc_picture_desc *picture,
+                                                     unsigned &ref_list0_count,
+                                                     unsigned &ref_list1_count)
+{
+   for (ref_list0_count = 0; ref_list0_count < _countof(picture->ref_list0); ref_list0_count++)
+   {
+      if (picture->ref_list0[ref_list0_count] == PIPE_H2645_LIST_REF_INVALID_ENTRY)
+      {
+         break;
+      }
+   }
+
+   for (ref_list1_count = 0; ref_list1_count < _countof(picture->ref_list0); ref_list1_count++)
+   {
+      if (picture->ref_list1[ref_list1_count] == PIPE_H2645_LIST_REF_INVALID_ENTRY)
+      {
+         break;
+      }
+   }
 }

@@ -149,8 +149,10 @@ get_bool_cap(struct svga_winsys_screen *sws, SVGA3dDevCapIndex cap,
    .lower_doubles_options = nir_lower_dfloor | nir_lower_dsign | nir_lower_dceil | nir_lower_dtrunc | nir_lower_dround_even, \
    .lower_fmod = true,                                                        \
    .lower_fpow = true,                                                        \
-   .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),      \
-   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES)
+   .support_indirect_inputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |           \
+                              BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |           \
+                              BITFIELD_BIT(MESA_SHADER_FRAGMENT),             \
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_STAGES)
 
 static const nir_shader_compiler_options svga_vgpu9_fragment_compiler_options = {
    COMMON_OPTIONS,
@@ -181,22 +183,19 @@ static const nir_shader_compiler_options svga_gl4_compiler_options = {
    VGPU10_OPTIONS,
 };
 
-static const void *
+static const struct nir_shader_compiler_options *
 svga_get_compiler_options(struct pipe_screen *pscreen,
-                          enum pipe_shader_ir ir,
-                          enum pipe_shader_type shader)
+                          mesa_shader_stage shader)
 {
    struct svga_screen *svgascreen = svga_screen(pscreen);
    struct svga_winsys_screen *sws = svgascreen->sws;
-
-   assert(ir == PIPE_SHADER_IR_NIR);
 
    if (sws->have_gl43 || sws->have_sm5)
       return &svga_gl4_compiler_options;
    else if (sws->have_vgpu10)
       return &svga_vgpu10_compiler_options;
    else {
-      if (shader == PIPE_SHADER_FRAGMENT)
+      if (shader == MESA_SHADER_FRAGMENT)
          return &svga_vgpu9_fragment_compiler_options;
       else
          return &svga_vgpu9_vertex_compiler_options;
@@ -211,7 +210,7 @@ vgpu9_init_shader_caps(struct svga_screen *svgascreen)
    assert(!sws->have_vgpu10);
 
    struct pipe_shader_caps *caps =
-      (struct pipe_shader_caps *)&svgascreen->screen.shader_caps[PIPE_SHADER_VERTEX];
+      (struct pipe_shader_caps *)&svgascreen->screen.shader_caps[MESA_SHADER_VERTEX];
 
    caps->max_instructions =
    caps->max_alu_instructions =
@@ -229,7 +228,7 @@ vgpu9_init_shader_caps(struct svga_screen *svgascreen)
    caps->indirect_const_addr = true;
    caps->supported_irs = (1 << PIPE_SHADER_IR_TGSI) | (1 << PIPE_SHADER_IR_NIR);
 
-   caps = (struct pipe_shader_caps *)&svgascreen->screen.shader_caps[PIPE_SHADER_FRAGMENT];
+   caps = (struct pipe_shader_caps *)&svgascreen->screen.shader_caps[MESA_SHADER_FRAGMENT];
 
    caps->max_instructions =
    caps->max_alu_instructions =
@@ -257,17 +256,17 @@ vgpu10_init_shader_caps(struct svga_screen *svgascreen)
 
    assert(sws->have_vgpu10);
 
-    for (unsigned i = 0; i <= PIPE_SHADER_COMPUTE; i++) {
+    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++) {
        struct pipe_shader_caps *caps =
           (struct pipe_shader_caps *)&svgascreen->screen.shader_caps[i];
 
        switch (i) {
-       case PIPE_SHADER_TESS_CTRL:
-       case PIPE_SHADER_TESS_EVAL:
+       case MESA_SHADER_TESS_CTRL:
+       case MESA_SHADER_TESS_EVAL:
           if (!sws->have_sm5)
              continue;
           break;
-       case PIPE_SHADER_COMPUTE:
+       case MESA_SHADER_COMPUTE:
           if (!sws->have_gl43)
              continue;
           break;
@@ -285,19 +284,19 @@ vgpu10_init_shader_caps(struct svga_screen *svgascreen)
        caps->max_control_flow_depth = 64;
 
        switch (i) {
-       case PIPE_SHADER_FRAGMENT:
+       case MESA_SHADER_FRAGMENT:
           caps->max_inputs = VGPU10_MAX_PS_INPUTS;
           caps->max_outputs = VGPU10_MAX_PS_OUTPUTS;
           break;
-       case PIPE_SHADER_GEOMETRY:
+       case MESA_SHADER_GEOMETRY:
           caps->max_inputs = svgascreen->max_gs_inputs;
           caps->max_outputs = VGPU10_MAX_GS_OUTPUTS;
           break;
-       case PIPE_SHADER_TESS_CTRL:
+       case MESA_SHADER_TESS_CTRL:
           caps->max_inputs = VGPU11_MAX_HS_INPUT_CONTROL_POINTS;
           caps->max_outputs = VGPU11_MAX_HS_OUTPUTS;
           break;
-       case PIPE_SHADER_TESS_EVAL:
+       case MESA_SHADER_TESS_EVAL:
           caps->max_inputs = VGPU11_MAX_DS_INPUT_CONTROL_POINTS;
           caps->max_outputs = VGPU11_MAX_DS_OUTPUTS;
           break;
@@ -387,6 +386,7 @@ svga_init_screen_caps(struct svga_screen *svgascreen)
    caps->occlusion_query = true;
    caps->texture_buffer_objects = sws->have_vgpu10;
    caps->texture_buffer_offset_alignment = sws->have_vgpu10 ? 16 : 0;
+   caps->texture_mirror_clamp_to_edge = sws->have_vgpu10;
 
    caps->texture_swizzle = true;
    caps->constant_buffer_offset_alignment = 256;
@@ -527,12 +527,11 @@ svga_init_screen_caps(struct svga_screen *svgascreen)
 
    caps->vendor_id = 0x15ad; /* VMware Inc. */
    caps->device_id = sws->device_id ? sws->device_id : 0x0405; /* assume SVGA II */
-   caps->video_memory = 1; /* XXX: Query the host ? */
+   caps->video_memory = sws->max_mob_memory_mib ? sws->max_mob_memory_mib : 1;
    caps->copy_between_compressed_and_plain_formats = sws->have_vgpu10;
    caps->doubles = sws->have_sm5;
    caps->uma = false;
    caps->allow_mapped_buffers_during_execution = false;
-   caps->tgsi_div = true;
    caps->max_gs_invocations = 32;
    caps->max_shader_buffer_size = 1 << 27;
    /* Verify this once protocol is finalized. Setting it to minimum value. */
@@ -791,7 +790,6 @@ svga_screen_create(struct svga_winsys_screen *sws)
    screen->get_vendor = svga_get_vendor;
    screen->get_device_vendor = svga_get_vendor; // TODO actual device vendor
    screen->get_screen_fd = svga_screen_get_fd;
-   screen->get_compiler_options = svga_get_compiler_options;
    screen->get_timestamp = NULL;
    screen->is_format_supported = svga_is_format_supported;
    screen->context_create = svga_context_create;
@@ -838,6 +836,9 @@ svga_screen_create(struct svga_winsys_screen *sws)
        */
       svgascreen->debug.sampler_state_mapping = false;
    }
+
+   for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
+      screen->nir_options[i] = svga_get_compiler_options(screen, i);
 
    debug_printf("%s enabled\n",
                 sws->have_gl43 ? "SM5+" :

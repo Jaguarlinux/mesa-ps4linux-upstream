@@ -15,6 +15,14 @@ if [[ -z "$VK_DRIVER" ]]; then
     exit 1
 fi
 
+if [ -z "$VKD3D_PROTON_TAG" ]; then
+    echo "VKD3D_PROTON_TAG must be set to the conditional build tag"
+    exit 1
+fi
+
+# Are we using the right vkd3d-proton version?
+ci_tag_test_time_check "VKD3D_PROTON_TAG"
+
 INSTALL=$(realpath -s "$PWD"/install)
 
 # Set up the driver environment.
@@ -159,7 +167,7 @@ for expected_fail_line in "${expected_fail_lines[@]}"; do
   printf '%s,%s\n' "$test_name" "$test_status"
 done >> "$RESULTSFILE"
 
-mapfile -t unexpected_results < <(comm -23 "$RESULTSFILE" "$EXPECTATIONFILE")
+mapfile -t unexpected_results < <(comm -23 <(sort "$RESULTSFILE") <(sort "$EXPECTATIONFILE"))
 if [ ${#unexpected_results[@]} -gt 0 ]; then
   printf >&2 '\nUnexpected results:\n'
   printf >&2 '  %s\n' "${unexpected_results[@]}"

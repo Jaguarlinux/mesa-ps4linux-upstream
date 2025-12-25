@@ -10,8 +10,13 @@
 #include "pan_pps_driver.h"
 
 #include <cstring>
-#include <perfetto.h>
 #include <xf86drm.h>
+
+#ifndef ANDROID_LIBPERFETTO
+#include <perfetto.h>
+#else
+#include <perfetto/tracing.h>
+#endif
 
 #include <drm-uapi/panfrost_drm.h>
 #include <perf/pan_perf.h>
@@ -58,9 +63,9 @@ PanfrostDriver::create_available_counters(const PanfrostPerf &perf)
 
          counter.set_getter([=](const Counter &c, const Driver &d) {
             auto &pan_driver = PanfrostDriver::into(d);
-            struct panfrost_perf *perf = pan_driver.perf->perf;
+            struct pan_perf *perf = pan_driver.perf->perf;
             const auto counter = &perf->cfg->categories[gid].counters[id];
-            return int64_t(panfrost_perf_counter_read(counter, perf));
+            return int64_t(pan_perf_counter_read(counter, perf));
          });
 
          group.counters.push_back(cid++);

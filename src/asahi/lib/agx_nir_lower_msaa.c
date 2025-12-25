@@ -94,11 +94,7 @@ agx_nir_wrap_per_sample_loop(nir_shader *shader, uint8_t nr_samples)
    nir_loop *loop = nir_push_loop(&b);
    {
       bit = nir_load_var(&b, i);
-      nir_push_if(&b, nir_uge(&b, bit, end_bit));
-      {
-         nir_jump(&b, nir_jump_break);
-      }
-      nir_pop_if(&b, NULL);
+      nir_break_if(&b, nir_uge(&b, bit, end_bit));
 
       b.cursor = nir_cf_reinsert(&list, b.cursor);
       nir_store_var(&b, i, nir_ishl_imm(&b, bit, 1), ~0);
@@ -130,9 +126,12 @@ agx_nir_lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples)
    /* In single sampled programs, interpolateAtSample needs to return the
     * center pixel.
     */
-   if (nr_samples == 1)
-      nir_lower_single_sampled(shader);
-   else if (shader->info.fs.uses_sample_shading) {
+   if (nr_samples == 1) {
+      nir_lower_single_sampled_options lss_opts = {
+         .lower_sample_mask_in = true,
+      };
+      nir_lower_single_sampled(shader, &lss_opts);
+   } else if (shader->info.fs.uses_sample_shading) {
       agx_nir_lower_to_per_sample(shader);
       agx_nir_wrap_per_sample_loop(shader, nr_samples);
    }

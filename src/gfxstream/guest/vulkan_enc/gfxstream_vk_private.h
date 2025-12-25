@@ -81,6 +81,14 @@ struct gfxstream_vk_device {
 
     struct vk_device_dispatch_table cmd_dispatch;
     struct gfxstream_vk_physical_device* physical_device;
+
+    /* unique queue family indices in which to create the device queues */
+    uint32_t* queue_families;
+    uint32_t queue_family_count;
+
+    struct gfxstream_vk_queue* queues;
+    uint32_t queue_count;
+
     VkDevice internal_object;
 };
 
@@ -141,5 +149,8 @@ std::vector<VkFence> transformVkFenceList(const VkFence* pFences, uint32_t fence
 
 std::vector<VkSemaphoreSubmitInfo> transformVkSemaphoreSubmitInfoList(
     const VkSemaphoreSubmitInfo* pSemaphoreSubmitInfos, uint32_t semaphoreSubmitInfoCount);
+
+float linearChannelToSRGB(float cl);
+float srgbFormatNeedsConversionForClearColor(const VkFormat& format);
 
 #endif /* GFXSTREAM_VK_PRIVATE_H */

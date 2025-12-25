@@ -85,6 +85,8 @@ struct lp_jit_context
 
    struct lp_jit_viewport *viewports;
 
+   float min_depth_bounds, max_depth_bounds;
+
    uint32_t sample_mask;
 };
 
@@ -100,6 +102,8 @@ enum {
    LP_JIT_CTX_U8_BLEND_COLOR,
    LP_JIT_CTX_F_BLEND_COLOR,
    LP_JIT_CTX_VIEWPORTS,
+   LP_JIT_CTX_MIN_DEPTH_BOUNDS,
+   LP_JIT_CTX_MAX_DEPTH_BOUNDS,
    LP_JIT_CTX_SAMPLE_MASK,
    LP_JIT_CTX_COUNT
 };
@@ -121,6 +125,12 @@ enum {
 
 #define lp_jit_context_viewports(_gallivm, _type, _ptr) \
    lp_build_struct_get2(_gallivm, _type, _ptr, LP_JIT_CTX_VIEWPORTS, "viewports")
+
+#define lp_jit_context_min_depth_bounds(_gallivm, _type, _ptr) \
+   lp_build_struct_get2(_gallivm, _type, _ptr, LP_JIT_CTX_MIN_DEPTH_BOUNDS, "min_depth_bounds")
+
+#define lp_jit_context_max_depth_bounds(_gallivm, _type, _ptr) \
+   lp_build_struct_get2(_gallivm, _type, _ptr, LP_JIT_CTX_MAX_DEPTH_BOUNDS, "max_depth_bounds")
 
 #define lp_jit_context_sample_mask(_gallivm, _type, _ptr)                \
    lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CTX_SAMPLE_MASK, "sample_mask")
@@ -199,7 +209,8 @@ typedef void
                     const void *dady,
                     uint8_t **color,
                     uint8_t *depth,
-                    uint64_t mask,
+                    uint64_t mask0,
+                    uint64_t mask1,
                     struct lp_jit_thread_data *thread_data,
                     unsigned *stride,
                     unsigned depth_stride,
@@ -335,23 +346,8 @@ enum {
    LP_JIT_CS_CTX_COUNT
 };
 
-#define lp_jit_cs_context_constants(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_CONSTANTS, "constants")
-
-#define lp_jit_cs_context_ssbos(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_SSBOS, "ssbos")
-
-#define lp_jit_cs_context_textures(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_TEXTURES, "textures")
-
-#define lp_jit_cs_context_samplers(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_SAMPLERS, "samplers")
-
-#define lp_jit_cs_context_images(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_IMAGES, "images")
-
 #define lp_jit_cs_context_shared_size(_gallivm, _type, _ptr) \
-   lp_build_struct_get_ptr2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_SHARED_SIZE, "shared_size")
+   lp_build_struct_get2(_gallivm, _type, _ptr, LP_JIT_CS_CTX_SHARED_SIZE, "shared_size")
 
 typedef void
 (*lp_jit_cs_func)(const struct lp_jit_cs_context *context,
@@ -387,7 +383,9 @@ void lp_jit_buffer_from_bda(struct lp_jit_buffer *jit, void *mem, size_t size);
 void lp_jit_buffer_from_pipe(struct lp_jit_buffer *jit, const struct pipe_shader_buffer *buffer);
 void lp_jit_buffer_from_pipe_const(struct lp_jit_buffer *jit, const struct pipe_constant_buffer *buffer, struct pipe_screen *screen);
 void lp_jit_texture_from_pipe(struct lp_jit_texture *jit, const struct pipe_sampler_view *view);
+void lp_jit_bindless_texture_from_pipe(struct lp_jit_bindless_texture *jit, const struct pipe_sampler_view *view);
 void lp_jit_texture_buffer_from_bda(struct lp_jit_texture *jit, void *mem, size_t size, enum pipe_format format);
+void lp_jit_bindless_texture_buffer_from_bda(struct lp_jit_bindless_texture *jit, void *mem);
 void lp_jit_sampler_from_pipe(struct lp_jit_sampler *jit, const struct pipe_sampler_state *sampler);
 void lp_jit_image_from_pipe(struct lp_jit_image *jit, const struct pipe_image_view *view);
 void lp_jit_image_buffer_from_bda(struct lp_jit_image *jit, void *mem, size_t size, enum pipe_format format);

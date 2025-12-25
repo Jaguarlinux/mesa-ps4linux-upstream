@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ir::*;
+use compiler::cfg::CFG;
 use std::cmp::max;
 use std::cmp::Reverse;
 
@@ -129,6 +130,10 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::LeaX(_)
         | Op::Lop2(_)
         | Op::Lop3(_)
+        | Op::SuClamp(_)
+        | Op::SuBfm(_)
+        | Op::SuEau(_)
+        | Op::IMadSp(_)
         | Op::Shf(_)
         | Op::Shl(_)
         | Op::Shr(_)
@@ -140,14 +145,14 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         }
 
         // Move ops
-        Op::Mov(_) | Op::Prmt(_) | Op::Sel(_) => SideEffect::None,
+        Op::Mov(_) | Op::Prmt(_) | Op::Sel(_) | Op::Sgxt(_) => SideEffect::None,
         Op::Shfl(_) => SideEffect::None,
 
         // Predicate ops
         Op::PLop3(_) | Op::PSetP(_) => SideEffect::None,
 
         // Uniform ops
-        Op::R2UR(_) => SideEffect::None,
+        Op::R2UR(_) | Op::Redux(_) => SideEffect::None,
 
         // Texture ops
         Op::Tex(_)
@@ -158,12 +163,19 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::Txq(_) => SideEffect::Memory,
 
         // Surface ops
-        Op::SuLd(_) | Op::SuSt(_) | Op::SuAtom(_) => SideEffect::Memory,
+        Op::SuLd(_)
+        | Op::SuSt(_)
+        | Op::SuAtom(_)
+        | Op::SuLdGa(_)
+        | Op::SuStGa(_) => SideEffect::Memory,
 
         // Memory ops
         Op::Ipa(_) | Op::Ldc(_) => SideEffect::None,
         Op::Ld(_)
+        | Op::Ldsm(_)
+        | Op::LdSharedLock(_)
         | Op::St(_)
+        | Op::StSCheckUnlock(_)
         | Op::Atom(_)
         | Op::AL2P(_)
         | Op::ALd(_)
@@ -171,6 +183,9 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::CCtl(_)
         | Op::LdTram(_)
         | Op::MemBar(_) => SideEffect::Memory,
+
+        // Matrix ops
+        Op::Imma(_) | Op::Hmma(_) | Op::Movm(_) => SideEffect::None,
 
         // Control-flow ops
         Op::BClear(_)
@@ -201,7 +216,14 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::ViLd(_)
         | Op::Kill(_)
         | Op::S2R(_) => SideEffect::Barrier,
-        Op::PixLd(_) | Op::Nop(_) | Op::Vote(_) => SideEffect::None,
+        Op::PixLd(_) | Op::Vote(_) | Op::Match(_) => SideEffect::None,
+        Op::Nop(OpNop { label, .. }) => {
+            if label.is_none() {
+                SideEffect::None
+            } else {
+                SideEffect::Barrier
+            }
+        }
 
         // Virtual ops
         Op::Annotate(_)
@@ -219,6 +241,11 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
     }
 }
 
+pub fn estimate_block_weight(cfg: &CFG<BasicBlock>, block_idx: usize) -> u64 {
+    let loop_depth = cfg.loop_depth(block_idx) as f32;
+    10_f32.powf((loop_depth + 1.0).log2()) as u64
+}
+
 /// Try to guess how many cycles a variable latency instruction will take
 ///
 /// These values are based on the cycle estimates from ["Dissecting the NVidia
@@ -226,7 +253,11 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
 /// Memory instructions were copied from L1 data cache latencies.
 /// For instructions not mentioned in the paper, I made up numbers.
 /// This could probably be improved.
-pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
+pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+    if !sm.op_needs_scoreboard(op) {
+        return 0;
+    }
+
     match op {
         // Multi-function unit
         Op::Rro(_) | Op::MuFu(_) => 15,
@@ -238,7 +269,7 @@ pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
         // Integer ALU
         Op::BRev(_) | Op::Flo(_) | Op::PopC(_) => 15,
         Op::IMad(_) | Op::IMul(_) => {
-            assert!(sm < 70);
+            assert!(sm.sm() < 70);
             86
         }
 
@@ -249,7 +280,7 @@ pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
         Op::Shfl(_) => 15,
 
         // Uniform ops
-        Op::R2UR(_) => 15,
+        Op::Redux(_) | Op::R2UR(_) => 15,
 
         // Texture ops
         Op::Tex(_)
@@ -260,13 +291,21 @@ pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
         | Op::Txq(_) => 32,
 
         // Surface ops
-        Op::SuLd(_) | Op::SuSt(_) | Op::SuAtom(_) => 32,
+        Op::SuLd(_)
+        | Op::SuSt(_)
+        | Op::SuAtom(_)
+        | Op::SuLdGa(_)
+        | Op::SuStGa(_) => 32,
 
         // Memory ops
         Op::Ldc(_) => 4,
 
         Op::Ld(_)
+        | Op::Ldsm(_)
+        | Op::Movm(_)
+        | Op::LdSharedLock(_)
         | Op::St(_)
+        | Op::StSCheckUnlock(_)
         | Op::Atom(_)
         | Op::AL2P(_)
         | Op::ALd(_)
@@ -293,7 +332,10 @@ pub fn estimate_variable_latency(sm: u8, op: &Op) -> u32 {
         | Op::ViLd(_)
         | Op::Kill(_)
         | Op::PixLd(_)
-        | Op::S2R(_) => 16,
+        | Op::S2R(_)
+        | Op::Match(_) => 16,
+
+        Op::Hmma(_) | Op::Imma(_) => 22,
 
         _ => panic!("Unknown variable latency op {op}"),
     }

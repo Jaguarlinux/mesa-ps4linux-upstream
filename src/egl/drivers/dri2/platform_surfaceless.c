@@ -199,12 +199,6 @@ surfaceless_get_capability(void *loaderPrivate, enum dri_loader_cap cap)
    }
 }
 
-static const __DRIkopperLoaderExtension kopper_loader_extension = {
-   .base = {__DRI_KOPPER_LOADER, 1},
-
-   .SetSurfaceCreateInfo = NULL,
-};
-
 static const __DRIimageLoaderExtension image_loader_extension = {
    .base = {__DRI_IMAGE_LOADER, 2},
    .getBuffers = surfaceless_image_get_buffers,
@@ -213,15 +207,17 @@ static const __DRIimageLoaderExtension image_loader_extension = {
 };
 
 static const __DRIextension *image_loader_extensions[] = {
-   &image_loader_extension.base,  &image_lookup_extension.base,
-   &background_callable_extension.base,
-   &kopper_loader_extension.base, NULL,
+   &image_loader_extension.base,  &image_lookup_extension.base, NULL,
 };
 
 static const __DRIextension *swrast_loader_extensions[] = {
    &swrast_pbuffer_loader_extension.base, &image_loader_extension.base,
-   &image_lookup_extension.base,
-   &kopper_loader_extension.base,         NULL,
+   &image_lookup_extension.base, NULL,
+};
+
+static const __DRIextension *kopper_loader_extensions[] = {
+   &kopper_pbuffer_loader_extension.base, &image_lookup_extension.base,
+   &image_lookup_extension.base, NULL,
 };
 
 static bool
@@ -250,9 +246,31 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
       if (dri2_dpy->fd_render_gpu < 0)
          goto next;
 
-      disp->Device = dev_list;
+#ifdef HAVE_WAYLAND_PLATFORM
+      loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
+                                   &dri2_dpy->fd_display_gpu);
 
+      if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu) {
+         free(dri2_dpy->device_name);
+         dri2_dpy->device_name =
+            loader_get_device_name_for_fd(dri2_dpy->fd_render_gpu);
+         if (!dri2_dpy->device_name) {
+            _eglError(EGL_BAD_ALLOC, "surfaceless-egl: failed to get device name "
+                                     "for requested GPU");
+            goto retry;
+         }
+      }
+
+      /* we have to do the check now, because loader_get_user_preferred_fd
+       * will return a render-node when the requested gpu is different
+       * to the server, but also if the client asks for the same gpu than
+       * the server by requesting its pci-id */
+      dri2_dpy->is_render_node =
+         drmGetNodeTypeFromFd(dri2_dpy->fd_render_gpu) == DRM_NODE_RENDER;
+#endif
       char *driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
+
+      disp->Device = dev_list;
       if (swrast) {
          /* Use kms swrast only with vgem / virtio_gpu.
           * virtio-gpu fallbacks to software rendering when 3D features
@@ -269,13 +287,13 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
       }
 
       if (dri2_dpy->driver_name) {
-         dri2_detect_swrast(disp);
-         if (swrast || zink)
+         dri2_detect_swrast_kopper(disp);
+         if (dri2_dpy->kopper)
+            dri2_dpy->loader_extensions = kopper_loader_extensions;
+         else if (swrast)
             dri2_dpy->loader_extensions = swrast_loader_extensions;
          else
             dri2_dpy->loader_extensions = image_loader_extensions;
-
-         dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
 
          if (!dri2_create_screen(disp)) {
             _eglLog(_EGL_WARNING, "DRI2: failed to create screen");
@@ -305,6 +323,9 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
    retry:
       free(dri2_dpy->driver_name);
       dri2_dpy->driver_name = NULL;
+      if (dri2_dpy->fd_display_gpu != dri2_dpy->fd_render_gpu)
+         close(dri2_dpy->fd_display_gpu);
+      dri2_dpy->fd_display_gpu = -1;
       close(dri2_dpy->fd_render_gpu);
       dri2_dpy->fd_render_gpu = -1;
 
@@ -337,9 +358,12 @@ surfaceless_probe_device_sw(_EGLDisplay *disp)
    if (!dri2_dpy->driver_name)
       return false;
 
-   dri2_detect_swrast(disp);
+   dri2_detect_swrast_kopper(disp);
 
-   dri2_dpy->loader_extensions = swrast_loader_extensions;
+   if (dri2_dpy->kopper)
+      dri2_dpy->loader_extensions = kopper_loader_extensions;
+   else
+      dri2_dpy->loader_extensions = swrast_loader_extensions;
 
    dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
 

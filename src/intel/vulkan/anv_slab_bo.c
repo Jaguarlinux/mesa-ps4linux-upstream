@@ -102,7 +102,7 @@ get_slabs(struct anv_device *device, uint64_t size)
          return slabs;
    }
 
-   unreachable("should have found a valid slab for this size");
+   UNREACHABLE("should have found a valid slab for this size");
    return NULL;
 }
 
@@ -134,7 +134,7 @@ anv_slab_bo_alloc(struct anv_device *device, const char *name, uint64_t requeste
 
    const unsigned num_slab_allocator = ARRAY_SIZE(device->bo_slabs);
    struct pb_slabs *last_slab = &device->bo_slabs[num_slab_allocator - 1];
-   const uint64_t max_slab_entry_size = 1 << (last_slab->min_order + last_slab->num_orders - 1);
+   const uint64_t max_slab_entry_size = BITFIELD64_BIT(last_slab->min_order + last_slab->num_orders - 1);
 
    if (requested_size > max_slab_entry_size)
       return NULL;
@@ -187,7 +187,7 @@ anv_slab_bo_free(struct anv_device *device, struct anv_bo *bo)
    }
 
    bo->refcount = 0;
-   pb_slab_free(get_slabs(device, bo->size), &bo->slab_entry);
+   pb_slab_free(get_slabs(device, bo->actual_size), &bo->slab_entry);
 }
 
 static unsigned heap_max_get(struct anv_device *device)
@@ -258,7 +258,7 @@ anv_slab_alloc(void *priv,
       alloc_flags |= ANV_BO_ALLOC_DESCRIPTOR_POOL_FLAGS;
       break;
    default:
-      unreachable("Missing");
+      UNREACHABLE("Missing");
       return NULL;
    }
 
@@ -293,7 +293,7 @@ anv_slab_alloc(void *priv,
       struct anv_bo *bo = &slab->entries[i];
       uint64_t offset = intel_48b_address(slab->bo->offset);
 
-      offset += (i * entry_size);
+      offset += ((uint64_t)i * entry_size);
 
       bo->name = "slab_child";
       bo->gem_handle = slab->bo->gem_handle;

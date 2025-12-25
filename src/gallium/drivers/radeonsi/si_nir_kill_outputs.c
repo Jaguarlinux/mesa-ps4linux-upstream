@@ -9,13 +9,14 @@ bool si_nir_kill_outputs(nir_shader *nir, const union si_shader_key *key)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    assert(impl);
-   assert(nir->info.stage <= MESA_SHADER_GEOMETRY);
+   assert(nir->info.stage <= MESA_SHADER_GEOMETRY ||
+          nir->info.stage == MESA_SHADER_MESH);
 
    if (!key->ge.opt.kill_outputs &&
        !key->ge.opt.kill_pointsize &&
        !key->ge.opt.kill_layer &&
        !key->ge.opt.kill_clip_distances &&
-       !(nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER)) &&
+       !(nir->info.outputs_written & VARYING_BIT_LAYER) &&
        !key->ge.opt.remove_streamout &&
        !key->ge.mono.remove_streamout) {
       return nir_no_progress(impl);
@@ -75,11 +76,7 @@ bool si_nir_kill_outputs(nir_shader *nir, const union si_shader_key *key)
             break;
 
          case VARYING_SLOT_CLIP_VERTEX:
-            /* TODO: We should only kill specific clip planes as required by kill_clip_distance,
-             * not whole gl_ClipVertex. Lower ClipVertex in NIR.
-             */
-            if ((key->ge.opt.kill_clip_distances & SI_USER_CLIP_PLANE_MASK) ==
-                SI_USER_CLIP_PLANE_MASK)
+            if (key->ge.opt.kill_clip_distances == SI_USER_CLIP_PLANE_MASK)
                progress |= nir_remove_sysval_output(intr, MESA_SHADER_FRAGMENT);
             break;
 

@@ -177,7 +177,7 @@ add_non_uniform_instr(struct nu_state *state, struct nu_handle *handles,
       key.instr_index = instr->index;
 
    for (uint32_t i = 0; i < handle_count; i++)
-      key.handle_indixes[i] = handles[i].handle->parent_instr->index;
+      key.handle_indixes[i] = nir_def_instr(handles[i].handle)->index;
 
    struct hash_entry *entry = _mesa_hash_table_search(state->accesses, &key);
    if (!entry) {
@@ -200,7 +200,7 @@ add_non_uniform_instr(struct nu_state *state, struct nu_handle *handles,
    for (uint32_t i = 0; i < handle_count; i++)
       src.srcs[i] = srcs[i];
 
-   util_dynarray_append(&data->srcs, struct nu_handle_src, src);
+   util_dynarray_append(&data->srcs, src);
 }
 
 static bool
@@ -409,6 +409,14 @@ nir_lower_non_uniform_access_impl(nir_function_impl *impl,
             case nir_intrinsic_image_deref_fragment_mask_load_amd:
                if ((options->types & nir_lower_non_uniform_image_access) &&
                    lower_non_uniform_access_intrin(&state, intrin, 0, nir_lower_non_uniform_image_access))
+                  progress = true;
+               break;
+
+            case nir_intrinsic_load_readonly_output_pan:
+            case nir_intrinsic_load_converted_output_pan:
+               /* render target can be nonuniform, but not conversion descriptor */
+               if ((options->types & nir_lower_non_uniform_image_access) &&
+                   lower_non_uniform_access_intrin(&state, intrin, 2, nir_lower_non_uniform_image_access))
                   progress = true;
                break;
 

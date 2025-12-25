@@ -56,6 +56,13 @@ The correct description of `v_alignbyte_b32` is probably the following:
 D.u = ({S0, S1} >> (8 * S2.u[1:0])) & 0xffffffff
 ```
 
+## `v_cvt_pk_u8_f32`
+
+All versions of the ISA document fail to mention two things:
+- the conversion saturates instead of truncating like the `& 255` implies
+- the conversion uses the single precision rounding mode instead of always rounding
+  towards zero like every other floating point to integer conversion
+
 ## SMEM stores
 
 The Vega ISA references doesn't say this (or doesn't make it clear), but
@@ -330,6 +337,17 @@ Only `s_waitcnt_vscnt null, 0`. Needed even if the first instruction is a load.
 
 NSA MIMG instructions should be limited to 3 dwords before GFX10.3 to avoid
 stability issues: https://reviews.llvm.org/D103348
+
+## RDNA2 / GFX10.3 hazards
+
+### SALU EXEC write followed by NSA MIMG instruction
+
+Triggered-by:
+Potential stability issues can occur if an SALU instruction changes exec from 0
+to non-zero immediately before an NSA MIMG instruction with 4+ dwords.
+
+Mitigated-by: Any instruction, including `s_nop`.
+
 
 ## RDNA3 / GFX11 hazards
 

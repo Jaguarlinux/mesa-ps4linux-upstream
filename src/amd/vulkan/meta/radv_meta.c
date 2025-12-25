@@ -7,7 +7,7 @@
  */
 
 #include "radv_meta.h"
-#include "radv_printf.h"
+#include "radv_debug_nir.h"
 
 #include "vk_common_entrypoints.h"
 #include "vk_pipeline_cache.h"
@@ -208,8 +208,16 @@ radv_meta_restore(const struct radv_meta_saved_state *state, struct radv_cmd_buf
       if (state->flags & RADV_META_SAVE_GRAPHICS_PIPELINE)
          stage_flags |= VK_SHADER_STAGE_ALL_GRAPHICS;
 
-      vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), VK_NULL_HANDLE, stage_flags, 0,
-                                 MAX_PUSH_CONSTANTS_SIZE, state->push_constants);
+      const VkPushConstantsInfoKHR pc_info = {
+         .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+         .layout = VK_NULL_HANDLE,
+         .stageFlags = stage_flags,
+         .offset = 0,
+         .size = MAX_PUSH_CONSTANTS_SIZE,
+         .pValues = state->push_constants,
+      };
+
+      radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
    }
 
    if (state->flags & RADV_META_SAVE_RENDER) {
@@ -231,7 +239,7 @@ radv_meta_get_view_type(const struct radv_image *image)
    case VK_IMAGE_TYPE_3D:
       return VK_IMAGE_VIEW_TYPE_3D;
    default:
-      unreachable("bad VkImageViewType");
+      UNREACHABLE("bad VkImageViewType");
    }
 }
 
@@ -318,12 +326,6 @@ radv_device_init_meta(struct radv_device *device)
          return result;
    }
 
-   if (device->vk.enabled_features.nullDescriptor) {
-      result = radv_device_init_null_accel_struct(device);
-      if (result != VK_SUCCESS)
-         return result;
-   }
-
    return VK_SUCCESS;
 }
 
@@ -365,6 +367,7 @@ radv_meta_bind_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoi
    VK_FROM_HANDLE(radv_pipeline_layout, layout, _layout);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_descriptor_set_layout *set_layout = layout->set[0].layout;
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
    uint32_t upload_offset;
    uint8_t *ptr;
 
@@ -393,7 +396,7 @@ radv_meta_bind_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoi
          VK_FROM_HANDLE(radv_image_view, iview, image_view);
          for (uint32_t b = 0; b < ARRAY_SIZE(iview->image->bindings); b++) {
             if (iview->image->bindings[b].bo)
-               radv_cs_add_buffer(device->ws, cmd_buffer->cs, iview->image->bindings[b].bo);
+               radv_cs_add_buffer(device->ws, cs->b, iview->image->bindings[b].bo);
          }
       }
    }
@@ -417,4 +420,17 @@ radv_meta_bind_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoi
    };
 
    radv_CmdSetDescriptorBufferOffsets2EXT(radv_cmd_buffer_to_handle(cmd_buffer), &descriptor_buffer_offsets);
+}
+
+enum radv_copy_flags
+radv_get_copy_flags_from_bo(const struct radeon_winsys_bo *bo)
+{
+   enum radv_copy_flags copy_flags = 0;
+
+   if (bo->initial_domain & RADEON_DOMAIN_VRAM)
+      copy_flags |= RADV_COPY_FLAGS_DEVICE_LOCAL;
+   if (bo->is_virtual)
+      copy_flags |= RADV_COPY_FLAGS_SPARSE;
+
+   return copy_flags;
 }

@@ -30,7 +30,7 @@
 struct ir3_legalize_ctx {
    struct ir3_compiler *compiler;
    struct ir3_shader_variant *so;
-   gl_shader_stage type;
+   mesa_shader_stage type;
    int max_bary;
    bool early_input_release;
    bool has_inputs;
@@ -105,6 +105,9 @@ ir3_required_sync_flags(struct ir3_legalize_state *state,
       else
          reg = n->srcs[i - n->dsts_count];
 
+      if (reg->flags & IR3_REG_DUMMY)
+         continue;
+
       if (is_reg_gpr(reg)) {
 
          /* TODO: we probably only need (ss) for alu
@@ -152,7 +155,7 @@ ir3_required_sync_flags(struct ir3_legalize_state *state,
          if (state->needs_sy_for_const) {
             flags |= IR3_INSTR_SY;
          }
-      } else if (reg_is_addr1(reg) && n->block->in_early_preamble) {
+      } else if (!(reg->flags & (IR3_REG_IMMED | IR3_REG_RT))) {
          if (regmask_get(&state->needs_ss, reg)) {
             flags |= IR3_INSTR_SS;
          }
@@ -160,7 +163,7 @@ ir3_required_sync_flags(struct ir3_legalize_state *state,
    }
 
    foreach_dst (reg, n) {
-      if (reg->flags & IR3_REG_RT)
+      if (reg->flags & (IR3_REG_RT | IR3_REG_DUMMY))
          continue;
       if (needs_sy_war(state, reg)) {
          flags |= IR3_INSTR_SY;
@@ -210,8 +213,6 @@ sync_update(struct ir3_legalize_state *state, struct ir3_compiler *compiler,
    if (is_barrier(n)) {
       state->force_ss = true;
       state->force_sy = true;
-   } else if (n->opc == OPC_PREDT) {
-      state->force_ss = true;
    } else {
       state->force_ss = false;
       state->force_sy = false;
@@ -234,12 +235,14 @@ sync_update(struct ir3_legalize_state *state, struct ir3_compiler *compiler,
          }
       } else if (reg_is_addr1(dst) && n->block->in_early_preamble) {
          regmask_set(&state->needs_ss, dst);
+      } else if (dst->flags & IR3_REG_UNIFORM) {
+         regmask_set(&state->needs_ss, dst);
       }
    }
 
-   if (is_tex_or_prefetch(n) && n->dsts_count > 0) {
+   if (is_tex_or_prefetch(n) && !has_dummy_dst(n)) {
       regmask_set(&state->needs_sy, n->dsts[0]);
-   } else if (n->opc == OPC_RESINFO && n->dsts_count > 0) {
+   } else if (n->opc == OPC_RESINFO && !has_dummy_dst(n)) {
       regmask_set(&state->needs_ss, n->dsts[0]);
    } else if (is_load(n)) {
       if (is_local_mem_load(n))
@@ -369,6 +372,8 @@ ir3_merge_pred_legalize_states(struct ir3_legalize_state *state,
       regmask_or(&state->needs_sy, &state->needs_sy, &pstate->needs_sy);
       state->needs_ss_for_const |= pstate->needs_ss_for_const;
       state->needs_sy_for_const |= pstate->needs_sy_for_const;
+      state->force_ss |= pstate->force_ss;
+      state->force_sy |= pstate->force_sy;
 
       /* Our nop state is the max of the predecessor blocks. The predecessor nop
        * state contains the cycle offset from the start of its block when each
@@ -423,6 +428,15 @@ ir3_merge_pred_legalize_states(struct ir3_legalize_state *state,
                         &state->needs_ss_or_sy_scalar_war,
                         &pstate->needs_ss_or_sy_scalar_war);
    }
+
+   mesa_shader_stage stage = block->shader->type;
+
+   if (stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_GEOMETRY) {
+      if (block == ir3_start_block(block->shader)) {
+         state->force_ss = true;
+         state->force_sy = true;
+      }
+   }
 }
 
 static bool
@@ -455,13 +469,18 @@ get_ready_slot(struct ir3_legalize_state *state,
       consumer_alu ? &state->alu_nop : &state->non_alu_nop;
    assert(!(reg->flags & IR3_REG_SHARED));
    if (reg->flags & IR3_REG_HALF) {
-      if (matching_size)
+      if (matching_size) {
+         assert(num < ARRAY_SIZE(nop->half_ready));
          return &nop->half_ready[num];
-      else
+      } else {
+         assert(num / 2 < ARRAY_SIZE(nop->full_ready));
          return &nop->full_ready[num / 2];
+      }
    } else {
-      if (matching_size)
+      if (matching_size) {
+         assert(num < ARRAY_SIZE(nop->full_ready));
          return &nop->full_ready[num];
+      }
       /* If "num" is large enough, then it can't alias a half-reg because only
        * the first half of the full reg speace aliases half regs. Return NULL in
        * this case.
@@ -516,7 +535,7 @@ delay_update(struct ir3_compiler *compiler,
       return;
 
    foreach_dst_n (dst, n, instr) {
-      if (dst->flags & IR3_REG_RT)
+      if (dst->flags & (IR3_REG_RT | IR3_REG_DUMMY))
          continue;
 
       unsigned elems = post_ra_reg_elems(dst);
@@ -536,7 +555,7 @@ delay_update(struct ir3_compiler *compiler,
       if (dst->flags & IR3_REG_RELATIV)
          dst_cycle += instr->repeat;
 
-      if (dst->flags & IR3_REG_SHARED)
+      if (dst->flags & (IR3_REG_SHARED | IR3_REG_UNIFORM))
          continue;
 
       for (unsigned elem = 0; elem < elems; elem++, num++) {
@@ -610,6 +629,34 @@ ir3_update_legalize_state(struct ir3_legalize_state *state,
 
    if (count)
       state->cycle += n->repeat + n->nop;
+}
+
+static struct ir3_instruction *
+insert_nop_flags(struct ir3_legalize_ctx *ctx,
+                 struct ir3_legalize_state *state,
+                 struct ir3_instruction *last_n,
+                 struct ir3_builder *build,
+                 enum ir3_instruction_flags flags)
+{
+   if (last_n && last_n->opc == OPC_NOP) {
+      /* Note that reusing the previous nop isn't just an optimization
+       * but prevents infinitely adding nops when this block is in a loop
+       * and needs to be legalized more than once.
+       */
+      last_n->flags |= flags;
+
+      /* If we reuse the last nop, we shouldn't do a full state update as
+       * its delay has already been taken into account.
+       */
+      sync_update(state, ctx->compiler, last_n);
+   } else {
+      struct ir3_instruction *nop = ir3_NOP(build);
+      nop->flags |= flags;
+      ir3_update_legalize_state(state, ctx->compiler, nop);
+      last_n = nop;
+   }
+
+   return last_n;
 }
 
 /* We want to evaluate each block from the position of any other
@@ -701,11 +748,18 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          last_input_needs_ss = false;
       }
 
-      /* I'm not exactly what this is for, but it seems we need this on every
-       * mova1 in early preambles.
-       */
-      if (writes_addr1(n) && block->in_early_preamble)
-         n->srcs[0]->flags |= IR3_REG_R;
+      /* In earlypreamble we need to use mova.u/ldc.u: */
+      if (block->in_early_preamble) {
+         if (writes_addr1(n) || (n->opc == OPC_LDC))
+            n->flags |= IR3_INSTR_U;
+      }
+
+      /* Ensure no pending uGPR writes before EP ends: */
+      if ((n->opc == OPC_SHPE) && (ctx->compiler->gen >= 8) &&
+          block->in_early_preamble &&
+          regmask_get_any_shared(&state->needs_sy)) {
+         last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SY);
+      }
 
       /* cat5+ does not have an (ss) bit, if needed we need to
        * insert a nop to carry the sync flag.  Would be kinda
@@ -713,12 +767,8 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
        * this should be a pretty rare case:
        */
       if ((n->flags & IR3_INSTR_SS) && !supports_ss(n)) {
-         struct ir3_instruction *nop;
-         nop = ir3_NOP(&build);
-         nop->flags |= IR3_INSTR_SS;
+         last_n = insert_nop_flags(ctx, state, last_n, &build, IR3_INSTR_SS);
          n->flags &= ~IR3_INSTR_SS;
-         last_n = nop;
-         ir3_update_legalize_state(state, ctx->compiler, nop);
       }
 
       unsigned delay = ir3_required_delay(state, ctx->compiler, n);
@@ -776,7 +826,7 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
          ctx->has_tex_prefetch = true;
       }
 
-      if (n->opc == OPC_RESINFO && n->dsts_count > 0) {
+      if (n->opc == OPC_RESINFO && !has_dummy_dst(n)) {
          ir3_update_legalize_state(state, ctx->compiler, n);
 
          n = ir3_NOP(&build);
@@ -895,25 +945,6 @@ apply_fine_deriv_macro(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
       }
    }
 
-   return true;
-}
-
-/* Some instructions can take a dummy destination of r63.x, which we model as it
- * not having a destination in the IR to avoid having special code to handle
- * this. Insert the dummy destination after everything else is done.
- */
-static bool
-expand_dummy_dests(struct ir3_block *block)
-{
-   foreach_instr (n, &block->instr_list) {
-      if ((n->opc == OPC_SAM || n->opc == OPC_LDC || n->opc == OPC_RESINFO) &&
-          n->dsts_count == 0) {
-         struct ir3_register *dst = ir3_dst_create(n, INVALID_REG, 0);
-         /* Copy the blob's writemask */
-         if (n->opc == OPC_SAM)
-            dst->wrmask = 0b1111;
-      }
-   }
    return true;
 }
 
@@ -1171,6 +1202,15 @@ mark_jp(struct ir3_block *block)
 
    struct ir3_instruction *target =
       list_first_entry(&block->instr_list, struct ir3_instruction, node);
+
+   /* Add nop instruction for (jp) flag since it has no effect on a5xx when set
+    * on the end instruction.
+    */
+   if (target->opc == OPC_END && block->shader->compiler->gen == 5) {
+      struct ir3_builder build = ir3_builder_at(ir3_before_instr(target));
+      target = ir3_NOP(&build);
+   }
+
    target->flags |= IR3_INSTR_JP;
 }
 
@@ -1208,7 +1248,7 @@ invert_branch(struct ir3_instruction *branch)
       branch->opc = OPC_BRAA;
       break;
    default:
-      unreachable("can't get here");
+      UNREACHABLE("can't get here");
    }
 
    branch->cat0.inv1 = !branch->cat0.inv1;
@@ -1288,6 +1328,19 @@ block_sched(struct ir3 *ir)
    }
 }
 
+static void
+add_nop_before_block(struct ir3_block *block, unsigned repeat)
+{
+   struct ir3_instruction *nop = ir3_block_get_first_instr(block);
+
+   if (!nop || nop->opc != OPC_NOP) {
+      struct ir3_builder build = ir3_builder_at(ir3_before_block(block));
+      nop = ir3_NOP(&build);
+   }
+
+   nop->repeat = MAX2(nop->repeat, repeat);
+}
+
 /* Some gens have a hardware issue that needs to be worked around by 1)
  * inserting 4 nops after the second pred[tf] of a pred[tf]/pred[ft] pair and/or
  * inserting 6 nops after prede.
@@ -1301,17 +1354,11 @@ add_predication_workaround(struct ir3_compiler *compiler,
                            struct ir3_instruction *prede)
 {
    if (predtf && compiler->predtf_nop_quirk) {
-      struct ir3_builder build = ir3_builder_at(ir3_after_block(predtf->block));
-      struct ir3_instruction *nop = ir3_NOP(&build);
-      nop->repeat = 4;
-      ir3_instr_move_after(nop, predtf);
+      add_nop_before_block(predtf->block->predecessors[0]->successors[1], 4);
    }
 
    if (compiler->prede_nop_quirk) {
-      struct ir3_builder build = ir3_builder_at(ir3_after_block(prede->block));
-      struct ir3_instruction *nop = ir3_NOP(&build);
-      nop->repeat = 6;
-      ir3_instr_move_after(nop, prede);
+      add_nop_before_block(prede->block->successors[0], 6);
    }
 }
 
@@ -1547,6 +1594,220 @@ dbg_expand_rpt(struct ir3 *ir)
    }
 }
 
+struct ir3_mark_helpers_data {
+   bool valid;
+   regmask_t needs_helpers;
+};
+
+static void
+instr_mark_helpers(struct ir3_mark_helpers_data *bd,
+                   struct ir3_instruction *instr)
+{
+   if (instr->flags & IR3_INSTR_NEEDS_HELPERS) {
+      return;
+   }
+
+   foreach_dst (dst, instr) {
+      if (dst->flags & (IR3_REG_RT | IR3_REG_DUMMY)) {
+         continue;
+      }
+
+      if (regmask_get(&bd->needs_helpers, dst)) {
+         instr->flags |= IR3_INSTR_NEEDS_HELPERS;
+         return;
+      }
+   }
+
+   switch (instr->opc) {
+   case OPC_MOVMSK:
+   case OPC_BRCST_ACTIVE:
+   case OPC_QUAD_SHUFFLE_BRCST:
+   case OPC_QUAD_SHUFFLE_HORIZ:
+   case OPC_QUAD_SHUFFLE_VERT:
+   case OPC_QUAD_SHUFFLE_DIAG:
+   case OPC_BALL:
+   case OPC_BANY:
+      /* Subgroup operations don't require helper invocations to be present, but
+       * will use helper invocations if they are present.
+       */
+      instr->flags |= IR3_INSTR_NEEDS_HELPERS;
+      return;
+
+   case OPC_SAM:
+   case OPC_SAMB:
+   case OPC_GETLOD:
+   case OPC_DSX:
+   case OPC_DSY:
+   case OPC_DSXPP_1:
+   case OPC_DSYPP_1: {
+      if (instr->opc == OPC_SAM && has_dummy_dst(instr)) {
+         /* sam requires helper invocations except for dummy prefetch
+          * instructions.
+          */
+         return;
+      }
+
+      /* These instructions don't use helpers themselves but have a src that
+       * needs to be calculated using helpers (e.g., the coordinates used to
+       * calculate derivatives). Mark the src register as needing helpers so
+       * that we can keep them enabled until it is written.
+       */
+      unsigned nsrcs;
+      unsigned first_src_n = 0;
+
+      if (instr->opc == OPC_SAM || instr->opc == OPC_SAMB ||
+          instr->opc == OPC_GETLOD) {
+         nsrcs = (instr->flags & IR3_INSTR_3D) ? 3 : 2;
+
+         /* sam.s2en has the samp/tex in the first src; skip over it. */
+         if (instr->flags & IR3_INSTR_S2EN) {
+            if (instr->srcs[0]->flags & IR3_REG_FIRST_ALIAS) {
+               assert(ir3_alias_group_size(instr, 0) == 2);
+               first_src_n = 2;
+            } else {
+               first_src_n = 1;
+            }
+         }
+      } else {
+         /* dsx/dsy: derive the number of sources from the dst wrmask since the
+          * src itself may use aliases.
+          */
+         nsrcs = util_last_bit(instr->dsts[0]->wrmask);
+      }
+
+      if (instr->srcs[first_src_n]->flags & IR3_REG_FIRST_ALIAS) {
+         assert(first_src_n + nsrcs <= instr->srcs_count);
+
+         for (unsigned i = first_src_n; i < first_src_n + nsrcs; i++) {
+            struct ir3_register *src = instr->srcs[i];
+
+            if (is_reg_gpr(src)) {
+               regmask_set(&bd->needs_helpers, src);
+            }
+         }
+      } else {
+         regmask_set_masked(&bd->needs_helpers, instr->srcs[first_src_n],
+                            MASK(nsrcs));
+      }
+
+      break;
+   }
+
+   default:
+      break;
+   }
+}
+
+/* Apply IR3_INSTR_NEEDS_HELPERS to instructions that need helper invocations to
+ * be active. Note that we don't necessarily apply it to all instructions that
+ * need helpers, just to the last one in each block, as that gives us enough
+ * information for inserting (eq) to kill helpers.
+ *
+ * We use a backwards data-flow analysis because we cannot always know whether
+ * an instruction needs helpers by just looking at the opcode. For example,
+ * instructions that calculate (implicit) derivatives don't need helpers to be
+ * active but the calculation of their src needs to be done with active helpers.
+ */
+static bool
+mark_helpers(struct ir3_legalize_ctx *ctx, struct ir3 *ir,
+             struct ir3_shader_variant *so)
+{
+   foreach_block (block, &ir->block_list) {
+      struct ir3_mark_helpers_data *bd =
+         ralloc(ctx, struct ir3_mark_helpers_data);
+      bd->valid = false;
+      regmask_init(&bd->needs_helpers, ctx->compiler->mergedregs);
+      block->data = bd;
+   }
+
+   bool uses_helpers = false;
+   bool progress;
+
+   do {
+      progress = false;
+
+      foreach_block_rev (block, &ir->block_list) {
+         struct ir3_mark_helpers_data *bd = block->data;
+
+         if (bd->valid) {
+            continue;
+         }
+
+         struct ir3_mark_helpers_data prev_bd = *bd;
+         regmask_init(&bd->needs_helpers, ctx->compiler->mergedregs);
+         bool may_have_needs_helpers_at_entry = true;
+
+         for (unsigned i = 0; i < ARRAY_SIZE(block->successors); i++) {
+            struct ir3_block *succ = block->successors[i];
+            if (!succ) {
+               continue;
+            }
+
+            struct ir3_mark_helpers_data *succ_bd = succ->data;
+            regmask_or(&bd->needs_helpers, &bd->needs_helpers,
+                       &succ_bd->needs_helpers);
+         }
+
+         foreach_instr_rev (instr, &block->instr_list) {
+            instr_mark_helpers(bd, instr);
+
+            /* We only care about the last instruction needing helpers. */
+            if (instr->flags & IR3_INSTR_NEEDS_HELPERS) {
+               uses_helpers = true;
+
+               /* This also means we can stop tracking needs_helpers. This saves
+                * us from unnecessarily invalidating predecessors. Making sure
+                * loops are handled correctly is done in helper_sched.
+                */
+               regmask_init(&bd->needs_helpers, ctx->compiler->mergedregs);
+               may_have_needs_helpers_at_entry = false;
+               break;
+            }
+         }
+
+         bd->valid = true;
+
+         /* We have to invalidate the block's predecessors whenever it has more
+          * needs_helpers registers as the previous time around because this may
+          * cause more instructions being marked as needing helpers in its
+          * predecessors. We don't have to do this when it has less
+          * needs_helpers registers as this won't change anything. This is
+          * checked using may_have_needs_helpers_at_entry which will be false
+          * whenever we cleared needs_helpers.
+          */
+         if (may_have_needs_helpers_at_entry &&
+             memcmp(&prev_bd.needs_helpers, &bd->needs_helpers,
+                    sizeof(prev_bd.needs_helpers)) != 0) {
+            progress = true;
+
+            for (unsigned i = 0; i < block->predecessors_count; i++) {
+               struct ir3_mark_helpers_data *pred_bd =
+                  block->predecessors[i]->data;
+               pred_bd->valid = false;
+            }
+         }
+      }
+   } while (progress);
+
+   struct ir3_block *start_block = ir3_start_block(ir);
+   struct ir3_mark_helpers_data *start_bd = start_block->data;
+
+   foreach_input (input, ir) {
+      if (regmask_get(&start_bd->needs_helpers, input->dsts[0])) {
+         /* If we need helpers for an input reg, we have to make sure helpers
+          * are enabled when we enter the shader. Just mark the first
+          * instruction as needing helpers.
+          */
+         struct ir3_instruction *first = ir3_block_get_first_instr(start_block);
+         first->flags |= IR3_INSTR_NEEDS_HELPERS;
+         uses_helpers = true;
+         break;
+      }
+   }
+
+   return uses_helpers;
+}
+
 struct ir3_helper_block_data {
    /* Whether helper invocations may be used on any path starting at the
     * beginning of the block.
@@ -1571,16 +1832,15 @@ static void
 helper_sched(struct ir3_legalize_ctx *ctx, struct ir3 *ir,
              struct ir3_shader_variant *so)
 {
-   bool non_prefetch_helpers = false;
-
    foreach_block (block, &ir->block_list) {
       struct ir3_helper_block_data *bd =
          rzalloc(ctx, struct ir3_helper_block_data);
       foreach_instr (instr, &block->instr_list) {
-         if (uses_helpers(instr)) {
+         if (instr->flags & IR3_INSTR_NEEDS_HELPERS) {
             bd->uses_helpers_beginning = true;
-            if (instr->opc != OPC_META_TEX_PREFETCH) {
-               non_prefetch_helpers = true;
+
+            if (is_terminator(instr)) {
+               bd->uses_helpers_end = true;
             }
          }
 
@@ -1593,26 +1853,7 @@ helper_sched(struct ir3_legalize_ctx *ctx, struct ir3 *ir,
          }
       }
 
-      struct ir3_instruction *terminator = ir3_block_get_terminator(block);
-      if (terminator) {
-         if (terminator->opc == OPC_BALL || terminator->opc == OPC_BANY ||
-             (terminator->opc == OPC_GETONE &&
-              (terminator->flags & IR3_INSTR_NEEDS_HELPERS))) {
-            bd->uses_helpers_beginning = true;
-            bd->uses_helpers_end = true;
-            non_prefetch_helpers = true;
-         }
-      }
-
       block->data = bd;
-   }
-
-   /* If only prefetches use helpers then we can disable them in the shader via
-    * a register setting.
-    */
-   if (!non_prefetch_helpers) {
-      so->prefetch_end_of_quad = true;
-      return;
    }
 
    bool progress;
@@ -1710,11 +1951,7 @@ helper_sched(struct ir3_legalize_ctx *ctx, struct ir3 *ir,
        */
       struct ir3_instruction *first_instr = NULL;
       foreach_instr_rev (instr, &block->instr_list) {
-         /* Skip prefetches because they actually execute before the block
-          * starts and at this stage they aren't guaranteed to be at the start
-          * of the block.
-          */
-         if (uses_helpers(instr) && instr->opc != OPC_META_TEX_PREFETCH)
+         if (instr->flags & IR3_INSTR_NEEDS_HELPERS)
             break;
          first_instr = instr;
       }
@@ -1846,6 +2083,257 @@ track_last(struct ir3_legalize_ctx *ctx, struct ir3 *ir,
    } while (progress);
 }
 
+/* An instruction where we may insert nops without increasing the runtime nop
+ * count. These are of the form `(rptN)nop` and `(nopN)foo`. We can insert nops
+ * after them while decreasing their rpt/nop count without affecting the runtime
+ * behavior.
+ */
+struct nop_insert_point {
+   struct ir3_instruction *instr;
+
+   /* The maximum number of nops that can be inserted after `instr` without
+    * pushing any subsequent alias sequences over the next cache line. Since
+    * inserting nops at an earlier insert point affects all later ones, the
+    * max_nops value of the last insert point is the maximum for all insert
+    * points. This is taken into account when iterating insert points so that we
+    * only have to update the last insert point whenever we encounter an alias
+    * sequence.
+    */
+   unsigned max_nops;
+};
+
+struct alias_align_ctx {
+   DECLARE_ARRAY(struct nop_insert_point, nop_insert_points);
+};
+
+#define ICACHE_LINE_INSTRS 16
+
+static unsigned
+icache_line(unsigned ip)
+{
+   return ip / ICACHE_LINE_INSTRS;
+}
+
+static uint8_t *
+extra_nops(struct ir3_instruction *instr)
+{
+   if (instr->opc == OPC_NOP) {
+      return &instr->repeat;
+   }
+
+   return &instr->nop;
+}
+
+static bool
+is_insert_point(struct ir3_instruction *instr)
+{
+   uint8_t *instr_extra_nops = extra_nops(instr);
+   return *instr_extra_nops != 0;
+}
+
+static void
+update_last_insert_point_max_nops(struct alias_align_ctx *ctx,
+                                  unsigned max_nops)
+{
+   if (max_nops == 0) {
+      /* If we cannot insert more nops at the last insert point, we cannot
+       * insert more anywhere.
+       */
+      ctx->nop_insert_points_count = 0;
+   } else if (ctx->nop_insert_points_count != 0) {
+      struct nop_insert_point *last_nop_insert_point =
+         &ctx->nop_insert_points[ctx->nop_insert_points_count - 1];
+      last_nop_insert_point->max_nops =
+         MIN2(last_nop_insert_point->max_nops, max_nops);
+   }
+}
+
+static void
+insert_nops(struct ir3_cursor cursor, unsigned n)
+{
+   struct ir3_builder b = ir3_builder_at(cursor);
+
+   for (unsigned i = 0; i < n; i++) {
+      ir3_NOP(&b);
+   }
+}
+
+/* There seems to be a hardware bug that sometimes causes a GPU hang when an
+ * alias...sam sequence crosses an instruction cache line boundary. This pass
+ * inserts padding nops to ensure no such sequence cross a cache line.
+ *
+ * While the number of nops we have to insert is fixed at this point, we can try
+ * to minimize the number of nops executed at runtime by replacing nops encoded
+ * in instructions by standalone nops. That is, if this pass has to insert one
+ * nop, it will try to make one of the following replacements:
+ * - (rptN)nop -> (rptN-1)nop; nop
+ * - (nopN)foo -> (nopN-1)foo; nop
+ *
+ * It does so by keeping track of "insert points". Each insert point keeps track
+ * of the instruction and the maximum number of nops that can be inserted there
+ * without pushing any subsequent alias sequences over the next cache line.
+ * Whenever we need to insert nops, we first try it at the encountered insert
+ * points and only if that doesn't work, we insert them right before the first
+ * alias. The pass makes sure the insert points are only visited a bounded
+ * number of times in total to keep the whole pass O(n).
+ */
+static void
+align_aliases(struct ir3 *ir)
+{
+   if (!ir->compiler->has_alias_tex) {
+      return;
+   }
+
+   struct alias_align_ctx *ctx = rzalloc(ir, struct alias_align_ctx);
+   unsigned ip = 0;
+
+   foreach_block (block, &ir->block_list) {
+      bool in_alias_sequence = false;
+
+      foreach_instr (instr, &block->instr_list) {
+         if (instr->opc == OPC_META_TEX_PREFETCH) {
+            /* These will not be part of the final binary. */
+            continue;
+         }
+
+         instr->ip = ip++;
+
+         if (is_insert_point(instr)) {
+            struct nop_insert_point nop_insert_point = {
+               .instr = instr,
+
+               /* This will be set when we encounter the next alias sequence. */
+               .max_nops = ~0,
+            };
+
+            array_insert(ctx, ctx->nop_insert_points, nop_insert_point);
+            continue;
+         }
+
+         if (instr->opc != OPC_ALIAS || instr->cat7.alias_scope != ALIAS_TEX) {
+            in_alias_sequence = false;
+            continue;
+         }
+
+         if (in_alias_sequence) {
+            /* We only have to handle the first alias. */
+            continue;
+         }
+
+         in_alias_sequence = true;
+         unsigned num_aliases = instr->cat7.alias_table_size_minus_one + 1;
+         unsigned last_ip = instr->ip + num_aliases;
+         unsigned num_aliases_first_icache_line =
+            num_aliases - (last_ip % ICACHE_LINE_INSTRS);
+
+         if (icache_line(instr->ip) != icache_line(last_ip)) {
+            unsigned nops_left = num_aliases_first_icache_line;
+            assert(nops_left > 0);
+
+            /* Maximum number of nops we can still insert without pushing any
+             * existing sequences over the next cache line. Will be set to the
+             * minimum of the insert points we encounter.
+             */
+            unsigned max_nops = ~0;
+
+            /* First try to insert nops at the available insert points. */
+            for (unsigned i = ctx->nop_insert_points_count; i > 0; i--) {
+               /* Every iteration, we either:
+                * 1. Break because max_nops has become zero, which removes all
+                *    insert points;
+                * 2. Pop the current insert point because it has no nops left;
+                * 3. Break because we're done, this may leave the last insert
+                *    point in the list but will have decreased the number of
+                *    nops available there.
+                *
+                * This ensures that every insert point is encountered at most a
+                * constant number of times (and this constant is bounded by the
+                * maximum number of nops that can be inserted at any insert
+                * point, which is 6 for (rpt6)nop). This means that the *total*
+                * number of iterations for this loop is O(n) and hence the whole
+                * pass is O(n).
+                */
+               assert(i == ctx->nop_insert_points_count);
+
+               struct nop_insert_point *nop_insert_point =
+                  &ctx->nop_insert_points[i - 1];
+
+               max_nops = MIN2(max_nops, nop_insert_point->max_nops);
+
+               uint8_t *instr_extra_nops = extra_nops(nop_insert_point->instr);
+               unsigned num_nops = MIN3(*instr_extra_nops, nops_left, max_nops);
+               assert(num_nops != 0);
+
+               insert_nops(ir3_after_instr(nop_insert_point->instr), num_nops);
+               *instr_extra_nops -= num_nops;
+               nops_left -= num_nops;
+
+               /* If max_nops == ~0, then nop_insert_point->max_nops == ~0. This
+                * means that nop_insert_point is currently unconstrained because
+                * we didn't encounter a subsequent sequence yet (other than the
+                * current one). Leave it unconstrained, if it hasn't been
+                * removed when we're done inserting nops, it will be updated
+                * when we finish handling this instruction.
+                */
+               if (max_nops != ~0) {
+                  max_nops -= num_nops;
+                  nop_insert_point->max_nops = max_nops;
+               }
+
+               if (max_nops == 0) {
+                  /* 1. If we cannot insert more nops at the last insert point,
+                   * we cannot insert more anywhere.
+                   */
+                  ctx->nop_insert_points_count = 0;
+                  break;
+               }
+
+               if (*instr_extra_nops == 0) {
+                  /* 2. The insert point is all used up, remove it. */
+                  ctx->nop_insert_points_count--;
+
+                  /* Since we only set max_nops on the last insert point, we
+                   * have to propagate it now to the new last.
+                   */
+                  update_last_insert_point_max_nops(ctx, max_nops);
+               } else {
+                  /* The current insert point has nops left so we should have
+                   * used them if needed.
+                   */
+                  assert(nops_left == 0);
+               }
+
+               if (nops_left == 0) {
+                  /* 3. All necessary nops inserted. */
+                  break;
+               }
+            }
+
+            /* Then, insert any remaining nops before the first alias. */
+            insert_nops(ir3_before_instr(instr), nops_left);
+
+            instr->ip += num_aliases_first_icache_line;
+            assert(util_is_aligned(instr->ip, ICACHE_LINE_INSTRS));
+
+            last_ip = instr->ip + num_aliases;
+            assert(icache_line(instr->ip) == icache_line(last_ip));
+
+            ip = instr->ip + 1;
+         }
+
+         /* Calculate how many nops we can insert before the first alias without
+          * moving the whole sequence over the next cache line. This allows us
+          * to insert nops for subsequent aliases before this one.
+          */
+         unsigned max_nops =
+            ICACHE_LINE_INSTRS - 1 - last_ip % ICACHE_LINE_INSTRS;
+         update_last_insert_point_max_nops(ctx, max_nops);
+      }
+   }
+
+   ralloc_free(ctx);
+}
+
 bool
 ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
 {
@@ -1920,7 +2408,8 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
             }
          }
 
-         if (in_preamble && writes_pred(instr)) {
+         if (in_preamble && writes_pred(instr) &&
+             !(instr->dsts[0]->flags & IR3_REG_UNIFORM)) {
             pred_in_preamble = true;
          }
       }
@@ -1973,14 +2462,6 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
       progress |= apply_fine_deriv_macro(ctx, block);
    }
 
-   if (ir3_shader_debug & IR3_DBG_FULLSYNC) {
-      dbg_sync_sched(ir, so);
-   }
-
-   if (ir3_shader_debug & IR3_DBG_FULLNOP) {
-      dbg_nop_sched(ir, so);
-   }
-
    bool cfg_changed = false;
    while (opt_jump(ir))
       cfg_changed = true;
@@ -1995,11 +2476,23 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
 
    /* TODO: does (eq) exist before a6xx? */
    if (so->type == MESA_SHADER_FRAGMENT && so->need_pixlod &&
-       so->compiler->gen >= 6)
-      helper_sched(ctx, ir, so);
+       so->compiler->gen >= 6) {
+      if (mark_helpers(ctx, ir, so)) {
+         helper_sched(ctx, ir, so);
+      } else {
+         /* If no instructions use helpers, we can disable them in the shader
+          * via a register setting.
+          */
+         so->prefetch_end_of_quad = true;
+      }
+   }
 
-   foreach_block (block, &ir->block_list) {
-      progress |= expand_dummy_dests(block);
+   if (ir3_shader_debug & IR3_DBG_FULLSYNC) {
+      dbg_sync_sched(ir, so);
+   }
+
+   if (ir3_shader_debug & IR3_DBG_FULLNOP) {
+      dbg_nop_sched(ir, so);
    }
 
    /* Note: insert (last) before alias.tex to have the sources that are actually
@@ -2010,6 +2503,7 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
       track_last(ctx, ir, so);
 
    ir3_insert_alias_tex(ir);
+   align_aliases(ir);
    ir3_count_instructions(ir);
    resolve_jumps(ir);
 

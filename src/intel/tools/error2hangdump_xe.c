@@ -12,13 +12,14 @@
 
 #include "error_decode_xe_lib.h"
 #include "error2hangdump_lib.h"
+#include "intel/common/intel_gem.h"
 #include "intel/dev/intel_device_info.h"
 #include "util/macros.h"
 
 void
 read_xe_data_file(FILE *dump_file, FILE *hang_dump_file, bool verbose)
 {
-   enum  xe_topic xe_topic = XE_TOPIC_INVALID;
+   enum  xe_topic xe_topic = XE_TOPIC_UNKNOWN;
    uint32_t *vm_entry_data = NULL;
    uint32_t vm_entry_len = 0;
    struct xe_vm xe_vm;
@@ -42,7 +43,7 @@ read_xe_data_file(FILE *dump_file, FILE *hang_dump_file, bool verbose)
 
          if (error_decode_xe_read_u64_hexacimal_parameter(line, "batch_addr[", &u64_value)) {
             batch_buffers.addrs = realloc(batch_buffers.addrs, sizeof(uint64_t) * (batch_buffers.len + 1));
-            batch_buffers.addrs[batch_buffers.len] = u64_value;
+            batch_buffers.addrs[batch_buffers.len] = intel_48b_address(u64_value);
             batch_buffers.len++;
          }
 
@@ -56,34 +57,34 @@ read_xe_data_file(FILE *dump_file, FILE *hang_dump_file, bool verbose)
       case XE_TOPIC_CONTEXT: {
          enum xe_vm_topic_type type;
          const char *value_ptr;
-         bool is_hw_ctx;
+         char binary_name[64];
 
-         type = error_decode_xe_read_hw_sp_or_ctx_line(line, &value_ptr, &is_hw_ctx);
-         if (type == XE_VM_TOPIC_TYPE_UNKNOWN || !is_hw_ctx) {
-            break;
-         }
+         if (error_decode_xe_binary_line(line, binary_name, sizeof(binary_name), &type, &value_ptr)) {
+            if (strncmp(binary_name, "HWCTX", strlen("HWCTX")) != 0)
+               break;
 
-         switch (type) {
-         case XE_VM_TOPIC_TYPE_DATA:
-            if (!error_decode_xe_ascii85_decode_allocated(value_ptr, vm_entry_data, vm_entry_len))
-               printf("Failed to parse HWCTX data\n");
-            break;
-         case XE_VM_TOPIC_TYPE_LENGTH: {
-            vm_entry_len = strtoul(value_ptr, NULL, 0);
-            vm_entry_data = calloc(1, vm_entry_len);
-            if (!vm_entry_data) {
-               printf("Out of memory to allocate a buffer to store content of HWCTX\n");
+            switch (type) {
+            case XE_VM_TOPIC_TYPE_DATA:
+               if (!error_decode_xe_ascii85_decode_allocated(value_ptr, vm_entry_data, vm_entry_len))
+                  printf("Failed to parse HWCTX data\n");
+               break;
+            case XE_VM_TOPIC_TYPE_LENGTH: {
+               vm_entry_len = strtoul(value_ptr, NULL, 0);
+               vm_entry_data = calloc(1, vm_entry_len);
+               if (!vm_entry_data) {
+                  printf("Out of memory to allocate a buffer to store content of HWCTX\n");
+                  break;
+               }
+
+               error_decode_xe_vm_hw_ctx_set(&xe_vm, vm_entry_len, vm_entry_data);
                break;
             }
-
-            error_decode_xe_vm_hw_ctx_set(&xe_vm, vm_entry_len, vm_entry_data);
-            break;
-         }
-         case XE_VM_TOPIC_TYPE_ERROR:
-            printf("HWCTX not present in dump, content will be zeroed: %s\n", line);
-            break;
-         default:
-            printf("Not expected line in HWCTX: %s", line);
+            case XE_VM_TOPIC_TYPE_ERROR:
+               printf("HWCTX not present in dump, content will be zeroed: %s\n", line);
+               break;
+            default:
+               printf("Not expected line in HWCTX: %s", line);
+            }
          }
 
          break;

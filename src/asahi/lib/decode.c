@@ -11,11 +11,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "util/os_misc.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include <sys/mman.h>
 #include <agx_pack.h>
 
+#include "asahi/isa/disasm.h"
 #include "util/u_hexdump.h"
 #include "decode.h"
 
@@ -24,7 +26,8 @@ struct libagxdecode_config lib_config;
 static void
 agx_disassemble(void *_code, size_t maxlen, FILE *fp)
 {
-   /* stub */
+   bool errors = agx2_disassemble(_code, maxlen, fp);
+   assert(!errors);
 }
 
 FILE *agxdecode_dump_stream;
@@ -78,6 +81,29 @@ agxdecode_find_handle(struct agxdecode_ctx *ctx, unsigned handle)
 }
 
 static size_t
+_agxdecode_grab_mapped(struct agxdecode_ctx *ctx, uint64_t gpu_va, void **buf,
+                       int line, const char *filename)
+{
+   if (lib_config.read_gpu_mem)
+      UNREACHABLE("you'll have to figure it out.");
+
+   const struct agx_bo *mem =
+      agxdecode_find_mapped_gpu_mem_containing(ctx, gpu_va);
+
+   if (!mem) {
+      fprintf(stderr, "Access to unknown memory %" PRIx64 " in %s:%d\n", gpu_va,
+              filename, line);
+      fflush(agxdecode_dump_stream);
+      assert(0);
+   }
+
+   uint32_t offset = gpu_va - mem->va->addr;
+
+   *buf = mem->_map + offset;
+   return mem->size - offset;
+}
+
+static size_t
 __agxdecode_fetch_gpu_mem(struct agxdecode_ctx *ctx, const struct agx_bo *mem,
                           uint64_t gpu_va, size_t size, void *buf, int line,
                           const char *filename)
@@ -114,6 +140,9 @@ __agxdecode_fetch_gpu_mem(struct agxdecode_ctx *ctx, const struct agx_bo *mem,
 
 #define agxdecode_fetch_gpu_mem(ctx, gpu_va, size, buf)                        \
    __agxdecode_fetch_gpu_mem(ctx, NULL, gpu_va, size, buf, __LINE__, __FILE__)
+
+#define agxdecode_grab_mapped(ctx, gpu_va, buf)                                \
+   _agxdecode_grab_mapped(ctx, gpu_va, buf, __LINE__, __FILE__)
 
 #define agxdecode_fetch_gpu_array(ctx, gpu_va, buf)                            \
    agxdecode_fetch_gpu_mem(ctx, gpu_va, sizeof(buf), buf)
@@ -268,7 +297,6 @@ agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
 {
    enum agx_sampler_states *sampler_states = data;
    enum agx_usc_control type = map[0];
-   uint8_t buf[3072];
 
    bool extended_samplers =
       (sampler_states != NULL) &&
@@ -291,10 +319,11 @@ agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
       agx_unpack(agxdecode_dump_stream, map, USC_PRESHADER, ctrl);
       DUMP_UNPACKED(USC_PRESHADER, ctrl, "Preshader\n");
 
-      agx_disassemble(
-         buf, agxdecode_fetch_gpu_array(ctx, decode_usc(ctx, ctrl.code), buf),
-         agxdecode_dump_stream);
+      void *buf;
+      size_t size =
+         agxdecode_grab_mapped(ctx, decode_usc(ctx, ctrl.code), &buf);
 
+      agx_disassemble(buf, size, agxdecode_dump_stream);
       return STATE_DONE;
    }
 
@@ -303,9 +332,11 @@ agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
       DUMP_UNPACKED(USC_SHADER, ctrl, "Shader\n");
 
       agxdecode_log("\n");
-      agx_disassemble(
-         buf, agxdecode_fetch_gpu_array(ctx, decode_usc(ctx, ctrl.code), buf),
-         agxdecode_dump_stream);
+      void *buf;
+      size_t size =
+         agxdecode_grab_mapped(ctx, decode_usc(ctx, ctrl.code), &buf);
+
+      agx_disassemble(buf, size, agxdecode_dump_stream);
       agxdecode_log("\n");
 
       return AGX_USC_SHADER_LENGTH;
@@ -762,32 +793,6 @@ agxdecode_sampler_heap(struct agxdecode_ctx *ctx, uint64_t heap, unsigned count)
    }
 }
 
-void
-agxdecode_image_heap(struct agxdecode_ctx *ctx, uint64_t heap,
-                     unsigned nr_entries)
-{
-   agxdecode_dump_file_open();
-
-   fprintf(agxdecode_dump_stream, "Image heap:\n");
-   struct agx_texture_packed *map = calloc(nr_entries, AGX_TEXTURE_LENGTH);
-   agxdecode_fetch_gpu_mem(ctx, heap, AGX_TEXTURE_LENGTH * nr_entries, map);
-
-   for (unsigned i = 0; i < nr_entries; ++i) {
-      bool nonzero = false;
-      for (unsigned j = 0; j < ARRAY_SIZE(map[i].opaque); ++j) {
-         nonzero |= map[i].opaque[j] != 0;
-      }
-
-      if (nonzero) {
-         fprintf(agxdecode_dump_stream, "%u: \n", i);
-         agxdecode_texture_pbe(ctx, map + i);
-         fprintf(agxdecode_dump_stream, "\n");
-      }
-   }
-
-   free(map);
-}
-
 static void
 agxdecode_helper(struct agxdecode_ctx *ctx, const char *prefix, uint64_t helper)
 {
@@ -908,7 +913,7 @@ agxdecode_drm_cmdbuf(struct agxdecode_ctx *ctx,
       } else if (header->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS) {
          agxdecode_drm_attachments("Compute", data, header->size);
       } else {
-         unreachable("Invalid command type");
+         UNREACHABLE("Invalid command type");
       }
 
       offs += header->size;
@@ -988,7 +993,7 @@ agxdecode_track_alloc(struct agxdecode_ctx *ctx, struct agx_bo *alloc)
       assert(!match && "tried to alloc already allocated BO");
    }
 
-   util_dynarray_append(&ctx->mmap_array, struct agx_bo, *alloc);
+   util_dynarray_append(&ctx->mmap_array, *alloc);
 }
 
 void
@@ -1016,11 +1021,11 @@ agxdecode_dump_file_open(void)
    if (agxdecode_dump_stream)
       return;
 
-   /* This does a getenv every frame, so it is possible to use
-    * setenv to change the base at runtime.
+   /* This does a os_get_option every frame, so it is possible to use
+    * os_set_option to change the base at runtime.
     */
    const char *dump_file_base =
-      getenv("AGXDECODE_DUMP_FILE") ?: "agxdecode.dump";
+      os_get_option("AGXDECODE_DUMP_FILE") ?: "agxdecode.dump";
    if (!strcmp(dump_file_base, "stderr"))
       agxdecode_dump_stream = stderr;
    else {
@@ -1065,7 +1070,7 @@ libagxdecode_writer(void *cookie, const char *buffer, size_t size)
    return lib_config.stream_write(buffer, size);
 }
 
-#ifdef _GNU_SOURCE
+#if defined(_GNU_SOURCE) && !DETECT_OS_ANDROID
 static cookie_io_functions_t funcs = {.write = libagxdecode_writer};
 #endif
 
@@ -1074,14 +1079,14 @@ static decoder_params lib_params;
 void
 libagxdecode_init(struct libagxdecode_config *config)
 {
-#ifdef _GNU_SOURCE
+#if defined(_GNU_SOURCE) && !DETECT_OS_ANDROID
    lib_config = *config;
    agxdecode_dump_stream = fopencookie(NULL, "w", funcs);
 
    chip_id_to_params(&lib_params, config->chip_id);
 #else
    /* fopencookie is a glibc extension */
-   unreachable("libagxdecode only available with glibc");
+   UNREACHABLE("libagxdecode only available with glibc");
 #endif
 }
 

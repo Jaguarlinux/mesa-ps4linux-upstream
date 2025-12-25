@@ -279,6 +279,7 @@ get_compatible_tlb_format(VkFormat format)
 {
    switch (format) {
    case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_B8G8R8A8_SNORM:
       return VK_FORMAT_R8G8B8A8_UINT;
 
    case VK_FORMAT_R8G8_SNORM:
@@ -679,7 +680,7 @@ gather_image_to_buffer_info(struct v3dv_cmd_buffer *cmd_buffer,
          buffer_bpp = 1;
          break;
       default:
-         unreachable("unsupported aspect");
+         UNREACHABLE("unsupported aspect");
          return supported;
       };
       break;
@@ -695,7 +696,7 @@ gather_image_to_buffer_info(struct v3dv_cmd_buffer *cmd_buffer,
       src_format = dst_format;
       break;
    default:
-      unreachable("unsupported bit-size");
+      UNREACHABLE("unsupported bit-size");
       return supported;
    };
 
@@ -994,7 +995,7 @@ copy_image_to_buffer_blit(struct v3dv_cmd_buffer *cmd_buffer,
                             &blit_region, VK_FILTER_NEAREST, false);
       if (!handled) {
          /* This is unexpected, we should have a supported blit spec */
-         unreachable("Unable to blit buffer to destination image");
+         UNREACHABLE("Unable to blit buffer to destination image");
          return false;
       }
    }
@@ -1131,7 +1132,7 @@ v3dv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       if (copy_image_to_buffer_texel_buffer(cmd_buffer, buffer, image, region))
          continue;
 
-      unreachable("Unsupported image to buffer copy.");
+      UNREACHABLE("Unsupported image to buffer copy.");
    }
    cmd_buffer->state.is_transfer = false;
 }
@@ -1151,8 +1152,8 @@ copy_image_tfu(struct v3dv_cmd_buffer *cmd_buffer,
       return false;
    }
 
-   /* Destination can't be raster format */
-   if (!dst->tiled)
+   /* Destination can't be raster format on V3D 4.2 */
+   if (cmd_buffer->device->devinfo.ver < 71 && !dst->tiled)
       return false;
 
    /* We can only do full copies, so if the format is D24S8 both aspects need
@@ -1265,7 +1266,8 @@ copy_image_tfu(struct v3dv_cmd_buffer *cmd_buffer,
          dst->planes[dst_plane].mem->bo->handle,
          dst_offset,
          dst_slice->tiling,
-         dst_slice->padded_height,
+         dst_slice->tiling == V3D_TILING_RASTER ?
+                              dst_slice->stride : dst_slice->padded_height,
          dst->planes[dst_plane].cpp,
          src->planes[src_plane].mem->bo->handle,
          src_offset,
@@ -1514,7 +1516,7 @@ copy_image_blit(struct v3dv_cmd_buffer *cmd_buffer,
          format = VK_FORMAT_R16G16B16A16_UINT;
          break;
       default:
-         unreachable("Unsupported compressed format");
+         UNREACHABLE("Unsupported compressed format");
       }
 
       /* Create image views of the src/dst images that we can interpret in
@@ -1654,7 +1656,7 @@ copy_image_linear_texel_buffer(struct v3dv_cmd_buffer *cmd_buffer,
       format = VK_FORMAT_R8_UINT;
       break;
    default:
-      unreachable("unsupported bit-size");
+      UNREACHABLE("unsupported bit-size");
       return false;
    }
 
@@ -1736,7 +1738,7 @@ v3dv_CmdCopyImage2(VkCommandBuffer commandBuffer,
          continue;
       if (copy_image_linear_texel_buffer(cmd_buffer, dst, src, region))
          continue;
-      unreachable("Image copy not supported");
+      UNREACHABLE("Image copy not supported");
    }
 
    cmd_buffer->state.is_transfer = false;
@@ -1868,8 +1870,8 @@ copy_buffer_to_image_tfu(struct v3dv_cmd_buffer *cmd_buffer,
 
    assert(image->vk.samples == VK_SAMPLE_COUNT_1_BIT);
 
-   /* Destination can't be raster format */
-   if (!image->tiled)
+   /* Destination can't be raster format on V3D 4.2 */
+   if (cmd_buffer->device->devinfo.ver < 71 && !image->tiled)
       return false;
 
    /* We can't copy D24S8 because buffer to image copies only copy one aspect
@@ -1967,7 +1969,8 @@ copy_buffer_to_image_tfu(struct v3dv_cmd_buffer *cmd_buffer,
              dst_bo->handle,
              dst_offset,
              slice->tiling,
-             slice->padded_height,
+             slice->tiling == V3D_TILING_RASTER ?
+                              slice->stride : slice->padded_height,
              image->planes[plane].cpp,
              src_bo->handle,
              src_offset,
@@ -2240,9 +2243,9 @@ get_texel_buffer_copy_gs(const nir_shader_compiler_options *options)
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, options,
                                                   "meta texel buffer copy gs");
    nir_shader *nir = b.shader;
-   nir->info.inputs_read = 1ull << VARYING_SLOT_POS;
-   nir->info.outputs_written = (1ull << VARYING_SLOT_POS) |
-                               (1ull << VARYING_SLOT_LAYER);
+   nir->info.inputs_read = VARYING_BIT_POS;
+   nir->info.outputs_written = VARYING_BIT_POS |
+                               VARYING_BIT_LAYER;
    nir->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
    nir->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
    nir->info.gs.vertices_in = 3;
@@ -2320,7 +2323,7 @@ component_swizzle_to_nir_swizzle(VkComponentSwizzle comp, VkComponentSwizzle swz
    case VK_COMPONENT_SWIZZLE_A:
       return 3;
    default:
-      unreachable("Invalid swizzle");
+      UNREACHABLE("Invalid swizzle");
    };
 }
 
@@ -2724,6 +2727,7 @@ texel_buffer_shader_copy(struct v3dv_cmd_buffer *cmd_buffer,
 
    VkImageViewCreateInfo image_view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
       .image = v3dv_image_to_handle(image),
       .viewType = v3dv_image_type_to_view_type(image->vk.image_type),
       .format = dst_format,
@@ -3076,7 +3080,7 @@ copy_buffer_to_image_blit(struct v3dv_cmd_buffer *cmd_buffer,
             /* This is unexpected, we should have setup the upload to be
              * conformant to a TFU or TLB copy.
              */
-            unreachable("Unable to copy buffer to image through TLB");
+            UNREACHABLE("Unable to copy buffer to image through TLB");
             return false;
          }
 
@@ -3130,7 +3134,7 @@ copy_buffer_to_image_blit(struct v3dv_cmd_buffer *cmd_buffer,
                                &blit_region, VK_FILTER_NEAREST, true);
          if (!handled) {
             /* This is unexpected, we should have a supported blit spec */
-            unreachable("Unable to blit buffer to destination image");
+            UNREACHABLE("Unable to blit buffer to destination image");
             return false;
          }
       }
@@ -3245,7 +3249,7 @@ copy_buffer_to_image_shader(struct v3dv_cmd_buffer *cmd_buffer,
          cmask = VK_COLOR_COMPONENT_R_BIT;
          break;
       default:
-         unreachable("unsupported aspect");
+         UNREACHABLE("unsupported aspect");
          return false;
       };
       break;
@@ -3262,7 +3266,7 @@ copy_buffer_to_image_shader(struct v3dv_cmd_buffer *cmd_buffer,
       dst_format = src_format;
       break;
    default:
-      unreachable("unsupported bit-size");
+      UNREACHABLE("unsupported bit-size");
       return false;
    }
 
@@ -3348,7 +3352,7 @@ v3dv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
          goto handled;
       }
 
-      unreachable("Unsupported buffer to image copy.");
+      UNREACHABLE("Unsupported buffer to image copy.");
 
 handled:
       r += batch_size;
@@ -3396,8 +3400,8 @@ blit_tfu(struct v3dv_cmd_buffer *cmd_buffer,
    if (src->vk.format != dst->vk.format)
       return false;
 
-   /* Destination can't be raster format */
-   if (!dst->tiled)
+   /* Destination can't be raster format on V3D 4.2 */
+   if (cmd_buffer->device->devinfo.ver < 71 && !dst->tiled)
       return false;
 
    /* Source region must start at (0,0) */
@@ -3505,7 +3509,8 @@ blit_tfu(struct v3dv_cmd_buffer *cmd_buffer,
          dst->planes[0].mem->bo->handle,
          dst_offset,
          dst_slice->tiling,
-         dst_slice->padded_height,
+         dst_slice->tiling == V3D_TILING_RASTER ?
+                              dst_slice->stride : dst_slice->padded_height,
          dst->planes[0].cpp,
          src->planes[0].mem->bo->handle,
          src_offset,
@@ -3844,7 +3849,7 @@ get_channel_mask_for_sampler_dim(enum glsl_sampler_dim sampler_dim)
    case GLSL_SAMPLER_DIM_MS: return 0x3;
    case GLSL_SAMPLER_DIM_3D: return 0x7;
    default:
-      unreachable("invalid sampler dim");
+      UNREACHABLE("invalid sampler dim");
    };
 }
 
@@ -4072,7 +4077,7 @@ get_sampler_dim(VkImageType type, VkSampleCountFlagBits src_samples)
                                                     GLSL_SAMPLER_DIM_MS;
    case VK_IMAGE_TYPE_3D: return GLSL_SAMPLER_DIM_3D;
    default:
-      unreachable("Invalid image type");
+      UNREACHABLE("Invalid image type");
    }
 }
 
@@ -4421,7 +4426,7 @@ blit_shader(struct v3dv_cmd_buffer *cmd_buffer,
          dst_format = VK_FORMAT_R8G8B8A8_UINT;
          break;
       default:
-         unreachable("Unsupported depth/stencil format");
+         UNREACHABLE("Unsupported depth/stencil format");
       };
       src_format = dst_format;
    }
@@ -4635,6 +4640,7 @@ blit_shader(struct v3dv_cmd_buffer *cmd_buffer,
       /* Setup framebuffer */
       VkImageViewCreateInfo dst_image_view_info = {
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
          .image = v3dv_image_to_handle(dst),
          .viewType = v3dv_image_type_to_view_type(dst->vk.image_type),
          .format = dst_format,
@@ -4693,6 +4699,7 @@ blit_shader(struct v3dv_cmd_buffer *cmd_buffer,
 
       VkImageViewCreateInfo src_image_view_info = {
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
          .image = v3dv_image_to_handle(src),
          .viewType = v3dv_image_type_to_view_type(src->vk.image_type),
          .format = src_format,
@@ -4851,7 +4858,7 @@ v3dv_CmdBlitImage2(VkCommandBuffer commandBuffer,
                       pBlitImageInfo->filter, true)) {
          continue;
       }
-      unreachable("Unsupported blit operation");
+      UNREACHABLE("Unsupported blit operation");
    }
 
    cmd_buffer->state.is_transfer = false;
@@ -4980,7 +4987,7 @@ v3dv_CmdResolveImage2(VkCommandBuffer commandBuffer,
          continue;
       if (resolve_image_blit(cmd_buffer, dst, src, &info->pRegions[i]))
          continue;
-      unreachable("Unsupported multismaple resolve operation");
+      UNREACHABLE("Unsupported multismaple resolve operation");
    }
 
    cmd_buffer->state.is_transfer = false;

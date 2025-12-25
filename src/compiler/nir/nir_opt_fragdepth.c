@@ -35,16 +35,19 @@ bool
 nir_def_is_frag_coord_z(nir_def *def)
 {
    nir_scalar scalar = nir_scalar_resolved(def, 0);
-   nir_instr *instr = scalar.def->parent_instr;
-   if (instr->type != nir_instr_type_intrinsic)
+   nir_intrinsic_instr *intrin = nir_scalar_as_intrinsic(scalar);
+   if (!intrin)
       return false;
 
-   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-   if (intrin->intrinsic != nir_intrinsic_load_frag_coord)
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_frag_coord:
+      /* Depth is gl_FragCoord.z */
+      return scalar.comp == 2;
+   case nir_intrinsic_load_frag_coord_z:
+      return true;
+   default:
       return false;
-
-   /* Depth is gl_FragCoord.z */
-   return scalar.comp == 2;
+   }
 }
 
 bool

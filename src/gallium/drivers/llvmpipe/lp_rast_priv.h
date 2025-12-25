@@ -141,7 +141,7 @@ void
 lp_rast_shade_quads_mask_sample(struct lp_rasterizer_task *task,
                                 const struct lp_rast_shader_inputs *inputs,
                                 unsigned x, unsigned y,
-                                uint64_t mask);
+                                const uint64_t mask[2]);
 
 void
 lp_rast_shade_quads_mask(struct lp_rasterizer_task *task,
@@ -183,7 +183,7 @@ lp_rast_get_color_block_pointer(struct lp_rasterizer_task *task,
       color += (layer + view_index) * task->scene->cbufs[buf].layer_stride;
    }
 
-   assert(lp_check_alignment(color, llvmpipe_get_format_alignment(task->scene->fb.cbufs[buf]->format)));
+   assert(lp_check_alignment(color, llvmpipe_get_format_alignment(task->scene->fb.cbufs[buf].format)));
    return color;
 }
 
@@ -213,7 +213,7 @@ lp_rast_get_depth_block_pointer(struct lp_rasterizer_task *task,
       depth += (layer + view_index) * task->scene->zsbuf.layer_stride;
    }
 
-   assert(lp_check_alignment(depth, llvmpipe_get_format_alignment(task->scene->fb.zsbuf->format)));
+   assert(lp_check_alignment(depth, llvmpipe_get_format_alignment(task->scene->fb.zsbuf.format)));
    return depth;
 }
 
@@ -241,7 +241,7 @@ lp_rast_shade_quads_all(struct lp_rasterizer_task *task,
 
    /* color buffer */
    for (unsigned i = 0; i < scene->fb.nr_cbufs; i++) {
-      if (scene->fb.cbufs[i]) {
+      if (scene->fb.cbufs[i].texture) {
          stride[i] = scene->cbufs[i].stride;
          sample_stride[i] = scene->cbufs[i].sample_stride;
          color[i] = lp_rast_get_color_block_pointer(task, i, x, y,
@@ -259,9 +259,10 @@ lp_rast_shade_quads_all(struct lp_rasterizer_task *task,
       depth_stride = scene->zsbuf.stride;
    }
 
-   uint64_t mask = 0;
-   for (unsigned i = 0; i < scene->fb_max_samples; i++)
-      mask |= (uint64_t)0xffff << (16 * i);
+   static_assert(LP_MAX_SAMPLES <= 8, "Code below assumes max of 8 samples");
+   uint64_t mask[2] = { 0, 0 };
+   for (unsigned i = 0; i < MIN2(scene->fb_max_samples, LP_MAX_SAMPLES); i++)
+      mask[i / 4] |= (uint64_t)0xffff << (16 * (i % 4));
 
    /*
     * The rasterizer may produce fragments outside our
@@ -283,7 +284,7 @@ lp_rast_shade_quads_all(struct lp_rasterizer_task *task,
                                         GET_DADY(inputs),
                                         color,
                                         depth,
-                                        mask,
+                                        mask[0], mask[1],
                                         &task->thread_data,
                                         stride,
                                         depth_stride,

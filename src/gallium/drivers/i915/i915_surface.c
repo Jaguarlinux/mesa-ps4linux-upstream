@@ -136,15 +136,14 @@ i915_clear_render_target_render(struct pipe_context *pipe,
                                 unsigned height, bool render_condition_enabled)
 {
    struct i915_context *i915 = i915_context(pipe);
-   struct pipe_framebuffer_state fb_state;
+   struct pipe_framebuffer_state fb_state = {0};
 
    util_blitter_save_framebuffer(i915->blitter, &i915->framebuffer);
 
    fb_state.width = width;
    fb_state.height = height;
    fb_state.nr_cbufs = 1;
-   fb_state.cbufs[0] = dst;
-   fb_state.zsbuf = NULL;
+   fb_state.cbufs[0] = *dst;
    pipe->set_framebuffer_state(pipe, &fb_state);
 
    if (i915->dirty)
@@ -173,7 +172,7 @@ i915_clear_depth_stencil_render(struct pipe_context *pipe,
    fb_state.width = width;
    fb_state.height = height;
    fb_state.nr_cbufs = 0;
-   fb_state.zsbuf = dst;
+   fb_state.zsbuf = *dst;
    pipe->set_framebuffer_state(pipe, &fb_state);
 
    if (i915->dirty)
@@ -294,7 +293,7 @@ i915_clear_render_target_blitter(struct pipe_context *pipe,
    struct pipe_resource *pt = &tex->b;
    union util_color uc;
    unsigned offset =
-      i915_texture_offset(tex, dst->u.tex.level, dst->u.tex.first_layer);
+      i915_texture_offset(tex, dst->level, dst->first_layer);
 
    assert(util_format_get_blockwidth(pt->format) == 1);
    assert(util_format_get_blockheight(pt->format) == 1);
@@ -318,7 +317,7 @@ i915_clear_depth_stencil_blitter(struct pipe_context *pipe,
    unsigned packedds;
    unsigned mask = 0;
    unsigned offset =
-      i915_texture_offset(tex, dst->u.tex.level, dst->u.tex.first_layer);
+      i915_texture_offset(tex, dst->level, dst->first_layer);
 
    assert(util_format_get_blockwidth(pt->format) == 1);
    assert(util_format_get_blockheight(pt->format) == 1);
@@ -391,9 +390,9 @@ i915_create_surface_custom(struct pipe_context *ctx, struct pipe_resource *pt,
    struct i915_texture *tex = i915_texture(pt);
    struct i915_surface *surf;
 
-   assert(surf_tmpl->u.tex.first_layer == surf_tmpl->u.tex.last_layer);
+   assert(surf_tmpl->first_layer == surf_tmpl->last_layer);
    if (pt->target != PIPE_TEXTURE_CUBE && pt->target != PIPE_TEXTURE_3D)
-      assert(surf_tmpl->u.tex.first_layer == 0);
+      assert(surf_tmpl->first_layer == 0);
 
    surf = CALLOC_STRUCT(i915_surface);
    if (!surf)
@@ -404,9 +403,9 @@ i915_create_surface_custom(struct pipe_context *ctx, struct pipe_resource *pt,
    pipe_reference_init(&ps->reference, 1);
    pipe_resource_reference(&ps->texture, pt);
    ps->format = surf_tmpl->format;
-   ps->u.tex.level = surf_tmpl->u.tex.level;
-   ps->u.tex.first_layer = surf_tmpl->u.tex.first_layer;
-   ps->u.tex.last_layer = surf_tmpl->u.tex.last_layer;
+   ps->level = surf_tmpl->level;
+   ps->first_layer = surf_tmpl->first_layer;
+   ps->last_layer = surf_tmpl->last_layer;
    ps->context = ctx;
 
    if (util_format_is_depth_or_stencil(ps->format)) {
@@ -433,7 +432,7 @@ i915_create_surface_custom(struct pipe_context *ctx, struct pipe_resource *pt,
    return ps;
 }
 
-static struct pipe_surface *
+struct pipe_surface *
 i915_create_surface(struct pipe_context *ctx, struct pipe_resource *pt,
                     const struct pipe_surface *surf_tmpl)
 {
@@ -441,7 +440,7 @@ i915_create_surface(struct pipe_context *ctx, struct pipe_resource *pt,
                                      pt->height0);
 }
 
-static void
+void
 i915_surface_destroy(struct pipe_context *ctx, struct pipe_surface *surf)
 {
    pipe_resource_reference(&surf->texture, NULL);
@@ -462,6 +461,4 @@ i915_init_surface_functions(struct i915_context *i915)
    }
    i915->base.blit = i915_blit;
    i915->base.flush_resource = i915_flush_resource;
-   i915->base.create_surface = i915_create_surface;
-   i915->base.surface_destroy = i915_surface_destroy;
 }

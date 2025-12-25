@@ -34,6 +34,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_state.h"
 #include "pipe/p_context.h"
+#include "draw/draw_context.h"
 #include "frontend/drisw_api.h"
 
 #include "util/u_inlines.h"
@@ -70,6 +71,9 @@
 #define LVP_API_VERSION VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION)
 #endif
 
+#define LVP_SAMPLE_COUNTS (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | \
+                           VK_SAMPLE_COUNT_8_BIT)
+
 VKAPI_ATTR VkResult VKAPI_CALL lvp_EnumerateInstanceVersion(uint32_t* pApiVersion)
 {
    *pApiVersion = LVP_API_VERSION;
@@ -87,6 +91,7 @@ static const struct vk_instance_extension_table lvp_instance_extensions_supporte
 #ifdef LVP_USE_WSI_PLATFORM
    .KHR_get_surface_capabilities2            = true,
    .KHR_surface                              = true,
+   .KHR_surface_maintenance1                 = true,
    .KHR_surface_protected_capabilities       = true,
    .EXT_swapchain_colorspace                 = true,
    .EXT_surface_maintenance1                 = true,
@@ -120,6 +125,7 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .KHR_create_renderpass2                = true,
    .KHR_compute_shader_derivatives        = true,
    .KHR_copy_commands2                    = true,
+   .KHR_copy_memory_indirect              = true,
    .KHR_dedicated_allocation              = true,
    .KHR_deferred_host_operations          = true,
    .KHR_depth_stencil_resolve             = true,
@@ -156,6 +162,8 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .KHR_maintenance6                      = true,
    .KHR_maintenance7                      = true,
    .KHR_maintenance8                      = true,
+   .KHR_maintenance9                      = true,
+   .KHR_maintenance10                     = true,
    .KHR_map_memory2                       = true,
    .KHR_multiview                         = true,
    .KHR_push_descriptor                   = true,
@@ -185,14 +193,17 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .KHR_storage_buffer_storage_class      = true,
 #ifdef LVP_USE_WSI_PLATFORM
    .KHR_swapchain                         = true,
+   .KHR_swapchain_maintenance1            = true,
    .KHR_swapchain_mutable_format          = true,
 #endif
    .KHR_synchronization2                  = true,
    .KHR_timeline_semaphore                = true,
    .KHR_uniform_buffer_standard_layout    = true,
+   .KHR_unified_image_layouts             = true,
    .KHR_variable_pointers                 = true,
    .KHR_vertex_attribute_divisor          = true,
    .KHR_vulkan_memory_model               = true,
+   .KHR_workgroup_memory_explicit_layout  = true,
    .KHR_zero_initialize_workgroup_memory  = true,
    .ARM_rasterization_order_attachment_access = true,
    .EXT_4444_formats                      = true,
@@ -202,6 +213,7 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .EXT_calibrated_timestamps             = true,
    .EXT_color_write_enable                = true,
    .EXT_conditional_rendering             = true,
+   .EXT_depth_bias_control                = true,
    .EXT_depth_clip_enable                 = true,
    .EXT_depth_clip_control                = true,
    .EXT_depth_range_unrestricted          = true,
@@ -249,6 +261,9 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .EXT_primitive_topology_list_restart   = true,
    .EXT_rasterization_order_attachment_access = true,
    .EXT_queue_family_foreign              = true,
+   .EXT_global_priority                   = true,
+   .EXT_global_priority_query             = true,
+   .EXT_sample_locations                  = true,
    .EXT_sampler_filter_minmax             = true,
    .EXT_scalar_block_layout               = true,
    .EXT_separate_stencil_usage            = true,
@@ -267,6 +282,7 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .EXT_swapchain_maintenance1            = true,
 #endif
    .EXT_texel_buffer_alignment            = true,
+   .EXT_tooling_info                      = true,
    .EXT_transform_feedback                = true,
    .EXT_vertex_attribute_divisor          = true,
    .EXT_vertex_input_dynamic_state        = true,
@@ -283,6 +299,7 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
 #endif
    .GOOGLE_decorate_string                = true,
    .GOOGLE_hlsl_functionality1            = true,
+   .GOOGLE_user_type                      = true,
 };
 
 static bool
@@ -301,8 +318,51 @@ assert_memhandle_type(VkExternalMemoryHandleTypeFlags types)
    return types == 0;
 }
 
+static enum lvp_device_memory_type
+lvp_device_memory_type_for_handle_types(const struct lvp_physical_device *pdevice,
+                                        VkExternalMemoryHandleTypeFlags types)
+{
+   if (types == 0)
+      return LVP_DEVICE_MEMORY_TYPE_DEFAULT;
+
+#ifdef PIPE_MEMORY_FD
+   if (types & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+      assert(!(types & ~(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)));
+
+#ifdef HAVE_LIBDRM
+      int dmabuf_bits = DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
+      if ((pdevice->pscreen->caps.dmabuf & dmabuf_bits) == dmabuf_bits) {
+         /* If we have full dma-buf support, everything is a dma-buf */
+         return LVP_DEVICE_MEMORY_TYPE_DMA_BUF;
+      }
+
+      if (types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+         /* dma-buf is only supported for import so if we see dma-buf it has
+          * to come by itself.
+          */
+         assert(types == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+         return LVP_DEVICE_MEMORY_TYPE_DMA_BUF;
+      }
+#endif
+
+      assert(types == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+      return LVP_DEVICE_MEMORY_TYPE_OPAQUE_FD;
+   }
+#endif
+
+   if (types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
+      /* These can only be used for import so it's a single bit */
+      assert(util_bitcount(types) == 1);
+      return LVP_DEVICE_MEMORY_TYPE_USER_PTR;
+   }
+
+   UNREACHABLE("Unsupported import/export type");
+}
+
 static unsigned min_shader_cap(struct pipe_screen *pscreen,
-                               enum pipe_shader_type shader,
+                               mesa_shader_stage shader,
                                unsigned cap_offset)
 {
    unsigned val = UINT_MAX;
@@ -385,7 +445,7 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .shaderFloat64                            = (pdevice->pscreen->caps.doubles == 1),
       .shaderInt64                              = (pdevice->pscreen->caps.int64 == 1),
       .shaderInt16                              = AND_SHADER_CAP(pdevice->pscreen, int16),
-      .variableMultisampleRate                  = false,
+      .variableMultisampleRate                  = true,
       .inheritedQueries                         = false,
       .shaderResourceMinLod                     = true,
       .sparseBinding                            = DETECT_OS_LINUX,
@@ -546,6 +606,12 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
 
       /* VK_EXT_image_sliced_view_of_3d */
       .imageSlicedViewOf3D = true,
+
+      /* VK_EXT_depth_bias_control */
+      .depthBiasControl = true,
+      .leastRepresentableValueForceUnormRepresentation = true,
+      .floatRepresentation = true,
+      .depthBiasExact = true,
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
@@ -714,6 +780,10 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .shaderImageInt64Atomics = true,
       .sparseImageInt64Atomics = true,
 
+      /* VK_KHR_copy_memory_indirect */
+      .indirectMemoryCopy = true,
+      .indirectMemoryToImageCopy = true,
+
       /* VK_EXT_memory_priority */
       .memoryPriority = true,
 
@@ -745,6 +815,10 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .maintenance7 = true,
       /* maintenance8 */
       .maintenance8 = true,
+      /* maintenance9 */
+      .maintenance9 = true,
+      /* maintenance10 */
+      .maintenance10 = true,
 
       /* VK_KHR_shader_maximal_reconvergence */
       .shaderMaximalReconvergence = true,
@@ -755,7 +829,7 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
 #endif
 
 #ifdef LVP_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
 
@@ -773,6 +847,16 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .fragmentShaderSampleInterlock = true,
       .fragmentShaderPixelInterlock = true,
       .fragmentShaderShadingRateInterlock = false,
+
+      /* VK_KHR_workgroup_memory_explicit_layout */
+      .workgroupMemoryExplicitLayout = true,
+      .workgroupMemoryExplicitLayoutScalarBlockLayout = true,
+      .workgroupMemoryExplicitLayout8BitAccess = true,
+      .workgroupMemoryExplicitLayout16BitAccess = true,
+
+      /* VK_KHR_unified_image_layouts */
+      .unifiedImageLayouts = true,
+      .unifiedImageLayoutsVideo = true,
    };
 }
 
@@ -807,8 +891,6 @@ static VkImageLayout lvp_host_copy_image_layouts[] = {
 static void
 lvp_get_properties(const struct lvp_physical_device *device, struct vk_properties *p)
 {
-   VkSampleCountFlags sample_counts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
-
    const unsigned *grid_size = device->pscreen->compute_caps.max_grid_size;
    const unsigned *block_size = device->pscreen->compute_caps.max_block_size;
 
@@ -867,7 +949,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = 128,
       .maxGeometryShaderInvocations             = device->pscreen->caps.max_gs_invocations,
-      .maxGeometryInputComponents               = 64,
+      .maxGeometryInputComponents               = 128,
       .maxGeometryOutputComponents              = 128,
       .maxGeometryOutputVertices                = device->pscreen->caps.max_geometry_output_vertices,
       .maxGeometryTotalOutputComponents         = device->pscreen->caps.max_geometry_total_output_components,
@@ -906,16 +988,16 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxFramebufferWidth                      = device->pscreen->caps.max_texture_2d_size,
       .maxFramebufferHeight                     = device->pscreen->caps.max_texture_2d_size,
       .maxFramebufferLayers                     = device->pscreen->caps.max_texture_array_layers,
-      .framebufferColorSampleCounts             = sample_counts,
-      .framebufferDepthSampleCounts             = sample_counts,
-      .framebufferStencilSampleCounts           = sample_counts,
-      .framebufferNoAttachmentsSampleCounts     = sample_counts,
+      .framebufferColorSampleCounts             = LVP_SAMPLE_COUNTS,
+      .framebufferDepthSampleCounts             = LVP_SAMPLE_COUNTS,
+      .framebufferStencilSampleCounts           = LVP_SAMPLE_COUNTS,
+      .framebufferNoAttachmentsSampleCounts     = LVP_SAMPLE_COUNTS,
       .maxColorAttachments                      = max_render_targets,
-      .sampledImageColorSampleCounts            = sample_counts,
-      .sampledImageIntegerSampleCounts          = sample_counts,
-      .sampledImageDepthSampleCounts            = sample_counts,
-      .sampledImageStencilSampleCounts          = sample_counts,
-      .storageImageSampleCounts                 = sample_counts,
+      .sampledImageColorSampleCounts            = LVP_SAMPLE_COUNTS,
+      .sampledImageIntegerSampleCounts          = LVP_SAMPLE_COUNTS,
+      .sampledImageDepthSampleCounts            = LVP_SAMPLE_COUNTS,
+      .sampledImageStencilSampleCounts          = LVP_SAMPLE_COUNTS,
+      .storageImageSampleCounts                 = LVP_SAMPLE_COUNTS,
       .maxSampleMaskWords                       = 1,
       .timestampComputeAndGraphics              = true,
       .timestampPeriod                          = 1,
@@ -1007,7 +1089,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxDescriptorSetUpdateAfterBindStorageImages = MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindInputAttachments = MAX_DESCRIPTORS,
 
-      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_AVERAGE_BIT,
+      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = false,
       .independentResolve = false,
@@ -1016,7 +1098,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .filterMinmaxSingleComponentFormats = true,
 
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
-      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT, /* LVP_SAMPLE_COUNTS? */
 
       /* Vulkan 1.3 */
       .minSubgroupSize = lp_native_vector_width / 32,
@@ -1063,7 +1145,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = 512,
       .maxTransformFeedbackBufferDataSize = 512,
-      .maxTransformFeedbackBufferDataStride = 512,
+      .maxTransformFeedbackBufferDataStride = 2048,
       .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = false,
       .transformFeedbackRasterizationStreamSelect = false,
@@ -1177,6 +1259,15 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .prefersCompactVertexOutput = true,
       .prefersCompactPrimitiveOutput = false,
 
+      /* VK_EXT_sample_locations */
+      .sampleLocationSampleCounts = ~VK_SAMPLE_COUNT_1_BIT & LVP_SAMPLE_COUNTS,
+      .maxSampleLocationGridSize.width = 1,
+      .maxSampleLocationGridSize.height = 1,
+      .sampleLocationCoordinateRange[0] = 0.0f,
+      .sampleLocationCoordinateRange[1] = 0.9375f,
+      .sampleLocationSubPixelBits = 4,
+      .variableSampleLocations = true,
+
       /* VK_AMDX_shader_enqueue */
 #ifdef VK_ENABLE_BETA_EXTENSIONS
       .maxExecutionGraphDepth = 32,
@@ -1188,8 +1279,8 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
 
       /* VK_KHR_acceleration_structure */
       .maxGeometryCount = (1 << 24) - 1,
-      .maxInstanceCount = (1 << 24) - 1,
-      .maxPrimitiveCount = (1 << 24) - 1,
+      .maxInstanceCount = (1 << LVP_MAX_TLAS_DEPTH) - 1,
+      .maxPrimitiveCount = (1 << LVP_MAX_BLAS_DEPTH) - 1,
       .maxPerStageDescriptorAccelerationStructures = MAX_DESCRIPTORS,
       .maxPerStageDescriptorUpdateAfterBindAccelerationStructures = MAX_DESCRIPTORS,
       .maxDescriptorSetAccelerationStructures = MAX_DESCRIPTORS,
@@ -1249,6 +1340,9 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
    /* VK_EXT_host_image_copy */
    lvp_device_get_cache_uuid(p->optimalTilingLayoutUUID);
 
+   /* VK_KHR_copy_memory_indirect */
+   p->supportedQueues = 0xffffffff;
+
    /* maintenance7 */
    p->robustFragmentShadingRateAttachmentAccess = false;
    p->separateDepthStencilAttachmentAccess = true;
@@ -1258,6 +1352,14 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
    p->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = MAX_DESCRIPTORS / 2;
    p->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = MAX_DESCRIPTORS / 2;
    p->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = MAX_DESCRIPTORS;
+
+   /* maintenance9 */
+   p->image2DViewOf3DSparse = true;
+   p->defaultVertexAttributeValue = VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR;
+
+   /* maintenance10 */
+   p->rgba4OpaqueBlackSwizzled = true;
+   p->resolveSrgbFormatAppliesTransferFunction = true;
 
    /* VK_EXT_shader_object */
    /* this is basically unsupported */
@@ -1293,7 +1395,7 @@ lvp_physical_device_init(struct lvp_physical_device *device,
    if (!device->pscreen)
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (unsigned i = 0; i < ARRAY_SIZE(device->drv_options); i++)
-      device->drv_options[i] = device->pscreen->get_compiler_options(device->pscreen, PIPE_SHADER_IR_NIR, i);
+      device->drv_options[i] = device->pscreen->nir_options[MIN2(i, MESA_SHADER_COMPUTE)];
 
    device->sync_timeline_type = vk_sync_timeline_get_type(&lvp_pipe_sync_type);
    device->sync_types[0] = &lvp_pipe_sync_type;
@@ -1400,10 +1502,6 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateInstance(
 
    //   VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
-#if DETECT_OS_ANDROID
-   vk_android_init_ugralloc();
-#endif
-
    *pInstance = lvp_instance_to_handle(instance);
 
    return VK_SUCCESS;
@@ -1413,14 +1511,10 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyInstance(
    VkInstance                                  _instance,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_instance, instance, _instance);
+   VK_FROM_HANDLE(lvp_instance, instance, _instance);
 
    if (!instance)
       return;
-
-#if DETECT_OS_ANDROID
-   vk_android_destroy_ugralloc();
-#endif
 
    pipe_loader_release(&instance->devs, instance->num_devices);
 
@@ -1459,6 +1553,9 @@ static struct drisw_loader_funcs lvp_sw_lf = {
 static VkResult
 lvp_enumerate_physical_devices(struct vk_instance *vk_instance)
 {
+   if (!draw_get_option_use_llvm())
+      return VK_SUCCESS;
+
    struct lvp_instance *instance =
       container_of(vk_instance, struct lvp_instance, vk);
 
@@ -1515,6 +1612,9 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceQueueFamilyProperties2(
       prio->priorities[2] = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
       prio->priorities[3] = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
    }
+   VkQueueFamilyOwnershipTransferPropertiesKHR *prop = vk_find_struct(pQueueFamilyProperties, QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR);
+   if (prop)
+      prop->optimalImageTransferToQueueFamilies = ~0;
 
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
       p->queueFamilyProperties = (VkQueueFamilyProperties) {
@@ -1600,12 +1700,6 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL lvp_GetInstanceProcAddr(
                                     pName);
 }
 
-/* Windows will use a dll definition file to avoid build errors. */
-#ifdef _WIN32
-#undef PUBLIC
-#define PUBLIC
-#endif
-
 /* The loader wants us to expose a second GetInstanceProcAddr function
  * to work around certain LD_PRELOAD issues seen in apps.
  */
@@ -1620,9 +1714,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(
 static void
 destroy_pipelines(struct lvp_queue *queue)
 {
+   struct lvp_device *device = lvp_queue_device(queue);
    simple_mtx_lock(&queue->lock);
    while (util_dynarray_contains(&queue->pipeline_destroys, struct lvp_pipeline*)) {
-      lvp_pipeline_destroy(queue->device, util_dynarray_pop(&queue->pipeline_destroys, struct lvp_pipeline*), true);
+      lvp_pipeline_destroy(device, util_dynarray_pop(&queue->pipeline_destroys, struct lvp_pipeline*), true);
    }
    simple_mtx_unlock(&queue->lock);
 }
@@ -1632,8 +1727,9 @@ lvp_queue_submit(struct vk_queue *vk_queue,
                  struct vk_queue_submit *submit)
 {
    struct lvp_queue *queue = container_of(vk_queue, struct lvp_queue, vk);
+   struct lvp_device *device = lvp_queue_device(queue);
 
-   VkResult result = vk_sync_wait_many(&queue->device->vk,
+   VkResult result = vk_sync_wait_many(&device->vk,
                                        submit->wait_count, submit->waits,
                                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
    if (result != VK_SUCCESS)
@@ -1644,26 +1740,26 @@ lvp_queue_submit(struct vk_queue *vk_queue,
    for (uint32_t i = 0; i < submit->buffer_bind_count; i++) {
       VkSparseBufferMemoryBindInfo *bind = &submit->buffer_binds[i];
 
-      lvp_buffer_bind_sparse(queue->device, queue, bind);
+      lvp_buffer_bind_sparse(device, queue, bind);
    }
 
    for (uint32_t i = 0; i < submit->image_opaque_bind_count; i++) {
       VkSparseImageOpaqueMemoryBindInfo *bind = &submit->image_opaque_binds[i];
 
-      lvp_image_bind_opaque_sparse(queue->device, queue, bind);
+      lvp_image_bind_opaque_sparse(device, queue, bind);
    }
 
    for (uint32_t i = 0; i < submit->image_bind_count; i++) {
       VkSparseImageMemoryBindInfo *bind = &submit->image_binds[i];
 
-      lvp_image_bind_sparse(queue->device, queue, bind);
+      lvp_image_bind_sparse(device, queue, bind);
    }
 
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct lvp_cmd_buffer *cmd_buffer =
          container_of(submit->command_buffers[i], struct lvp_cmd_buffer, vk);
 
-      lvp_execute_cmds(queue->device, queue, cmd_buffer);
+      lvp_execute_cmds(device, queue, cmd_buffer);
    }
 
    simple_mtx_unlock(&queue->lock);
@@ -1674,7 +1770,7 @@ lvp_queue_submit(struct vk_queue *vk_queue,
    for (uint32_t i = 0; i < submit->signal_count; i++) {
       struct lvp_pipe_sync *sync =
          vk_sync_as_lvp_pipe_sync(submit->signals[i].sync);
-      lvp_pipe_sync_signal_with_fence(queue->device, sync, queue->last_fence);
+      lvp_pipe_sync_signal_with_fence(device, sync, queue->last_fence);
    }
    destroy_pipelines(queue);
 
@@ -1697,8 +1793,6 @@ lvp_queue_init(struct lvp_device *device, struct lvp_queue *queue,
       return result;
    }
 
-   queue->device = device;
-
    queue->ctx = device->pscreen->context_create(device->pscreen, NULL, PIPE_CONTEXT_ROBUST_BUFFER_ACCESS);
    queue->cso = cso_create_context(queue->ctx, CSO_NO_VBUF);
    queue->uploader = u_upload_create(queue->ctx, 1024 * 1024, PIPE_BIND_CONSTANT_BUFFER, PIPE_USAGE_STREAM, 0);
@@ -1706,7 +1800,7 @@ lvp_queue_init(struct lvp_device *device, struct lvp_queue *queue,
    queue->vk.driver_submit = lvp_queue_submit;
 
    simple_mtx_init(&queue->lock, mtx_plain);
-   util_dynarray_init(&queue->pipeline_destroys, NULL);
+   queue->pipeline_destroys = UTIL_DYNARRAY_INIT;
 
    return VK_SUCCESS;
 }
@@ -1731,7 +1825,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
    const VkAllocationCallbacks*                pAllocator,
    VkDevice*                                   pDevice)
 {
-   LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
+   VK_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
    struct lvp_device *device;
    struct lvp_instance *instance = (struct lvp_instance *)physical_device->vk.instance;
 
@@ -1766,15 +1860,30 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
    vk_device_enable_threaded_submit(&device->vk);
    device->vk.command_buffer_ops = &lvp_cmd_buffer_ops;
 
-   device->instance = (struct lvp_instance *)physical_device->vk.instance;
-   device->physical_device = physical_device;
-
    device->pscreen = physical_device->pscreen;
 
-   assert(pCreateInfo->queueCreateInfoCount == 1);
-   assert(pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex == 0);
-   assert(pCreateInfo->pQueueCreateInfos[0].queueCount == 1);
-   result = lvp_queue_init(device, &device->queue, pCreateInfo->pQueueCreateInfos, 0);
+   assert(pCreateInfo->queueCreateInfoCount <= LVP_NUM_QUEUES);
+   if (pCreateInfo->queueCreateInfoCount) {
+      assert(pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex == 0);
+      assert(pCreateInfo->pQueueCreateInfos[0].queueCount == 1);
+      result = lvp_queue_init(device, &device->queue, pCreateInfo->pQueueCreateInfos, 0);
+   } else {
+      /* VK_KHR_maintenance9 allows zero queues devices used to compile shaders only.
+      *  Since we only ever create a single queue, and it has no hardward backing it,
+      *  we can just create a dummy queue on the behalf of the user.
+      */
+      const float fake_priority = 1.0f;
+      const VkDeviceQueueCreateInfo dummy_create_info = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .pNext = NULL,
+         .flags = 0,
+         .queueFamilyIndex = 0,
+         .queueCount = 1,
+         .pQueuePriorities = &fake_priority
+      };
+      result = lvp_queue_init(device, &device->queue, &dummy_create_info, 0);
+   }
+
    if (result != VK_SUCCESS) {
       vk_free(&device->vk.alloc, device);
       return result;
@@ -1796,8 +1905,8 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
    device->null_image_handle = (void *)(uintptr_t)device->queue.ctx->create_image_handle(device->queue.ctx,
       &(struct pipe_image_view){ 0 });
 
-   util_dynarray_init(&device->bda_texture_handles, NULL);
-   util_dynarray_init(&device->bda_image_handles, NULL);
+   device->bda_texture_handles = UTIL_DYNARRAY_INIT;
+   device->bda_image_handles = UTIL_DYNARRAY_INIT;
 
    device->group_handle_alloc = 1;
 
@@ -1819,7 +1928,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyDevice(
    VkDevice                                    _device,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
 
    lvp_device_finish_accel_struct_state(device);
 
@@ -1842,7 +1951,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyDevice(
 
    if (device->queue.last_fence)
       device->pscreen->fence_reference(device->pscreen, &device->queue.last_fence, NULL);
-   ralloc_free(device->bda.table);
+   _mesa_hash_table_fini(&device->bda, NULL);
    simple_mtx_destroy(&device->bda_lock);
    pipe_resource_reference(&device->zero_buffer, NULL);
 
@@ -1903,7 +2012,7 @@ set_mem_priority(struct lvp_device_memory *mem, int priority)
       if (priority > 0)
          advice |= MADV_WILLNEED;
       if (advice)
-         madvise(mem->map, mem->size, advice);
+         madvise(mem->map, mem->vk.size, advice);
    }
 #endif
 }
@@ -1924,35 +2033,16 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
    const VkAllocationCallbacks*                pAllocator,
    VkDeviceMemory*                             pMem)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    struct lvp_device_memory *mem;
-   ASSERTED const VkExportMemoryAllocateInfo *export_info = NULL;
    ASSERTED const VkImportMemoryFdInfoKHR *import_info = NULL;
    const VkMemoryAllocateFlagsInfo *mem_flags = NULL;
-#if DETECT_OS_ANDROID
-   ASSERTED const VkImportAndroidHardwareBufferInfoANDROID *ahb_import_info = NULL;
-#endif
-   const VkImportMemoryHostPointerInfoEXT *host_ptr_info = NULL;
    VkResult error = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    assert(pAllocateInfo->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
    int priority = 0;
 
-   if (pAllocateInfo->allocationSize == 0) {
-      /* Apparently, this is allowed */
-      *pMem = VK_NULL_HANDLE;
-      return VK_SUCCESS;
-   }
-
    vk_foreach_struct_const(ext, pAllocateInfo->pNext) {
       switch ((unsigned)ext->sType) {
-      case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
-         host_ptr_info = (VkImportMemoryHostPointerInfoEXT*)ext;
-         assert(host_ptr_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
-         break;
-      case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
-         export_info = (VkExportMemoryAllocateInfo*)ext;
-         assert_memhandle_type(export_info->handleTypes);
-         break;
       case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
          import_info = (VkImportMemoryFdInfoKHR*)ext;
          assert_memhandle_type(import_info->handleType);
@@ -1965,12 +2055,6 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
       case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
          mem_flags = (void*)ext;
          break;
-#if DETECT_OS_ANDROID
-      case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID: {
-         ahb_import_info = (VkImportAndroidHardwareBufferInfoANDROID*)ext;
-         break;
-      }
-#endif
       default:
          break;
       }
@@ -1978,80 +2062,73 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
 
 #ifdef PIPE_MEMORY_FD
    if (import_info != NULL && import_info->fd < 0) {
-      return vk_error(device->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      const struct lvp_physical_device *pdev = lvp_device_physical(device);
+      return vk_error(pdev->vk.instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
 #endif
 
-   mem = vk_alloc2(&device->vk.alloc, pAllocator, sizeof(*mem), 8,
-                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   mem = vk_device_memory_create(&device->vk, pAllocateInfo, pAllocator,
+                                 sizeof(*mem));
    if (mem == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   vk_object_base_init(&device->vk, &mem->base,
-                       VK_OBJECT_TYPE_DEVICE_MEMORY);
-
    mem->memory_type = LVP_DEVICE_MEMORY_TYPE_DEFAULT;
    mem->backed_fd = -1;
-   mem->size = pAllocateInfo->allocationSize;
 
-#if DETECT_OS_ANDROID
-   mem->android_hardware_buffer = NULL;
-#endif
-
-   if (host_ptr_info) {
+   if (mem->vk.host_ptr) {
       mem->mem_alloc = (struct llvmpipe_memory_allocation) {
-         .cpu_addr = host_ptr_info->pHostPointer,
+         .cpu_addr = mem->vk.host_ptr,
       };
       mem->pmem = (void *)&mem->mem_alloc;
-      mem->map = host_ptr_info->pHostPointer;
+      mem->map = mem->vk.host_ptr;
       mem->memory_type = LVP_DEVICE_MEMORY_TYPE_USER_PTR;
    }
 #if DETECT_OS_ANDROID
-   else if(ahb_import_info) {
-      error = lvp_import_ahb_memory(device, mem, ahb_import_info);
-      if (error != VK_SUCCESS)
-         goto fail;
-   } else if(export_info &&
-             (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
-      error = lvp_create_ahb_memory(device, mem, pAllocateInfo);
+   else if (mem->vk.ahardware_buffer) {
+      error = lvp_import_ahb_memory(device, mem);
       if (error != VK_SUCCESS)
          goto fail;
    }
 #endif
 #ifdef PIPE_MEMORY_FD
-   else if(import_info && import_info->handleType) {
-      bool dmabuf = import_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   else if (mem->vk.import_handle_type) {
+      assert(import_info &&
+             import_info->handleType == mem->vk.import_handle_type);
+      const enum lvp_device_memory_type memory_type =
+         lvp_device_memory_type_for_handle_types(lvp_device_physical(device), mem->vk.import_handle_type);
+      const bool dmabuf = memory_type == LVP_DEVICE_MEMORY_TYPE_DMA_BUF;
       uint64_t size;
       if(!device->pscreen->import_memory_fd(device->pscreen, import_info->fd, &mem->pmem, &size, dmabuf)) {
-         close(import_info->fd);
          error = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          goto fail;
       }
       if(size < pAllocateInfo->allocationSize) {
          device->pscreen->free_memory_fd(device->pscreen, mem->pmem);
-         close(import_info->fd);
+         error = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          goto fail;
       }
-      if (export_info && export_info->handleTypes == import_info->handleType) {
+      if (mem->vk.export_handle_types == mem->vk.import_handle_type) {
          mem->backed_fd = import_info->fd;
       }
       else {
          close(import_info->fd);
       }
 
-      mem->size = size;
+      mem->vk.size = size;
       mem->map = device->pscreen->map_memory(device->pscreen, mem->pmem);
-      mem->memory_type = dmabuf ? LVP_DEVICE_MEMORY_TYPE_DMA_BUF : LVP_DEVICE_MEMORY_TYPE_OPAQUE_FD;
+      mem->memory_type = memory_type;
    }
-   else if (export_info && export_info->handleTypes) {
-      bool dmabuf = export_info->handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   else if (mem->vk.export_handle_types) {
+      const enum lvp_device_memory_type memory_type =
+         lvp_device_memory_type_for_handle_types(lvp_device_physical(device), mem->vk.export_handle_types);
+      const bool dmabuf = memory_type == LVP_DEVICE_MEMORY_TYPE_DMA_BUF;
       mem->pmem = device->pscreen->allocate_memory_fd(device->pscreen, pAllocateInfo->allocationSize, &mem->backed_fd, dmabuf);
       if (!mem->pmem || mem->backed_fd < 0) {
           goto fail;
       }
 
       mem->map = device->pscreen->map_memory(device->pscreen, mem->pmem);
-      mem->memory_type = dmabuf ? LVP_DEVICE_MEMORY_TYPE_DMA_BUF : LVP_DEVICE_MEMORY_TYPE_OPAQUE_FD;
+      mem->memory_type = memory_type;
       /* XXX: this should be memset_s or memset_explicit but they are not supported */
       if (mem_flags && mem_flags->flags & VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT)
          memset(mem->map, 0, pAllocateInfo->allocationSize);
@@ -2073,14 +2150,12 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
          memset(mem->map, 0, pAllocateInfo->allocationSize);
    }
 
-   mem->type_index = pAllocateInfo->memoryTypeIndex;
-
    *pMem = lvp_device_memory_to_handle(mem);
 
    return VK_SUCCESS;
 
 fail:
-   vk_free2(&device->vk.alloc, pAllocator, mem);
+   vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
    return vk_error(device, error);
 }
 
@@ -2089,8 +2164,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_FreeMemory(
    VkDeviceMemory                              _mem,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
-   LVP_FROM_HANDLE(lvp_device_memory, mem, _mem);
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device_memory, mem, _mem);
 
    if (mem == NULL)
       return;
@@ -2114,9 +2189,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_FreeMemory(
    default:
       break;
    }
-   vk_object_base_finish(&mem->base);
-   vk_free2(&device->vk.alloc, pAllocator, mem);
 
+   vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL lvp_MapMemory2KHR(
@@ -2124,7 +2198,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_MapMemory2KHR(
     const VkMemoryMapInfoKHR*                   pMemoryMapInfo,
     void**                                      ppData)
 {
-   LVP_FROM_HANDLE(lvp_device_memory, mem, pMemoryMapInfo->memory);
+   VK_FROM_HANDLE(lvp_device_memory, mem, pMemoryMapInfo->memory);
 
    if (mem == NULL) {
       *ppData = NULL;
@@ -2176,8 +2250,13 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetDeviceBufferMemoryRequirements(
    VkBuffer _buffer;
    if (lvp_CreateBuffer(_device, pInfo->pCreateInfo, NULL, &_buffer) != VK_SUCCESS)
       return;
-   LVP_FROM_HANDLE(lvp_buffer, buffer, _buffer);
-   pMemoryRequirements->memoryRequirements.size = buffer->total_size;
+
+   assert(pInfo->pNext == NULL);
+   const VkBufferMemoryRequirementsInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+      .buffer = _buffer,
+   };
+   lvp_GetBufferMemoryRequirements2(_device, &info, pMemoryRequirements);
    lvp_DestroyBuffer(_device, _buffer, NULL);
 }
 
@@ -2193,9 +2272,23 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetDeviceImageMemoryRequirements(
    VkImage _image;
    if (lvp_CreateImage(_device, pInfo->pCreateInfo, NULL, &_image) != VK_SUCCESS)
       return;
-   LVP_FROM_HANDLE(lvp_image, image, _image);
-   pMemoryRequirements->memoryRequirements.size = image->size;
-   pMemoryRequirements->memoryRequirements.alignment = image->alignment;
+   VK_FROM_HANDLE(lvp_image, image, _image);
+
+   /* Per spec VUs of VkImageMemoryRequirementsInfo2 */
+   const bool need_plane_info =
+      image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT &&
+      (image->plane_count > 1 ||
+       image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+   const VkImagePlaneMemoryRequirementsInfo plane_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
+      .planeAspect = pInfo->planeAspect,
+   };
+   const VkImageMemoryRequirementsInfo2 base_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .pNext = need_plane_info ? &plane_info : NULL,
+      .image = _image,
+   };
+   lvp_GetImageMemoryRequirements2(_device, &base_info, pMemoryRequirements);
    lvp_DestroyImage(_device, _image, NULL);
 }
 
@@ -2204,7 +2297,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetBufferMemoryRequirements(
    VkBuffer                                    _buffer,
    VkMemoryRequirements*                       pMemoryRequirements)
 {
-   LVP_FROM_HANDLE(lvp_buffer, buffer, _buffer);
+   VK_FROM_HANDLE(lvp_buffer, buffer, _buffer);
 
    pMemoryRequirements->alignment = 64;
    if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
@@ -2253,7 +2346,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetImageMemoryRequirements(
    VkImage                                     _image,
    VkMemoryRequirements*                       pMemoryRequirements)
 {
-   LVP_FROM_HANDLE(lvp_image, image, _image);
+   VK_FROM_HANDLE(lvp_image, image, _image);
    pMemoryRequirements->memoryTypeBits = 1;
 
    pMemoryRequirements->size = image->size;
@@ -2295,10 +2388,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_BindBufferMemory2(VkDevice _device,
                                uint32_t bindInfoCount,
                                const VkBindBufferMemoryInfo *pBindInfos)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
-      LVP_FROM_HANDLE(lvp_device_memory, mem, pBindInfos[i].memory);
-      LVP_FROM_HANDLE(lvp_buffer, buffer, pBindInfos[i].buffer);
+      VK_FROM_HANDLE(lvp_device_memory, mem, pBindInfos[i].memory);
+      VK_FROM_HANDLE(lvp_buffer, buffer, pBindInfos[i].buffer);
       VkBindMemoryStatusKHR *status = (void*)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS_KHR);
 
       buffer->mem = mem;
@@ -2341,81 +2434,72 @@ lvp_image_plane_bind(struct lvp_device *device,
    return VK_SUCCESS;
 }
 
-
-VKAPI_ATTR VkResult VKAPI_CALL lvp_BindImageMemory2(VkDevice _device,
-                              uint32_t bindInfoCount,
-                              const VkBindImageMemoryInfo *pBindInfos)
+static VkResult
+lvp_image_bind(struct lvp_device *device,
+               const VkBindImageMemoryInfo *bind_info)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
-   VkResult res = VK_SUCCESS;
-   for (uint32_t i = 0; i < bindInfoCount; ++i) {
-      const VkBindImageMemoryInfo *bind_info = &pBindInfos[i];
-      LVP_FROM_HANDLE(lvp_device_memory, mem, bind_info->memory);
-      LVP_FROM_HANDLE(lvp_image, image, bind_info->image);
-      VkBindMemoryStatusKHR *status = (void*)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS_KHR);
-      bool did_bind = false;
+   VK_FROM_HANDLE(lvp_device_memory, mem, bind_info->memory);
+   VK_FROM_HANDLE(lvp_image, image, bind_info->image);
+   uint64_t mem_offset = bind_info->memoryOffset;
+   VkResult result;
 
-      if (!mem) {
-         continue;
-      }
-
-#ifdef LVP_USE_WSI_PLATFORM
-      vk_foreach_struct_const(s, bind_info->pNext) {
-         switch (s->sType) {
-         case VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR: {
-            const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
-               (const VkBindImageMemorySwapchainInfoKHR *) s;
-            struct lvp_image *swapchain_image =
-               lvp_swapchain_get_image(swapchain_info->swapchain,
-                                       swapchain_info->imageIndex);
-
-            image->planes[0].pmem = swapchain_image->planes[0].pmem;
-            image->planes[0].memory_offset = swapchain_image->planes[0].memory_offset;
-            device->pscreen->resource_bind_backing(device->pscreen,
-                                                   image->planes[0].bo,
-                                                   image->planes[0].pmem,
-                                                   0, 0,
-                                                   image->planes[0].memory_offset);
-            did_bind = true;
-            if (status)
-               *status->pResult = VK_SUCCESS;
-            break;
-         }
-         default:
-            break;
-         }
-      }
+   if (!mem) {
+#if DETECT_OS_ANDROID
+      /* TODO handle VkNativeBufferANDROID */
+      UNREACHABLE("VkBindImageMemoryInfo with no memory");
+#else
+      const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
+         vk_find_struct_const(bind_info->pNext,
+                              BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+      assert(swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE);
+      mem = lvp_device_memory_from_handle(wsi_common_get_memory(
+         swapchain_info->swapchain, swapchain_info->imageIndex));
+      mem_offset = 0;
 #endif
+   }
 
-      if (!did_bind) {
-         uint64_t offset_B = 0;
-         VkResult result;
-         if (image->disjoint) {
-            const VkBindImagePlaneMemoryInfo *plane_info =
-               vk_find_struct_const(pBindInfos[i].pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
-            uint8_t plane = lvp_image_aspects_to_plane(image, plane_info->planeAspect);
-            result = lvp_image_plane_bind(device, &image->planes[plane],
-                                          mem, bind_info->memoryOffset, &offset_B);
-            if (status)
-               *status->pResult = result;
-            if (result != VK_SUCCESS)
-               return result;
-         } else {
-            VkResult fail = VK_SUCCESS;
-            for (unsigned plane = 0; plane < image->plane_count; plane++) {
-               result = lvp_image_plane_bind(device, &image->planes[plane],
-                                             mem, bind_info->memoryOffset + image->offset, &offset_B);
-               if (status)
-                  *status->pResult = res;
-               if (result != VK_SUCCESS)
-                  fail = result;
-            }
-            if (fail != VK_SUCCESS)
-               return fail;
-         }
+   assert(mem);
+   uint64_t offset_B = 0;
+   if (image->disjoint) {
+      const VkBindImagePlaneMemoryInfo *plane_info =
+         vk_find_struct_const(bind_info->pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
+      const uint8_t plane =
+         lvp_image_aspects_to_plane(image, plane_info->planeAspect);
+      result = lvp_image_plane_bind(device, &image->planes[plane], mem,
+                                    mem_offset, &offset_B);
+      if (result != VK_SUCCESS)
+         return result;
+   } else {
+      for (unsigned plane = 0; plane < image->plane_count; plane++) {
+         result = lvp_image_plane_bind(device, &image->planes[plane], mem,
+                                       mem_offset + image->offset, &offset_B);
+         if (result != VK_SUCCESS)
+            return result;
       }
    }
-   return res;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+lvp_BindImageMemory2(VkDevice _device,
+                     uint32_t bindInfoCount,
+                     const VkBindImageMemoryInfo *pBindInfos)
+{
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      const VkBindMemoryStatus *bind_status =
+         vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS);
+      VkResult bind_result = lvp_image_bind(device, &pBindInfos[i]);
+      if (bind_status)
+         *bind_status->pResult = bind_result;
+      if (bind_result != VK_SUCCESS)
+         result = bind_result;
+   }
+
+   return result;
 }
 
 #ifdef PIPE_MEMORY_FD
@@ -2423,7 +2507,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_BindImageMemory2(VkDevice _device,
 VkResult
 lvp_GetMemoryFdKHR(VkDevice _device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFD)
 {
-   LVP_FROM_HANDLE(lvp_device_memory, memory, pGetFdInfo->memory);
+   VK_FROM_HANDLE(lvp_device_memory, memory, pGetFdInfo->memory);
 
    assert(pGetFdInfo->sType == VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR);
    assert_memhandle_type(pGetFdInfo->handleType);
@@ -2439,7 +2523,7 @@ lvp_GetMemoryFdPropertiesKHR(VkDevice _device,
                              int fd,
                              VkMemoryFdPropertiesKHR *pMemoryFdProperties)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
 
    assert(pMemoryFdProperties->sType == VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR);
 
@@ -2447,8 +2531,10 @@ lvp_GetMemoryFdPropertiesKHR(VkDevice _device,
       // There is only one memoryType so select this one
       pMemoryFdProperties->memoryTypeBits = 1;
    }
-   else
-      return vk_error(device->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   else {
+      const struct lvp_physical_device *pdev = lvp_device_physical(device);
+      return vk_error(pdev->vk.instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
    return VK_SUCCESS;
 }
 
@@ -2460,7 +2546,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateEvent(
    const VkAllocationCallbacks*                pAllocator,
    VkEvent*                                    pEvent)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    struct lvp_event *event = vk_alloc2(&device->vk.alloc, pAllocator,
                                        sizeof(*event), 8,
                                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -2480,8 +2566,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyEvent(
    VkEvent                                     _event,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
-   LVP_FROM_HANDLE(lvp_event, event, _event);
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_event, event, _event);
 
    if (!event)
       return;
@@ -2494,7 +2580,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_GetEventStatus(
    VkDevice                                    _device,
    VkEvent                                     _event)
 {
-   LVP_FROM_HANDLE(lvp_event, event, _event);
+   VK_FROM_HANDLE(lvp_event, event, _event);
    if (event->event_storage == 1)
       return VK_EVENT_SET;
    return VK_EVENT_RESET;
@@ -2504,7 +2590,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_SetEvent(
    VkDevice                                    _device,
    VkEvent                                     _event)
 {
-   LVP_FROM_HANDLE(lvp_event, event, _event);
+   VK_FROM_HANDLE(lvp_event, event, _event);
    event->event_storage = 1;
 
    return VK_SUCCESS;
@@ -2514,7 +2600,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_ResetEvent(
    VkDevice                                    _device,
    VkEvent                                     _event)
 {
-   LVP_FROM_HANDLE(lvp_event, event, _event);
+   VK_FROM_HANDLE(lvp_event, event, _event);
    event->event_storage = 0;
 
    return VK_SUCCESS;
@@ -2566,7 +2652,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateSampler(
    const VkAllocationCallbacks*                pAllocator,
    VkSampler*                                  pSampler)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    struct lvp_sampler *sampler;
 
    sampler = vk_sampler_create(&device->vk, pCreateInfo,
@@ -2586,8 +2672,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroySampler(
    VkSampler                                   _sampler,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
-   LVP_FROM_HANDLE(lvp_sampler, sampler, _sampler);
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_sampler, sampler, _sampler);
 
    if (!_sampler)
       return;
@@ -2601,7 +2687,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreatePrivateDataSlot(
    const VkAllocationCallbacks*                pAllocator,
    VkPrivateDataSlot*                          pPrivateDataSlot)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    return vk_private_data_slot_create(&device->vk, pCreateInfo, pAllocator,
                                       pPrivateDataSlot);
 }
@@ -2611,7 +2697,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyPrivateDataSlot(
    VkPrivateDataSlot                           privateDataSlot,
    const VkAllocationCallbacks*                pAllocator)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    vk_private_data_slot_destroy(&device->vk, privateDataSlot, pAllocator);
 }
 
@@ -2622,7 +2708,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_SetPrivateData(
    VkPrivateDataSlot                           privateDataSlot,
    uint64_t                                    data)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    return vk_object_base_set_private_data(&device->vk, objectType,
                                           objectHandle, privateDataSlot,
                                           data);
@@ -2635,7 +2721,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPrivateData(
    VkPrivateDataSlot                           privateDataSlot,
    uint64_t*                                   pData)
 {
-   LVP_FROM_HANDLE(lvp_device, device, _device);
+   VK_FROM_HANDLE(lvp_device, device, _device);
    vk_object_base_get_private_data(&device->vk, objectType, objectHandle,
                                    privateDataSlot, pData);
 }
@@ -2645,7 +2731,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceExternalFenceProperties(
    const VkPhysicalDeviceExternalFenceInfo    *pExternalFenceInfo,
    VkExternalFenceProperties                  *pExternalFenceProperties)
 {
-   LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
+   VK_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
    const VkExternalFenceHandleTypeFlagBits handle_type = pExternalFenceInfo->handleType;
 
    if (handle_type == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT &&
@@ -2669,7 +2755,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceExternalSemaphoreProperties(
    const VkPhysicalDeviceExternalSemaphoreInfo *pExternalSemaphoreInfo,
    VkExternalSemaphoreProperties               *pExternalSemaphoreProperties)
 {
-   LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
+   VK_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
    const VkSemaphoreTypeCreateInfo *type_info =
       vk_find_struct_const(pExternalSemaphoreInfo->pNext, SEMAPHORE_TYPE_CREATE_INFO);
    const VkSemaphoreType type = !type_info ? VK_SEMAPHORE_TYPE_BINARY : type_info->semaphoreType;
@@ -2715,6 +2801,29 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_GetPhysicalDeviceCalibrateableTimeDomainsEXT(
     return vk_outarray_status(&out);
 }
 
+VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceMultisamplePropertiesEXT(
+   VkPhysicalDevice                            physicalDevice,
+   VkSampleCountFlagBits                       samples,
+   VkMultisamplePropertiesEXT*                 pMultisampleProperties)
+{
+   assert(pMultisampleProperties->sType ==
+          VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT);
+
+   VkSampleCountFlags sample_counts =
+      ~VK_SAMPLE_COUNT_1_BIT & LVP_SAMPLE_COUNTS;
+
+   VkExtent2D grid_size;
+   if (samples & sample_counts) {
+      grid_size.width = 1;
+      grid_size.height = 1;
+   } else {
+      grid_size.width = 0;
+      grid_size.height = 0;
+   }
+   pMultisampleProperties->maxSampleLocationGridSize = grid_size;
+}
+
+
 VKAPI_ATTR VkResult VKAPI_CALL lvp_GetCalibratedTimestampsEXT(
    VkDevice device,
    uint32_t timestampCount,
@@ -2746,7 +2855,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_SetDeviceMemoryPriorityEXT(
     VkDeviceMemory                              _memory,
     float                                       priority)
 {
-   LVP_FROM_HANDLE(lvp_device_memory, mem, _memory);
+   VK_FROM_HANDLE(lvp_device_memory, mem, _memory);
    set_mem_priority(mem, get_mem_priority(priority));
 }
 

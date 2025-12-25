@@ -11,6 +11,8 @@
 
 #include "fd6_format_table.h"
 
+#include "freedreno_dev_info.h"
+
 /* Specifies the table of all the formats and their features. Also supplies
  * the helpers that look up various data in those tables.
  */
@@ -54,8 +56,8 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _TC(L8_UNORM,   8_UNORM,                     WZYX),
    _TC(L8_SRGB,    8_UNORM,                     WZYX),
    _TC(L8_SNORM,   8_SNORM,                     WZYX),
-   _T_(I8_UNORM,   8_UNORM,                     WZYX),
-   _T_(I8_SNORM,   8_SNORM,                     WZYX),
+   _TC(I8_UNORM,   8_UNORM,                     WZYX),
+   _TC(I8_SNORM,   8_SNORM,                     WZYX),
 
    _T_(A8_UINT,    8_UINT,                      WZYX),
    _T_(A8_SINT,    8_SINT,                      WZYX),
@@ -81,16 +83,16 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _T_(A16_UINT,    16_UINT,                    WZYX),
    _T_(A16_SINT,    16_SINT,                    WZYX),
    _T_(A16_FLOAT,   16_FLOAT,                   WZYX),
-   _T_(L16_UNORM,   16_UNORM,                   WZYX),
-   _T_(L16_SNORM,   16_SNORM,                   WZYX),
-   _T_(L16_UINT,    16_UINT,                    WZYX),
-   _T_(L16_SINT,    16_SINT,                    WZYX),
-   _T_(L16_FLOAT,   16_FLOAT,                   WZYX),
-   _T_(I16_UNORM,   16_UNORM,                   WZYX),
-   _T_(I16_SNORM,   16_SNORM,                   WZYX),
-   _T_(I16_UINT,    16_UINT,                    WZYX),
-   _T_(I16_SINT,    16_SINT,                    WZYX),
-   _T_(I16_FLOAT,   16_FLOAT,                   WZYX),
+   _TC(L16_UNORM,   16_UNORM,                   WZYX),
+   _TC(L16_SNORM,   16_SNORM,                   WZYX),
+   _TC(L16_UINT,    16_UINT,                    WZYX),
+   _TC(L16_SINT,    16_SINT,                    WZYX),
+   _TC(L16_FLOAT,   16_FLOAT,                   WZYX),
+   _TC(I16_UNORM,   16_UNORM,                   WZYX),
+   _TC(I16_SNORM,   16_SNORM,                   WZYX),
+   _TC(I16_UINT,    16_UINT,                    WZYX),
+   _TC(I16_SINT,    16_SINT,                    WZYX),
+   _TC(I16_FLOAT,   16_FLOAT,                   WZYX),
 
    VTC(R8G8_UNORM,   8_8_UNORM,                 WZYX),
    VTC(R8G8_SNORM,   8_8_SNORM,                 WZYX),
@@ -101,6 +103,7 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _TC(R8G8_SRGB,    8_8_UNORM,                 WZYX),
 
    _T_(L8A8_UNORM,   8_8_UNORM,                 WZYX),
+   _T_(L8A8_SNORM,   8_8_SNORM,                 WZYX),
    _T_(L8A8_UINT,    8_8_UINT,                  WZYX),
    _T_(L8A8_SINT,    8_8_SINT,                  WZYX),
 
@@ -125,6 +128,10 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    VT_(R8G8B8_SINT,    8_8_8_SINT,              WZYX),
    V__(R8G8B8_USCALED, 8_8_8_UINT,              WZYX),
    V__(R8G8B8_SSCALED, 8_8_8_SINT,              WZYX),
+   VT_(B8G8R8_UNORM,   8_8_8_UNORM,             WXYZ),
+   VT_(B8G8R8_SNORM,   8_8_8_SNORM,             WXYZ),
+   VT_(B8G8R8_UINT,    8_8_8_UINT,              WXYZ),
+   VT_(B8G8R8_SINT,    8_8_8_SINT,              WXYZ),
 
    /* 32-bit */
    V__(R32_UNORM,   32_UNORM,                   WZYX),
@@ -312,14 +319,14 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _T_(BPTC_RGB_FLOAT,  BPTC_FLOAT,             WZYX),
    _T_(BPTC_RGB_UFLOAT, BPTC_UFLOAT,            WZYX),
 
-   _T_(RGTC1_UNORM, RGTC1_UNORM,                WZYX),
-   _T_(RGTC1_SNORM, RGTC1_SNORM,                WZYX),
-   _T_(RGTC2_UNORM, RGTC2_UNORM,                WZYX),
-   _T_(RGTC2_SNORM, RGTC2_SNORM,                WZYX),
-   _T_(LATC1_UNORM, RGTC1_UNORM,                WZYX),
-   _T_(LATC1_SNORM, RGTC1_SNORM,                WZYX),
-   _T_(LATC2_UNORM, RGTC2_UNORM,                WZYX),
-   _T_(LATC2_SNORM, RGTC2_SNORM,                WZYX),
+   _T_(RGTC1_UNORM, RGTC1_UNORM_FAST,           WZYX),
+   _T_(RGTC1_SNORM, RGTC1_SNORM_FAST,           WZYX),
+   _T_(RGTC2_UNORM, RGTC2_UNORM_FAST,           WZYX),
+   _T_(RGTC2_SNORM, RGTC2_SNORM_FAST,           WZYX),
+   _T_(LATC1_UNORM, RGTC1_UNORM_FAST,           WZYX),
+   _T_(LATC1_SNORM, RGTC1_SNORM_FAST,           WZYX),
+   _T_(LATC2_UNORM, RGTC2_UNORM_FAST,           WZYX),
+   _T_(LATC2_SNORM, RGTC2_SNORM_FAST,           WZYX),
 
    _T_(ASTC_4x4,   ASTC_4x4,                    WZYX),
    _T_(ASTC_5x4,   ASTC_5x4,                    WZYX),
@@ -419,6 +426,25 @@ fd6_texture_format(enum pipe_format format, enum a6xx_tile_mode tile_mode,
    }
 
    return formats[format].tex;
+}
+
+bool
+fd6_texture_format_supported(const struct fd_dev_info *info, enum pipe_format format,
+                             enum a6xx_tile_mode tile_mode, bool is_mutable)
+{
+   if (info->props.is_a702) {
+      /* BPTC is removed */
+      switch (format) {
+      case PIPE_FORMAT_BPTC_RGBA_UNORM:
+      case PIPE_FORMAT_BPTC_SRGBA:
+      case PIPE_FORMAT_BPTC_RGB_FLOAT:
+      case PIPE_FORMAT_BPTC_RGB_UFLOAT:
+         return false;
+      default:
+         break;
+      }
+   }
+   return fd6_texture_format(format, tile_mode, is_mutable) != FMT6_NONE;
 }
 
 enum a3xx_color_swap

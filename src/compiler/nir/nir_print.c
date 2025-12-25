@@ -148,8 +148,8 @@ print_def(nir_def *def, print_state *state)
            def->bit_size, sizes[def->num_components],
            padding, "", state->def_prefix, def->index);
 
-   if (state->shader->has_debug_info) {
-      nir_instr_debug_info *debug_info = nir_instr_get_debug_info(def->parent_instr);
+   if (nir_def_instr(def)->has_debug_info) {
+      nir_instr_debug_info *debug_info = nir_instr_get_debug_info(nir_def_instr(def));
       if (debug_info->variable_name)
          fprintf(fp, ".%s", debug_info->variable_name);
    }
@@ -192,7 +192,7 @@ print_hex_padded_const_value(const nir_const_value *value, unsigned bit_size, FI
       fprintf(fp, "0x%02x", value->u8);
       break;
    default:
-      unreachable("unhandled bit size");
+      UNREACHABLE("unhandled bit size");
    }
 }
 
@@ -213,7 +213,7 @@ print_hex_terse_const_value(const nir_const_value *value, unsigned bit_size, FIL
       fprintf(fp, "0x%x", value->u8);
       break;
    default:
-      unreachable("unhandled bit size");
+      UNREACHABLE("unhandled bit size");
    }
 }
 
@@ -245,7 +245,7 @@ print_int_const_value(const nir_const_value *value, unsigned bit_size, FILE *fp)
       fprintf(fp, "%+d", value->i8);
       break;
    default:
-      unreachable("unhandled bit size");
+      UNREACHABLE("unhandled bit size");
    }
 }
 
@@ -266,7 +266,7 @@ print_uint_const_value(const nir_const_value *value, unsigned bit_size, FILE *fp
       fprintf(fp, "%u", value->u8);
       break;
    default:
-      unreachable("unhandled bit size");
+      UNREACHABLE("unhandled bit size");
    }
 }
 
@@ -309,7 +309,7 @@ print_const_from_load(nir_load_const_instr *instr, print_state *state, nir_alu_t
             break;
 
          default:
-            unreachable("invalid nir alu base type");
+            UNREACHABLE("invalid nir alu base type");
          }
       }
    } else {
@@ -351,7 +351,7 @@ print_const_from_load(nir_load_const_instr *instr, print_state *state, nir_alu_t
             needs_decimal |= v->u8 >= 10;
             break;
          default:
-            unreachable("invalid bit size");
+            UNREACHABLE("invalid bit size");
          }
       }
 
@@ -407,9 +407,9 @@ print_src(const nir_src *src, print_state *state, nir_alu_type src_type)
 {
    FILE *fp = state->fp;
    fprintf(fp, "%s%u", state->def_prefix, src->ssa->index);
-   nir_instr *instr = src->ssa->parent_instr;
+   nir_instr *instr = nir_def_instr(src->ssa);
 
-   if (state->shader->has_debug_info) {
+   if (instr->has_debug_info) {
       nir_instr_debug_info *debug_info = nir_instr_get_debug_info(instr);
       if (debug_info->variable_name)
          fprintf(fp, ".%s", debug_info->variable_name);
@@ -567,7 +567,7 @@ get_constant_sampler_addressing_mode(enum cl_sampler_addressing_mode mode)
    case SAMPLER_ADDRESSING_MODE_REPEAT_MIRRORED:
       return "repeat_mirrored";
    default:
-      unreachable("Invalid addressing mode");
+      UNREACHABLE("Invalid addressing mode");
    }
 }
 
@@ -580,7 +580,7 @@ get_constant_sampler_filter_mode(enum cl_sampler_filter_mode mode)
    case SAMPLER_FILTER_MODE_LINEAR:
       return "linear";
    default:
-      unreachable("Invalid filter mode");
+      UNREACHABLE("Invalid filter mode");
    }
 }
 
@@ -676,7 +676,7 @@ print_constant(nir_constant *c, const struct glsl_type *type, print_state *state
             break;
 
          default:
-            unreachable("Cannot get here from the first level switch");
+            UNREACHABLE("Cannot get here from the first level switch");
          }
       }
       break;
@@ -714,8 +714,17 @@ print_constant(nir_constant *c, const struct glsl_type *type, print_state *state
       }
       break;
 
+   case GLSL_TYPE_COOPERATIVE_MATRIX:
+      // This occurs as the constant initializer for a cmat variable.
+      // In this case it's a scalar constant, and its word value is
+      // c->values[0], but we have to interpet it via the component type.
+      fprintf(fp, "%s(", glsl_get_type_name(type));
+      print_constant(c, glsl_get_cmat_element(type), state);
+      fprintf(fp, ")");
+      break;
+
    default:
-      unreachable("not reached");
+      UNREACHABLE("not reached");
    }
 }
 
@@ -743,6 +752,12 @@ get_variable_mode_str(nir_variable_mode mode, bool want_local_global_mode)
       return "push_const";
    case nir_var_mem_constant:
       return "constant";
+   case nir_var_mem_pixel_local_in:
+      return "pixel_local_in";
+   case nir_var_mem_pixel_local_out:
+      return "pixel_local_out";
+   case nir_var_mem_pixel_local_inout:
+      return "pixel_local";
    case nir_var_image:
       return "image";
    case nir_var_shader_temp:
@@ -767,7 +782,7 @@ get_variable_mode_str(nir_variable_mode mode, bool want_local_global_mode)
 }
 
 static const char *
-get_location_str(unsigned location, gl_shader_stage stage,
+get_location_str(unsigned location, mesa_shader_stage stage,
                  nir_variable_mode mode, char *buf)
 {
    switch (stage) {
@@ -841,6 +856,9 @@ print_access(enum gl_access_qualifier access, print_state *state, const char *se
       { ACCESS_IN_BOUNDS, "in-bounds" },
       { ACCESS_KEEP_SCALAR, "keep-scalar" },
       { ACCESS_SMEM_AMD, "smem-amd" },
+      { ACCESS_SKIP_HELPERS, "skip-helpers" },
+      { ACCESS_ATOMIC, "atomic" },
+      { ACCESS_FUSED_EU_DISABLE_INTEL, "fused-eu-disable-intel" },
    };
 
    bool first = true;
@@ -1003,7 +1021,7 @@ print_deref_link(const nir_deref_instr *instr, bool whole_chain, print_state *st
    }
 
    nir_deref_instr *parent =
-      nir_instr_as_deref(instr->parent.ssa->parent_instr);
+      nir_def_as_deref(instr->parent.ssa);
 
    /* Is the parent we're going to print a bare cast? */
    const bool is_parent_cast =
@@ -1042,6 +1060,11 @@ print_deref_link(const nir_deref_instr *instr, bool whole_chain, print_state *st
    case nir_deref_type_struct:
       fprintf(fp, "%s%s", is_parent_pointer ? "->" : ".",
               glsl_get_struct_elem_name(parent->type, instr->strct.index));
+      if (whole_chain &&
+          parent->type->fields.structure[instr->strct.index].pixel_local_storage) {
+         fprintf(fp, " (%s)",
+                 util_format_short_name(parent->type->fields.structure[instr->strct.index].image_format));
+      }
       break;
 
    case nir_deref_type_array:
@@ -1061,7 +1084,7 @@ print_deref_link(const nir_deref_instr *instr, bool whole_chain, print_state *st
       break;
 
    default:
-      unreachable("Invalid deref instruction type");
+      UNREACHABLE("Invalid deref instruction type");
    }
 }
 
@@ -1090,7 +1113,7 @@ print_deref_instr(nir_deref_instr *instr, print_state *state)
       fprintf(fp, " = deref_ptr_as_array ");
       break;
    default:
-      unreachable("Invalid deref instruction type");
+      UNREACHABLE("Invalid deref instruction type");
    }
 
    /* Only casts naturally return a pointer type */
@@ -1106,12 +1129,24 @@ print_deref_instr(nir_deref_instr *instr, print_state *state)
       fprintf(fp, "%s%s", get_variable_mode_str(1 << m, true),
               modes ? "|" : "");
    }
+
+   nir_variable *var = nir_deref_instr_get_variable(instr);
+   if (var) {
+      static const char *precision_str[] = {"", " highp", " mediump", " lowp"};
+      fprintf(fp, "%s", precision_str[var->data.precision]);
+   }
+
    fprintf(fp, " %s)", get_type_name(instr->type, state));
 
    if (instr->deref_type == nir_deref_type_cast) {
       fprintf(fp, "  (ptr_stride=%u, align_mul=%u, align_offset=%u)",
               instr->cast.ptr_stride,
               instr->cast.align_mul, instr->cast.align_offset);
+   }
+
+   if (nir_deref_instr_is_arr(instr)) {
+      if (instr->arr.in_bounds)
+         fprintf(fp, "  (in bounds)");
    }
 
    if (instr->deref_type != nir_deref_type_var &&
@@ -1186,6 +1221,18 @@ print_alu_type(nir_alu_type type, print_state *state)
       fprintf(fp, "%s", name);
 }
 
+static const char *sampler_dim_name[] = {
+   [GLSL_SAMPLER_DIM_1D] = "1D",
+   [GLSL_SAMPLER_DIM_2D] = "2D",
+   [GLSL_SAMPLER_DIM_3D] = "3D",
+   [GLSL_SAMPLER_DIM_CUBE] = "Cube",
+   [GLSL_SAMPLER_DIM_RECT] = "Rect",
+   [GLSL_SAMPLER_DIM_BUF] = "Buf",
+   [GLSL_SAMPLER_DIM_MS] = "2D-MSAA",
+   [GLSL_SAMPLER_DIM_SUBPASS] = "Subpass",
+   [GLSL_SAMPLER_DIM_SUBPASS_MS] = "Subpass-MSAA",
+};
+
 static void
 print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
 {
@@ -1216,6 +1263,12 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
 
    for (unsigned i = 0; i < info->num_indices; i++) {
       unsigned idx = info->indices[i];
+
+      /* Skip "general" to denoise since it is the unremarkable default case */
+      if (idx == NIR_INTRINSIC_PREAMBLE_CLASS &&
+          nir_intrinsic_preamble_class(instr) == nir_preamble_class_general)
+         continue;
+
       if (i == 0)
          fprintf(fp, " (");
       else
@@ -1244,6 +1297,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          switch (atomic_op) {
          case nir_atomic_op_iadd:
             fprintf(fp, "iadd");
+            break;
+         case nir_atomic_op_isub:
+            fprintf(fp, "isub");
             break;
          case nir_atomic_op_imin:
             fprintf(fp, "imin");
@@ -1298,20 +1354,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
       }
 
       case NIR_INTRINSIC_IMAGE_DIM: {
-         static const char *dim_name[] = {
-            [GLSL_SAMPLER_DIM_1D] = "1D",
-            [GLSL_SAMPLER_DIM_2D] = "2D",
-            [GLSL_SAMPLER_DIM_3D] = "3D",
-            [GLSL_SAMPLER_DIM_CUBE] = "Cube",
-            [GLSL_SAMPLER_DIM_RECT] = "Rect",
-            [GLSL_SAMPLER_DIM_BUF] = "Buf",
-            [GLSL_SAMPLER_DIM_MS] = "2D-MSAA",
-            [GLSL_SAMPLER_DIM_SUBPASS] = "Subpass",
-            [GLSL_SAMPLER_DIM_SUBPASS_MS] = "Subpass-MSAA",
-         };
          enum glsl_sampler_dim dim = nir_intrinsic_image_dim(instr);
-         assert(dim < ARRAY_SIZE(dim_name) && dim_name[dim]);
-         fprintf(fp, "image_dim=%s", dim_name[dim]);
+         assert(dim < ARRAY_SIZE(sampler_dim_name) && sampler_dim_name[dim]);
+         fprintf(fp, "image_dim=%s", sampler_dim_name[dim]);
          break;
       }
 
@@ -1423,17 +1468,25 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          case nir_intrinsic_load_input_vertex:
          case nir_intrinsic_load_coefficients_agx:
          case nir_intrinsic_load_attribute_pan:
+         case nir_intrinsic_load_fs_coeffs_pco:
             mode = nir_var_shader_in;
             break;
 
          case nir_intrinsic_load_output:
          case nir_intrinsic_load_per_vertex_output:
+         case nir_intrinsic_load_converted_output_pan:
+         case nir_intrinsic_load_readonly_output_pan:
          case nir_intrinsic_load_per_primitive_output:
          case nir_intrinsic_store_output:
          case nir_intrinsic_store_per_primitive_output:
          case nir_intrinsic_store_per_vertex_output:
          case nir_intrinsic_store_per_view_output:
             mode = nir_var_shader_out;
+            break;
+
+         case nir_intrinsic_load_pixel_local:
+         case nir_intrinsic_store_pixel_local:
+            mode = nir_var_mem_pixel_local_inout;
             break;
 
          default:
@@ -1469,9 +1522,6 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
          if (io.high_16bits)
             fprintf(fp, " high_16bits");
 
-         if (io.invariant)
-            fprintf(fp, " invariant");
-
          if (io.high_dvec2)
             fprintf(fp, " high_dvec2");
 
@@ -1495,6 +1545,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
             }
             fprintf(fp, ")");
          }
+
+         if (io.no_validate)
+            fprintf(fp, " no_validate");
 
          break;
       }
@@ -1687,6 +1740,19 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
                  glsl_interp_mode_name(nir_intrinsic_interp_mode(instr)));
          break;
 
+      case NIR_INTRINSIC_PREAMBLE_CLASS: {
+         /* "General" handled above */
+         nir_preamble_class cls = nir_intrinsic_preamble_class(instr);
+         if (cls == nir_preamble_class_image)
+            fprintf(fp, "class=image");
+         else if (cls == nir_preamble_class_sampler)
+            fprintf(fp, "class=sampler");
+         else
+            UNREACHABLE("invalid class");
+
+         break;
+      }
+
       default: {
          unsigned off = info->index_map[idx] - 1;
          fprintf(fp, "%s=%d", nir_intrinsic_index_names[idx], instr->const_index[off]);
@@ -1833,8 +1899,11 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
    case nir_texop_tex_type_nv:
       fprintf(fp, "tex_type_nv ");
       break;
+   case nir_texop_sample_pos_nv:
+      fprintf(fp, "sample_pos_nv ");
+      break;
    default:
-      unreachable("Invalid texture operation");
+      UNREACHABLE("Invalid texture operation");
       break;
    }
 
@@ -1874,6 +1943,9 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
          break;
       case nir_tex_src_min_lod:
          fprintf(fp, "(min_lod)");
+         break;
+      case nir_tex_src_max_lod_kk:
+         fprintf(fp, "(max_lod_kk)");
          break;
       case nir_tex_src_ms_index:
          fprintf(fp, "(ms_index)");
@@ -1923,7 +1995,7 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
          break;
 
       default:
-         unreachable("Invalid texture source type");
+         UNREACHABLE("Invalid texture source type");
          break;
       }
    }
@@ -1962,6 +2034,16 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
    if (instr->is_sparse) {
       fprintf(fp, ", sparse");
    }
+
+   if (instr->skip_helpers) {
+      fprintf(fp, ", skip_helpers");
+   }
+
+   if (instr->backend_flags) {
+      fprintf(fp, ", backend_flags=0x%X", instr->backend_flags);
+   }
+
+   fprintf(fp, ", %s", sampler_dim_name[instr->sampler_dim]);
 }
 
 static void
@@ -1979,6 +2061,42 @@ print_call_instr(nir_call_instr *instr, print_state *state)
       print_src(&instr->indirect_callee, state, nir_type_invalid);
       fprintf(fp, ") ");
    }
+
+   for (unsigned i = 0; i < instr->num_params; i++) {
+      if (i != 0)
+         fprintf(fp, ", ");
+
+      if (instr->callee->params[i].name)
+         fprintf(fp, "%s ", instr->callee->params[i].name);
+
+      print_src(&instr->params[i], state, nir_type_invalid);
+   }
+}
+
+static const char *
+get_cmat_call_op_str(nir_cmat_call_op op)
+{
+   switch (op) {
+   case nir_cmat_call_op_reduce:
+      return "cmat_call_reduce";
+   case nir_cmat_call_op_reduce_finish:
+      return "cmat_call_reduce_finish";
+   case nir_cmat_call_op_reduce_2x2:
+      return "cmat_call_reduce_2x2";
+   case nir_cmat_call_op_per_element_op:
+      return "cmat_call_per_element";
+   }
+   UNREACHABLE("Unknown cmat call op");
+}
+
+static void
+print_cmat_call_instr(nir_cmat_call_instr *instr, print_state *state)
+{
+   FILE *fp = state->fp;
+
+   print_no_dest_padding(state);
+
+   fprintf(fp, "%s %s ", get_cmat_call_op_str(instr->op), instr->callee->name);
 
    for (unsigned i = 0; i < instr->num_params; i++) {
       if (i != 0)
@@ -2047,7 +2165,7 @@ print_phi_instr(nir_phi_instr *instr, print_state *state)
    nir_block **preds =
       state->preds ? state->preds : nir_block_get_predecessors_sorted(instr->instr.block, NULL);
 
-   for (unsigned i = 0; i < instr->instr.block->predecessors->entries; i++) {
+   for (unsigned i = 0; i < instr->instr.block->predecessors.entries; i++) {
       nir_phi_src *src = nir_phi_get_src_from_block(instr, preds[i]);
       if (i != 0)
          fprintf(fp, ", ");
@@ -2061,28 +2179,6 @@ print_phi_instr(nir_phi_instr *instr, print_state *state)
 }
 
 static void
-print_parallel_copy_instr(nir_parallel_copy_instr *instr, print_state *state)
-{
-   FILE *fp = state->fp;
-   nir_foreach_parallel_copy_entry(entry, instr) {
-      if (&entry->node != exec_list_get_head(&instr->entries))
-         fprintf(fp, "; ");
-
-      if (entry->dest_is_reg) {
-         fprintf(fp, "*");
-         print_src(&entry->dest.reg, state, nir_type_invalid);
-      } else {
-         print_def(&entry->dest.def, state);
-      }
-      fprintf(fp, " = ");
-
-      if (entry->src_is_reg)
-         fprintf(fp, "*");
-      print_src(&entry->src, state, nir_type_invalid);
-   }
-}
-
-static void
 print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
 {
    FILE *fp = state->fp;
@@ -2092,7 +2188,7 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
       debug_info->nir_line = (uint32_t)ftell(fp);
    }
 
-   if (state->shader->has_debug_info && !state->gather_debug_info) {
+   if (instr->has_debug_info && !state->gather_debug_info) {
       nir_instr_debug_info *debug_info = nir_instr_get_debug_info((nir_instr *)instr);
 
       bool changed = state->last_debug_info.spirv_offset != debug_info->spirv_offset;
@@ -2130,6 +2226,10 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
       print_call_instr(nir_instr_as_call(instr), state);
       break;
 
+   case nir_instr_type_cmat_call:
+      print_cmat_call_instr(nir_instr_as_cmat_call(instr), state);
+      break;
+
    case nir_instr_type_intrinsic:
       print_intrinsic_instr(nir_instr_as_intrinsic(instr), state);
       break;
@@ -2154,12 +2254,8 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
       print_phi_instr(nir_instr_as_phi(instr), state);
       break;
 
-   case nir_instr_type_parallel_copy:
-      print_parallel_copy_instr(nir_instr_as_parallel_copy(instr), state);
-      break;
-
    default:
-      unreachable("Invalid instruction type");
+      UNREACHABLE("Invalid instruction type");
       break;
    }
 
@@ -2178,7 +2274,6 @@ block_has_instruction_with_dest(nir_block *block)
       case nir_instr_type_tex:
       case nir_instr_type_undef:
       case nir_instr_type_phi:
-      case nir_instr_type_parallel_copy:
          return true;
 
       case nir_instr_type_intrinsic: {
@@ -2193,6 +2288,7 @@ block_has_instruction_with_dest(nir_block *block)
 
       case nir_instr_type_jump:
       case nir_instr_type_call:
+      case nir_instr_type_cmat_call:
          /* Doesn't define a new value. */
          break;
       }
@@ -2208,7 +2304,7 @@ static void
 print_block_preds(nir_block *block, print_state *state)
 {
    FILE *fp = state->fp;
-   for (unsigned i = 0; i < block->predecessors->entries; i++) {
+   for (unsigned i = 0; i < block->predecessors.entries; i++) {
       fprintf(fp, " b%u", state->preds[i]->index);
    }
 }
@@ -2312,7 +2408,19 @@ print_loop(nir_loop *loop, print_state *state, unsigned tabs)
    FILE *fp = state->fp;
 
    print_indentation(tabs, fp);
-   fprintf(fp, "%sloop {\n", divergence_status(state, loop->divergent_break));
+   fprintf(fp, "%sloop", divergence_status(state, loop->divergent_break));
+   switch (loop->control) {
+   case nir_loop_control_unroll:
+      fprintf(fp, "  // unroll");
+      break;
+   case nir_loop_control_dont_unroll:
+      fprintf(fp, "  // don't unroll");
+      break;
+   case nir_loop_control_none:
+   default:
+      break;
+   }
+   fprintf(fp, " {\n");
    foreach_list_typed(nir_cf_node, node, node, &loop->body) {
       print_cf_node(node, state, tabs + 1);
    }
@@ -2346,7 +2454,7 @@ print_cf_node(nir_cf_node *node, print_state *state, unsigned int tabs)
       break;
 
    default:
-      unreachable("Invalid CFG node type");
+      UNREACHABLE("Invalid CFG node type");
    }
 }
 
@@ -2374,8 +2482,8 @@ print_function_impl(nir_function_impl *impl, print_state *state, bool print_name
        * nir_print don't modify the shader.  If needed, a limit for ssa_alloc
        * can be added.
        */
-      state->float_types = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
-      state->int_types = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
+      state->float_types = BITSET_CALLOC(impl->ssa_alloc);
+      state->int_types = BITSET_CALLOC(impl->ssa_alloc);
       nir_gather_types(impl, state->float_types, state->int_types);
    }
 
@@ -2602,7 +2710,7 @@ print_nz_bool(FILE *fp, const char *label, bool value)
 static void
 print_shader_info(const struct shader_info *info, FILE *fp)
 {
-   fprintf(fp, "shader: %s\n", gl_shader_stage_name(info->stage));
+   fprintf(fp, "shader: %s\n", mesa_shader_stage_name(info->stage));
 
    if (memcmp(info->source_blake3, &(blake3_hash){ 0 }, sizeof(info->source_blake3))) {
       fprintf(fp, "source_blake3: {");
@@ -2618,7 +2726,7 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
    print_nz_bool(fp, "internal", info->internal);
 
-   if (gl_shader_stage_uses_workgroup(info->stage)) {
+   if (mesa_shader_stage_uses_workgroup(info->stage)) {
       fprintf(fp, "workgroup_size: %u, %u, %u%s\n",
               info->workgroup_size[0],
               info->workgroup_size[1],
@@ -2626,8 +2734,10 @@ print_shader_info(const struct shader_info *info, FILE *fp)
               info->workgroup_size_variable ? " (variable)" : "");
    }
 
+   if (info->prev_stage != MESA_SHADER_NONE)
+      fprintf(fp, "prev_stage: %s\n", mesa_shader_stage_name(info->prev_stage));
    if (info->next_stage != MESA_SHADER_NONE)
-      fprintf(fp, "next_stage: %s\n", gl_shader_stage_name(info->next_stage));
+      fprintf(fp, "next_stage: %s\n", mesa_shader_stage_name(info->next_stage));
 
    print_nz_unsigned(fp, "num_textures", info->num_textures);
    print_nz_unsigned(fp, "num_ubos", info->num_ubos);
@@ -2639,6 +2749,8 @@ print_shader_info(const struct shader_info *info, FILE *fp)
    print_nz_x64(fp, "dual_slot_inputs", info->dual_slot_inputs);
    print_nz_x64(fp, "outputs_written", info->outputs_written);
    print_nz_x64(fp, "outputs_read", info->outputs_read);
+   print_nz_x64(fp, "perspective_varyings", info->perspective_varyings);
+   print_nz_x64(fp, "linear_varyings", info->linear_varyings);
 
    print_nz_bitset(fp, "system_values_read", info->system_values_read, ARRAY_SIZE(info->system_values_read));
 
@@ -2660,9 +2772,9 @@ print_shader_info(const struct shader_info *info, FILE *fp)
    print_nz_x64(fp, "inputs_read_indirectly", info->inputs_read_indirectly);
    print_nz_x64(fp, "outputs_read_indirectly", info->outputs_read_indirectly);
    print_nz_x64(fp, "outputs_written_indirectly", info->outputs_written_indirectly);
-   print_nz_x64(fp, "patch_inputs_read_indirectly", info->patch_inputs_read_indirectly);
-   print_nz_x64(fp, "patch_outputs_read_indirectly", info->patch_outputs_read_indirectly);
-   print_nz_x64(fp, "patch_outputs_written_indirectly", info->patch_outputs_written_indirectly);
+   print_nz_x32(fp, "patch_inputs_read_indirectly", info->patch_inputs_read_indirectly);
+   print_nz_x32(fp, "patch_outputs_read_indirectly", info->patch_outputs_read_indirectly);
+   print_nz_x32(fp, "patch_outputs_written_indirectly", info->patch_outputs_written_indirectly);
 
    print_nz_bitset(fp, "textures_used", info->textures_used, ARRAY_SIZE(info->textures_used));
    print_nz_bitset(fp, "textures_used_by_txf", info->textures_used_by_txf, ARRAY_SIZE(info->textures_used_by_txf));
@@ -2681,8 +2793,11 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
    print_nz_unsigned(fp, "ray queries", info->ray_queries);
 
-   fprintf(fp, "subgroup_size: %u\n", info->subgroup_size);
+   print_nz_unsigned(fp, "api_subgroup_size", info->api_subgroup_size);
+   fprintf(fp, "max_subgroup_size: %u\n", info->max_subgroup_size);
+   fprintf(fp, "min_subgroup_size: %u\n", info->min_subgroup_size);
 
+   print_nz_bool(fp, "api_subgroup_size_draw_uniform", info->api_subgroup_size_draw_uniform);
    print_nz_bool(fp, "uses_wide_subgroup_intrinsics", info->uses_wide_subgroup_intrinsics);
 
    bool has_xfb_stride = info->xfb_stride[0] || info->xfb_stride[1] || info->xfb_stride[2] || info->xfb_stride[3];
@@ -2713,6 +2828,7 @@ print_shader_info(const struct shader_info *info, FILE *fp)
 
    print_nz_bool(fp, "first_ubo_is_default_ubo", info->first_ubo_is_default_ubo);
    print_nz_bool(fp, "separate_shader", info->separate_shader);
+   print_nz_bool(fp, "known_interpolation_qualifiers", info->known_interpolation_qualifiers);
    print_nz_bool(fp, "has_transform_feedback_varyings", info->has_transform_feedback_varyings);
    print_nz_bool(fp, "flrp_lowered", info->flrp_lowered);
    print_nz_bool(fp, "io_lowered", info->io_lowered);
@@ -2846,6 +2962,8 @@ _nir_print_shader_annotated(nir_shader *shader, FILE *fp,
       fprintf(fp, "scratch: %u\n", shader->scratch_size);
    if (shader->constant_data_size)
       fprintf(fp, "constants: %u\n", shader->constant_data_size);
+   if (shader->printf_info_count)
+      fprintf(fp, "printfs: %u\n", shader->printf_info_count);
 
    if (NIR_DEBUG(PRINT_STRUCT_DECLS)) {
       nir_foreach_variable_in_shader(var, shader) {
@@ -2903,6 +3021,9 @@ nir_print_shader_annotated(nir_shader *shader, FILE *fp,
 void
 nir_print_shader(nir_shader *shader, FILE *fp)
 {
+   nir_foreach_function_impl(impl, shader) {
+      nir_index_ssa_defs(impl);
+   }
    nir_print_shader_annotated(shader, fp, NULL);
    fflush(fp);
 }

@@ -18,7 +18,6 @@ extern "C" {
 
 typedef struct nir_shader nir_shader;
 struct radeon_info;
-struct radv_pipeline_layout;
 struct radv_shader_stage;
 struct radv_shader_info;
 struct radv_shader_args;
@@ -48,6 +47,8 @@ bool radv_nir_lower_primitive_shading_rate(nir_shader *nir, enum amd_gfx_level g
 bool radv_nir_lower_fs_intrinsics(nir_shader *nir, const struct radv_shader_stage *fs_stage,
                                   const struct radv_graphics_state_key *gfx_state);
 
+bool radv_nir_lower_fs_input_attachment(nir_shader *nir);
+
 bool radv_nir_lower_fs_barycentric(nir_shader *shader, const struct radv_graphics_state_key *gfx_state,
                                    unsigned rast_prim);
 
@@ -59,7 +60,7 @@ bool radv_nir_lower_viewport_to_zero(nir_shader *nir);
 
 bool radv_nir_export_multiview(nir_shader *nir);
 
-void radv_nir_lower_io_to_scalar_early(nir_shader *nir, nir_variable_mode mask);
+void radv_nir_lower_io_vars_to_scalar(nir_shader *nir, nir_variable_mode mask);
 
 unsigned radv_map_io_driver_location(unsigned semantic);
 
@@ -76,6 +77,8 @@ bool radv_nir_opt_cooperative_matrix(nir_shader *shader, enum amd_gfx_level gfx_
 bool radv_nir_lower_draw_id_to_zero(nir_shader *shader);
 
 bool radv_nir_remap_color_attachment(nir_shader *shader, const struct radv_graphics_state_key *gfx_state);
+
+bool radv_nir_trim_fs_color_exports(nir_shader *shader, uint32_t colors_needed);
 
 bool radv_nir_lower_printf(nir_shader *shader);
 
@@ -94,7 +97,11 @@ typedef struct radv_nir_opt_tid_function_options {
 
 bool radv_nir_opt_tid_function(nir_shader *shader, const radv_nir_opt_tid_function_options *options);
 
-bool radv_nir_opt_fs_builtins(nir_shader *shader, const struct radv_graphics_state_key *gfx_state);
+bool radv_nir_opt_fs_builtins(nir_shader *shader, const struct radv_graphics_state_key *gfx_state,
+                              unsigned vgt_outprim_type);
+
+bool radv_nir_lower_immediate_samplers(nir_shader *shader, struct radv_device *device,
+                                       const struct radv_shader_stage *stage);
 
 #ifdef __cplusplus
 }

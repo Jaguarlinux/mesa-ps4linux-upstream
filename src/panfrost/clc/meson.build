@@ -8,8 +8,8 @@ if get_option('precomp-compiler') == 'system'
 else
   prog_panfrost_compile = executable(
     'panfrost_compile',
-    ['panfrost_compile.c'],
-    link_with : [libpanfrost_bifrost],
+    ['pan_compile.c'],
+    link_with : [libpanfrost_compiler],
     include_directories : [inc_include, inc_src],
     c_args : [c_msvc_compat_args, no_override_init_args],
     link_args : [ld_args_build_id],

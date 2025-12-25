@@ -233,12 +233,14 @@ struct pipe_picture_desc
    uint8_t *decrypt_key;
    uint32_t key_size;
    enum pipe_format input_format;
-   bool input_full_range;
    enum pipe_format output_format;
    /* Flush flags for pipe_video_codec::end_frame */
    unsigned flush_flags;
+   /* A fence for pipe_video_codec::begin_frame to wait on */
+   struct pipe_fence_handle *in_fence;
+   uint64_t in_fence_value;
    /* A fence for pipe_video_codec::end_frame to signal job completion */
-   struct pipe_fence_handle **fence;
+   struct pipe_fence_handle **out_fence;
 };
 
 struct pipe_quant_matrix
@@ -401,6 +403,7 @@ struct pipe_h264_sps
    uint8_t  mb_adaptive_frame_field_flag;
    uint8_t  direct_8x8_inference_flag;
    uint8_t  MinLumaBiPredSize8x8;
+   uint8_t  gaps_in_frame_num_value_allowed_flag;
    uint32_t pic_width_in_mbs_minus1;
    uint32_t pic_height_in_mbs_minus1;
 };
@@ -525,6 +528,26 @@ struct pipe_enc_roi
    struct pipe_enc_region_in_roi region[PIPE_ENC_ROI_REGION_NUM_MAX];
 };
 
+enum pipe_enc_qpmap_input_mode
+{
+   PIPE_ENC_QPMAP_INPUT_MODE_DISABLED = 0,
+   PIPE_ENC_QPMAP_INPUT_MODE_CPU_BUFFER_8BIT = 1,
+   PIPE_ENC_QPMAP_INPUT_MODE_CPU_BUFFER_16BIT = 2,
+   PIPE_ENC_QPMAP_INPUT_MODE_GPU_RESOURCE = 3,
+};
+
+struct pipe_enc_qpmap_input_info
+{
+   /* Selects the input mode and app sets different params below */
+   enum pipe_enc_qpmap_input_mode input_qp_mode;
+   /* Count of the number entries contained by input_qpmap_cpu */
+   uint32_t qp_map_values_count;
+    /* Used with CPU modes */
+   void *input_qpmap_cpu;
+   /* Used with PIPE_ENC_QPMAP_INPUT_GPU_MODE */
+   struct pipe_resource *input_gpu_qpmap;
+};
+
 enum pipe_enc_dirty_info_type
 {
    PIPE_ENC_DIRTY_INFO_TYPE_DIRTY = 0,
@@ -610,6 +633,64 @@ struct pipe_enc_move_info
    bool overlapping_rects;
 };
 
+struct pipe_enc_two_pass_encoder_config
+{
+   /*
+    * Enables two pass encoding for all supported
+      frames during the lifetime of the encoder
+   */
+   bool enable;
+
+   /*
+    * Indicates the downscaling factor for the first pass
+    *
+    * Please check pipe_cap_two_pass for the supported downscaling factors
+    *
+    * pow2_downscale_factor | 1st pass width   | 1st pass height
+    * 0                     | InputWidth       | InputHeight
+    * 1                     | InputWidth / 2   | InputHeight / 2
+    * 2                     | InputWidth / 4   | InputHeight / 4
+    * n                     | InputWidth / 2^n | InputHeight / 2^n
+   */
+   unsigned pow2_downscale_factor;
+
+   /*
+   * When set, the first pass (low resolution) dpb texture output
+   * will not be written by the driver. It is responsability of the
+   * app to downscale the 2nd pass (full resolution) dpb recon texture into
+   * a downscaled recon dpb texture to be used as a downscaled dpb
+   * reference in future encoded frames.
+   *
+   * When not set, the driver writes the 1st pass output recon dpb
+   * texture and that can be directly used as a downscaled dpb
+   * reference in future encoded frames.
+   *
+   * Please check pipe_cap_two_pass.supports_1pass_recon_writing_skip
+   */
+   bool skip_1st_dpb_texture;
+};
+
+/*
+ * Used when pipe_enc_two_pass_encoder_config
+ * is enabled in the encoder
+*/
+struct pipe_enc_two_pass_frame_config
+{
+   /*
+    * Downscaled version of the source buffer to be encoded
+    * input to the 1st encoder pass
+   */
+   struct pipe_video_buffer *downscaled_source;
+
+   /*
+    * Disabled two pass for this frame
+    *
+    * Requires pipe_cap_two_pass.supports_dynamic_1st_pass_skip
+    *
+   */
+   bool skip_1st_pass;
+};
+
 struct pipe_enc_raw_header
 {
    uint8_t type; /* nal_unit_type or obu_type */
@@ -639,6 +720,10 @@ struct pipe_h264_enc_rate_control
 
    /* Used with PIPE_H2645_ENC_RATE_CONTROL_METHOD_QUALITY_VARIABLE */
    unsigned vbr_quality_factor;
+
+   /* See PIPE_VIDEO_CAP_ENC_SPATIAL_ADAPTIVE_QUANTIZATION */
+   /* value 0 indicates SAQ is disabled */
+   unsigned spatial_adaptive_quantization_strength;
 };
 
 struct pipe_h264_enc_motion_estimation
@@ -662,6 +747,7 @@ struct pipe_h264_enc_pic_control
       uint32_t deblocking_filter_control_present_flag : 1;
       uint32_t constrained_intra_pred_flag : 1;
       uint32_t redundant_pic_cnt_present_flag : 1;
+      uint32_t more_rbsp_data : 1;
       uint32_t transform_8x8_mode_flag : 1;
    };
    uint8_t nal_ref_idc;
@@ -739,6 +825,7 @@ struct pipe_h264_enc_seq_param
       uint32_t video_full_range_flag : 1;
       uint32_t direct_8x8_inference_flag : 1;
       uint32_t gaps_in_frame_num_value_allowed_flag : 1;
+      uint32_t delta_pic_order_always_zero_flag : 1;
    };
    unsigned profile_idc;
    unsigned enc_constraint_set_flags;
@@ -791,6 +878,10 @@ struct pipe_h264_enc_seq_param
    uint32_t max_num_ref_frames;
    uint32_t pic_width_in_mbs_minus1;
    uint32_t pic_height_in_map_units_minus1;
+   int32_t offset_for_non_ref_pic;
+   int32_t offset_for_top_to_bottom_field;
+   uint32_t num_ref_frames_in_pic_order_cnt_cycle;
+   int32_t offset_for_ref_frame[256];
 };
 
 struct pipe_h264_ref_list_mod_entry
@@ -839,6 +930,7 @@ struct pipe_h264_enc_slice_param
    uint8_t disable_deblocking_filter_idc;
    int32_t slice_alpha_c0_offset_div2;
    int32_t slice_beta_offset_div2;
+   int32_t delta_pic_order_cnt0;
 };
 
 struct pipe_h264_enc_dpb_entry
@@ -849,6 +941,7 @@ struct pipe_h264_enc_dpb_entry
    uint32_t temporal_id;
    bool is_ltr;
    struct pipe_video_buffer *buffer;
+   struct pipe_video_buffer *downscaled_buffer; /* for two pass */
    bool evict;
    enum pipe_h2645_enc_picture_type picture_type;
 };
@@ -900,9 +993,10 @@ struct pipe_h264_enc_picture_desc
    struct pipe_resource *gpu_stats_satd_map;
    /* See PIPE_VIDEO_CAP_ENC_GPU_STATS_RATE_CONTROL_BITS_MAP */
    struct pipe_resource *gpu_stats_rc_bitallocation_map;
+   /* See PIPE_VIDEO_CAP_ENC_GPU_STATS_PSNR */
+   struct pipe_resource *gpu_stats_psnr;
 
-   /* See PIPE_VIDEO_CAP_ENC_QP_MAPS */
-   struct pipe_resource *input_gpu_qpmap;
+   struct pipe_enc_qpmap_input_info input_qpmap_info;
 
    bool not_referenced;
    bool is_ltr;
@@ -928,6 +1022,8 @@ struct pipe_h264_enc_picture_desc
    uint8_t ref_list1[PIPE_H264_MAX_NUM_LIST_REF]; /* index in dpb, PIPE_H2645_LIST_REF_INVALID_ENTRY invalid */
 
    struct util_dynarray raw_headers; /* struct pipe_enc_raw_header */
+
+   struct pipe_enc_two_pass_frame_config twopass_frame_config;
 };
 
 struct pipe_h265_st_ref_pic_set
@@ -1255,6 +1351,10 @@ struct pipe_h265_enc_rate_control
 
    /* Used with PIPE_H2645_ENC_RATE_CONTROL_METHOD_QUALITY_VARIABLE */
    unsigned vbr_quality_factor;
+
+   /* See PIPE_VIDEO_CAP_ENC_SPATIAL_ADAPTIVE_QUANTIZATION */
+   /* value 0 indicates SAQ is disabled */
+   unsigned spatial_adaptive_quantization_strength;
 };
 
 struct pipe_h265_enc_dpb_entry
@@ -1264,6 +1364,7 @@ struct pipe_h265_enc_dpb_entry
    uint32_t temporal_id;
    bool is_ltr;
    struct pipe_video_buffer *buffer;
+   struct pipe_video_buffer *downscaled_buffer; /* for two pass */
    bool evict;
 };
 
@@ -1295,9 +1396,10 @@ struct pipe_h265_enc_picture_desc
    struct pipe_resource *gpu_stats_satd_map;
    /* See PIPE_VIDEO_CAP_ENC_GPU_STATS_RATE_CONTROL_BITS_MAP */
    struct pipe_resource *gpu_stats_rc_bitallocation_map;
+   /* See PIPE_VIDEO_CAP_ENC_GPU_STATS_PSNR */
+   struct pipe_resource *gpu_stats_psnr;
 
-   /* See PIPE_VIDEO_CAP_ENC_QP_MAPS */
-   struct pipe_resource *input_gpu_qpmap;
+   struct pipe_enc_qpmap_input_info input_qpmap_info;
 
    unsigned num_ref_idx_l0_active_minus1;
    unsigned num_ref_idx_l1_active_minus1;
@@ -1326,6 +1428,8 @@ struct pipe_h265_enc_picture_desc
    uint8_t ref_list1[PIPE_H265_MAX_NUM_LIST_REF]; /* index in dpb, PIPE_H2645_LIST_REF_INVALID_ENTRY invalid */
 
    struct util_dynarray raw_headers; /* struct pipe_enc_raw_header */
+
+   struct pipe_enc_two_pass_frame_config twopass_frame_config;
 };
 
 struct pipe_av1_enc_rate_control
@@ -1398,16 +1502,15 @@ struct pipe_av1_enc_seq_param
       uint32_t color_description_present_flag:1;
       uint32_t enable_ref_frame_mvs:1;
       uint32_t frame_id_number_present_flag:1;
-      uint32_t disable_screen_content_tools:1;
       uint32_t timing_info_present_flag:1;
       uint32_t equal_picture_interval:1;
       uint32_t decoder_model_info_present_flag:1;
       uint32_t force_screen_content_tools:2;
       uint32_t force_integer_mv:2;
       uint32_t initial_display_delay_present_flag:1;
-      uint32_t choose_integer_mv:1;
       uint32_t still_picture:1;
       uint32_t reduced_still_picture_header:1;
+      uint32_t high_bitdepth:1;
    } seq_bits;
 
    /* timing info params */
@@ -1478,8 +1581,7 @@ struct pipe_av1_enc_picture_desc
    struct pipe_enc_quality_modes quality_modes;
    struct pipe_enc_intra_refresh intra_refresh;
    struct pipe_enc_roi roi;
-   /* See PIPE_VIDEO_CAP_ENC_QP_MAPS */
-   struct pipe_resource *input_gpu_qpmap;
+   struct pipe_enc_qpmap_input_info input_qpmap_info;
    uint32_t tile_rows;
    uint32_t tile_cols;
    unsigned num_tile_groups;
@@ -1834,6 +1936,7 @@ struct pipe_vp9_picture_desc
          uint32_t  segmentation_enabled:1;
          uint32_t  segmentation_temporal_update:1;
          uint32_t  segmentation_update_map:1;
+         uint32_t  segmentation_update_data:1;
          uint32_t  last_ref_frame:3;
          uint32_t  last_ref_frame_sign_bias:1;
          uint32_t  golden_ref_frame:3;
@@ -1841,6 +1944,7 @@ struct pipe_vp9_picture_desc
          uint32_t  alt_ref_frame:3;
          uint32_t  alt_ref_frame_sign_bias:1;
          uint32_t  lossless_flag:1;
+         uint32_t  use_prev_frame_mvs:1;
       } pic_fields;
 
       uint8_t filter_level;
@@ -1868,8 +1972,8 @@ struct pipe_vp9_picture_desc
       int8_t uv_ac_delta_q;
       int8_t uv_dc_delta_q;
       uint8_t abs_delta;
-      uint8_t ref_deltas[4];
-      uint8_t mode_deltas[2];
+      int8_t ref_deltas[4];
+      int8_t mode_deltas[2];
    } picture_parameter;
 
    struct {
@@ -2084,14 +2188,12 @@ struct pipe_vpp_desc
    enum pipe_video_vpp_orientation orientation;
    struct pipe_vpp_blend blend;
 
-   /* Fence to wait on for the src surface */
-   struct pipe_fence_handle *src_surface_fence;
+   /* Only used for encode/decode processing */
+   struct pipe_video_buffer *dst;
 
    uint32_t background_color;
-   enum pipe_video_vpp_color_standard_type in_colors_standard;
    enum pipe_video_vpp_color_range in_color_range;
    enum pipe_video_vpp_chroma_siting in_chroma_siting;
-   enum pipe_video_vpp_color_standard_type out_colors_standard;
    enum pipe_video_vpp_color_range out_color_range;
    enum pipe_video_vpp_chroma_siting out_chroma_siting;
 
@@ -2728,6 +2830,24 @@ union pipe_enc_cap_gpu_stats_map {
   uint32_t value;
 };
 
+/* Used with PIPE_VIDEO_CAP_ENC_GPU_STATS_PSNR */
+union pipe_enc_cap_gpu_stats_psnr {
+   struct {
+      /*
+       * Driver Output. Indicates support for writing the frame's PSNR into a
+       * PIPE_BUFFER during encode frame execution as 32 bit float components
+       *
+       * The components are always written in Y, U, V order as packed
+       * 32 bit floats in the gpu_stats_psnr buffer sent down to the driver
+       * in the picture parameters. The unsupported channels are written as zero.
+       */
+      uint32_t supports_y_channel: 1;
+      uint32_t supports_u_channel: 1;
+      uint32_t supports_v_channel: 1;
+   } bits;
+  uint32_t value;
+};
+
 /* Used with PIPE_VIDEO_CAP_ENC_SLICED_NOTIFICATIONS */
 union pipe_enc_cap_sliced_notifications {
    struct {
@@ -2776,6 +2896,53 @@ union pipe_enc_cap_qpmap {
   uint32_t value;
 };
 
+/* Used with PIPE_VIDEO_CAP_ENC_TWO_PASS */
+union pipe_enc_cap_two_pass {
+   struct {
+      /*
+       * Driver Output. Indicates support for setting pipe_enc_two_pass_encoder_config.enable
+       */
+      uint32_t supports_two_pass: 1;
+      /*
+       * Driver Output. Indicates minimum value supported for pipe_enc_two_pass_encoder_config.pow2_downscale_factor
+       */
+      uint32_t min_pow2_downscale_factor: 3;
+      /*
+       * Driver Output. Indicates maximum value supported for pipe_enc_two_pass_encoder_config.pow2_downscale_factor
+       */
+      uint32_t max_pow2_downscale_factor: 3;
+      /*
+       * Driver output. Indicates support for skipping the first pass
+       * dpb output generation by setting pipe_enc_two_pass_encoder_config.skip_1st_dpb_texture = true
+       * and instead having the caller externally
+       * downscaling the dpb textures from the 2nd pass recon dpb texture.
+       *
+       * Using external downscaling may provide better quality at a higher
+       * performance cost, apps can choose this as a trade-off.
+       *
+       * When this mode is enabled, the driver will only generate the 2nd pass recon
+       * if the frame is used as reference and the app will be responsible for
+       * generating the downscaled dpb texture from the 2nd pass recon dpb texture
+       * to pass to future frames that use the reference.
+       *
+       * If not supported, the 1st pass recon pic output will always
+       * be written by the driver
+       */
+      uint32_t supports_1pass_recon_writing_skip: 1;
+      /*
+       * Driver output. Indicates support for skipping the first pass
+       * on arbitrary frames by setting pipe_enc_two_pass_frame_config.skip_1st_pass = true
+       * in the picture params.
+       *
+       * If not supported, all supported frame types by the driver will have
+       * two pass enabled during the encoder lifetime, ignoring the value in
+       * pipe_enc_two_pass_frame_config.skip_1st_pass
+       */
+      uint32_t supports_dynamic_1st_pass_skip: 1;
+   } bits;
+  uint32_t value;
+};
+
 /* Used with PIPE_VIDEO_CAP_ENC_MOTION_VECTOR_MAPS */
 union pipe_enc_cap_motion_vector_map {
    struct {
@@ -2818,6 +2985,15 @@ union pipe_enc_cap_motion_vector_map {
        * passed to the driver
        */
       uint32_t pipe_pixel_vectors_metadata_map_format: 9; /* 9 bits for pipe_format < PIPE_FORMAT_COUNT */
+   } bits;
+  uint32_t value;
+};
+
+/* Used with PIPE_VIDEO_CAP_ENC_SPATIAL_ADAPTIVE_QUANTIZATION */
+union pipe_enc_cap_spatial_adaptive_quantization {
+   struct {
+      /* value 0 indicates no support for SAQ */
+      uint32_t max_spatial_adaptive_quantization_strength: 8;
    } bits;
   uint32_t value;
 };

@@ -36,6 +36,8 @@
 #include "u_math.h"
 #include "u_printf.h"
 
+#include "util/half_float.h"
+
 #define XXH_INLINE_ALL
 #include "util/xxhash.h"
 
@@ -70,7 +72,7 @@ size_t util_printf_next_spec_pos(const char *str, size_t pos)
          continue;
       }
 
-      char *spec_pos = strpbrk(str_found, "cdieEfFgGaAosuxXp%");
+      const char *spec_pos = strpbrk(str_found, "cdieEfFgGaAosuxXp%");
       if (spec_pos == NULL) {
          return -1;
       } else if (*spec_pos == '%') {
@@ -241,7 +243,11 @@ u_printf_impl(FILE *out, const char *buffer, size_t buffer_size,
                case 2: {
                   uint16_t v;
                   memcpy(&v, &buffer[elmt_buf_pos], elmt_size);
-                  fprintf(out, print_str, v);
+                  if (is_float) {
+                     fprintf(out, print_str, _mesa_half_to_float(v));
+                  } else {
+                     fprintf(out, print_str, v);
+                  }
                   break;
                }
                case 4: {

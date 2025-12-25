@@ -11,9 +11,9 @@
 #include "nir_builder.h"
 
 #define SPECIAL_MS_OUT_MASK \
-   (BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_COUNT) | \
-    BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_INDICES) | \
-    BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE))
+   (VARYING_BIT_PRIMITIVE_COUNT | \
+    VARYING_BIT_PRIMITIVE_INDICES | \
+    VARYING_BIT_CULL_PRIMITIVE)
 
 #define MS_PRIM_ARG_EXP_MASK \
    (VARYING_BIT_LAYER | \
@@ -136,15 +136,20 @@ ms_store_prim_indices(nir_builder *b,
    assert(nir_src_is_const(*nir_get_io_offset_src(intrin)));
    assert(nir_src_as_uint(*nir_get_io_offset_src(intrin)) == 0);
 
+   const unsigned write_mask = nir_intrinsic_write_mask(intrin);
    const unsigned component_offset = nir_intrinsic_component(intrin);
    nir_def *store_val = intrin->src[0].ssa;
    assert(store_val->num_components <= 3);
+   assert(write_mask && write_mask <= BITFIELD_MASK(s->vertices_per_prim));
 
    if (store_val->num_components > s->vertices_per_prim)
       store_val = nir_trim_vector(b, store_val, s->vertices_per_prim);
 
-   if (s->layout.var.prm_attr.mask & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_INDICES)) {
+   if (s->layout.var.prm_attr.mask & VARYING_BIT_PRIMITIVE_INDICES) {
       for (unsigned c = 0; c < store_val->num_components; ++c) {
+         if (!(write_mask & BITFIELD_BIT(c)))
+            continue;
+
          const unsigned i = VARYING_SLOT_PRIMITIVE_INDICES * 4 + c + component_offset;
          nir_store_var(b, s->out_variables[i], nir_channel(b, store_val, c), 0x1);
       }
@@ -157,7 +162,9 @@ ms_store_prim_indices(nir_builder *b,
    /* The max vertex count is 256, so these indices always fit 8 bits.
     * To reduce LDS use, store these as a flat array of 8-bit values.
     */
-   nir_store_shared(b, nir_u2u8(b, store_val), offset, .base = s->layout.lds.indices_addr + component_offset);
+   nir_store_shared(b, nir_u2u8(b, store_val), offset,
+                    .base = s->layout.lds.indices_addr + component_offset,
+                    .write_mask = write_mask);
 }
 
 static void
@@ -171,12 +178,11 @@ ms_store_cull_flag(nir_builder *b,
    assert(nir_intrinsic_component(intrin) == 0);
    assert(nir_intrinsic_write_mask(intrin) == 1);
 
-   nir_def *store_val = intrin->src[0].ssa;
+   nir_def *store_val = nir_b2b1(b, intrin->src[0].ssa);
 
    assert(store_val->num_components == 1);
-   assert(store_val->bit_size == 1);
 
-   if (s->layout.var.prm_attr.mask & BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE)) {
+   if (s->layout.var.prm_attr.mask & VARYING_BIT_CULL_PRIMITIVE) {
       nir_store_var(b, s->out_variables[VARYING_SLOT_CULL_PRIMITIVE * 4], nir_b2i32(b, store_val), 0x1);
       return;
    }
@@ -275,7 +281,7 @@ ms_get_out_layout_part(unsigned location,
       }
    }
 
-   unreachable("Couldn't figure out mesh shader output mode.");
+   UNREACHABLE("Couldn't figure out mesh shader output mode.");
 }
 
 static void
@@ -295,7 +301,7 @@ ms_store_arrayed_output(nir_builder *b,
    bool hi_16b = io_sem.high_16bits;
    bool lo_16b = !hi_16b && store_val->bit_size == 16;
 
-   unsigned mapped_location = util_bitcount64(out->mask & u_bit_consecutive64(0, io_sem.location));
+   unsigned mapped_location = util_bitcount64(out->mask & BITFIELD64_MASK(io_sem.location));
    unsigned num_outputs = util_bitcount64(out->mask);
    unsigned const_off = out->addr + component_offset * 4 + (hi_16b ? 2 : 0);
 
@@ -333,15 +339,7 @@ ms_store_arrayed_output(nir_builder *b,
                            .access = ACCESS_COHERENT | ACCESS_IS_SWIZZLED_AMD,
                            .align_mul = 16, .align_offset = const_off % 16u);
    } else if (out_mode == ms_out_mode_var) {
-      unsigned write_mask_32 = write_mask;
-      if (store_val->bit_size > 32) {
-         /* Split 64-bit store values to 32-bit components. */
-         store_val = nir_bitcast_vector(b, store_val, 32);
-         /* Widen the write mask so it is in 32-bit components. */
-         write_mask_32 = util_widen_mask(write_mask, store_val->bit_size / 32);
-      }
-
-      u_foreach_bit(comp, write_mask_32) {
+      u_foreach_bit(comp, write_mask) {
          unsigned idx = io_sem.location * 4 + comp + component_offset;
          nir_def *val = nir_channel(b, store_val, comp);
          nir_def *v = nir_load_var(b, s->out_variables[idx]);
@@ -357,7 +355,7 @@ ms_store_arrayed_output(nir_builder *b,
          nir_store_var(b, s->out_variables[idx], val, 0x1);
       }
    } else {
-      unreachable("Invalid MS output mode for store");
+      UNREACHABLE("Invalid MS output mode for store");
    }
 }
 
@@ -414,7 +412,7 @@ ms_load_arrayed_output(nir_builder *b,
    unsigned const_off = out->addr + component_offset * 4;
 
    /* Use compacted location instead of the original semantic location. */
-   unsigned mapped_location = util_bitcount64(out->mask & u_bit_consecutive64(0, location));
+   unsigned mapped_location = util_bitcount64(out->mask & BITFIELD64_MASK(location));
 
    nir_def *base_addr = ms_arrayed_output_base_addr(b, arr_index, mapped_location, num_outputs);
    nir_def *base_addr_off = nir_imul_imm(b, base_offset, 16);
@@ -441,7 +439,7 @@ ms_load_arrayed_output(nir_builder *b,
       }
       return nir_vec(b, arr, num_components);
    } else {
-      unreachable("Invalid MS output mode for load");
+      UNREACHABLE("Invalid MS output mode for load");
    }
 }
 
@@ -510,10 +508,12 @@ lower_ms_intrinsic(nir_builder *b, nir_instr *instr, void *state)
       return update_ms_barrier(b, intrin, s);
    case nir_intrinsic_load_workgroup_index:
       return lower_ms_load_workgroup_index(b, intrin, s);
+   case nir_intrinsic_load_num_subgroups:
+      return nir_imm_int(b, DIV_ROUND_UP(s->api_workgroup_size, s->wave_size));
    case nir_intrinsic_set_vertex_and_primitive_count:
       return lower_ms_set_vertex_and_primitive_count(b, intrin, s);
    default:
-      unreachable("Not a lowerable mesh shader intrinsic.");
+      UNREACHABLE("Not a lowerable mesh shader intrinsic.");
    }
 }
 
@@ -531,6 +531,7 @@ filter_ms_intrinsic(const nir_instr *instr,
           intrin->intrinsic == nir_intrinsic_store_per_primitive_output ||
           intrin->intrinsic == nir_intrinsic_barrier ||
           intrin->intrinsic == nir_intrinsic_load_workgroup_index ||
+          intrin->intrinsic == nir_intrinsic_load_num_subgroups ||
           intrin->intrinsic == nir_intrinsic_set_vertex_and_primitive_count;
 }
 
@@ -768,7 +769,7 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
    nir_def *indices_loaded = NULL;
    nir_def *cull_flag = NULL;
 
-   if (s->layout.var.prm_attr.mask & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_INDICES)) {
+   if (s->layout.var.prm_attr.mask & VARYING_BIT_PRIMITIVE_INDICES) {
       nir_def *indices[3] = {0};
       for (unsigned c = 0; c < s->vertices_per_prim; ++c)
          indices[c] = nir_load_var(b, s->out_variables[VARYING_SLOT_PRIMITIVE_INDICES * 4 + c]);
@@ -780,7 +781,7 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
 
    if (s->uses_cull_flags) {
       nir_def *loaded_cull_flag = NULL;
-      if (s->layout.var.prm_attr.mask & BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE))
+      if (s->layout.var.prm_attr.mask & VARYING_BIT_CULL_PRIMITIVE)
          loaded_cull_flag = nir_load_var(b, s->out_variables[VARYING_SLOT_CULL_PRIMITIVE * 4]);
       else
          loaded_cull_flag = nir_u2u32(b, nir_load_shared(b, 1, 8, prim_idx_addr, .base = s->layout.lds.cull_flags_addr));
@@ -887,8 +888,8 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
    ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
 
    if (exports) {
-      ac_nir_export_position(b, s->hw_info->gfx_level, s->clipdist_enable_mask,
-                             !s->has_param_exports, false, true,
+      ac_nir_export_position(b, s->hw_info->gfx_level, s->clipdist_enable_mask, false, false,
+                             !s->has_param_exports, false,
                              s->per_vertex_outputs | VARYING_BIT_POS, &s->out, row);
    }
 
@@ -963,11 +964,7 @@ emit_ms_outputs(nir_builder *b, nir_def *invocation_index, nir_def *row_start,
          nir_phi_instr_add_src(index, preheader, invocation_index);
          nir_phi_instr_add_src(row, preheader, row_start);
 
-         nir_if *if_break = nir_push_if(b, nir_uge(b, &index->def, count));
-         {
-            nir_jump(b, nir_jump_break);
-         }
-         nir_pop_if(b, if_break);
+         nir_break_if(b, nir_uge(b, &index->def, count));
 
          cb(b, &index->def, &row->def, exports, parameters, mask, s);
 
@@ -1093,7 +1090,7 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
     *    barrier on the extra waves.
     */
    assert(s->hw_workgroup_size % s->wave_size == 0);
-   bool scan_barriers = ALIGN(s->api_workgroup_size, s->wave_size) < s->hw_workgroup_size;
+   bool scan_barriers = align(s->api_workgroup_size, s->wave_size) < s->hw_workgroup_size;
    bool can_shrink_barriers = s->api_workgroup_size <= s->wave_size;
    bool need_additional_barriers = scan_barriers && !can_shrink_barriers;
 
@@ -1204,11 +1201,7 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
                                      .memory_modes = nir_var_shader_out | nir_var_mem_shared);
 
                nir_def *loaded = nir_load_shared(b, 1, 32, zero, .base = api_waves_in_flight_addr);
-               nir_if *if_break = nir_push_if(b, nir_ieq_imm(b, loaded, 0));
-               {
-                  nir_jump(b, nir_jump_break);
-               }
-               nir_pop_if(b, if_break);
+               nir_break_if(b, nir_ieq_imm(b, loaded, 0));
             }
             nir_pop_loop(b, loop);
          }
@@ -1234,13 +1227,13 @@ ms_calculate_arrayed_output_layout(ms_out_mem_layout *l,
 {
    uint32_t lds_vtx_attr_size = util_bitcount64(l->lds.vtx_attr.mask) * max_vertices * 16;
    uint32_t lds_prm_attr_size = util_bitcount64(l->lds.prm_attr.mask) * max_primitives * 16;
-   l->lds.prm_attr.addr = ALIGN(l->lds.vtx_attr.addr + lds_vtx_attr_size, 16);
+   l->lds.prm_attr.addr = align(l->lds.vtx_attr.addr + lds_vtx_attr_size, 16);
    l->lds.total_size = l->lds.prm_attr.addr + lds_prm_attr_size;
 
    uint32_t scratch_ring_vtx_attr_size =
       util_bitcount64(l->scratch_ring.vtx_attr.mask) * max_vertices * 16;
    l->scratch_ring.prm_attr.addr =
-      ALIGN(l->scratch_ring.vtx_attr.addr + scratch_ring_vtx_attr_size, 16);
+      align(l->scratch_ring.vtx_attr.addr + scratch_ring_vtx_attr_size, 16);
 }
 
 static ms_out_mem_layout
@@ -1254,8 +1247,8 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
       VARYING_BIT_POS | VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1 | VARYING_BIT_CLIP_DIST0 |
       VARYING_BIT_CLIP_DIST1 | VARYING_BIT_PSIZ | VARYING_BIT_VIEWPORT |
       VARYING_BIT_PRIMITIVE_SHADING_RATE | VARYING_BIT_LAYER |
-      BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_COUNT) |
-      BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_INDICES) | BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE);
+      VARYING_BIT_PRIMITIVE_COUNT |
+      VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_CULL_PRIMITIVE;
 
    const bool use_attr_ring = hw_info->has_attr_ring;
    const uint64_t attr_ring_per_vertex_output_mask =
@@ -1271,9 +1264,9 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
       cross_invocation_output_access & ~SPECIAL_MS_OUT_MASK;
 
    const bool cross_invocation_indices =
-      cross_invocation_output_access & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_INDICES);
+      cross_invocation_output_access & VARYING_BIT_PRIMITIVE_INDICES;
    const bool cross_invocation_cull_primitive =
-      cross_invocation_output_access & BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE);
+      cross_invocation_output_access & VARYING_BIT_CULL_PRIMITIVE;
 
    /* Shared memory used by the API shader. */
    ms_out_mem_layout l = { .lds = { .total_size = api_shared_size } };
@@ -1289,7 +1282,7 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
                          ~cross_invocation_output_access;
 
    /* Workgroup information, see ms_workgroup_* for the layout. */
-   l.lds.workgroup_info_addr = ALIGN(l.lds.total_size, 16);
+   l.lds.workgroup_info_addr = align(l.lds.total_size, 16);
    l.lds.total_size = l.lds.workgroup_info_addr + 16;
 
    /* Per-vertex and per-primitive output attributes.
@@ -1297,7 +1290,7 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
     * First, try to put all outputs into LDS (shared memory).
     * If they don't fit, try to move them to VRAM one by one.
     */
-   l.lds.vtx_attr.addr = ALIGN(l.lds.total_size, 16);
+   l.lds.vtx_attr.addr = align(l.lds.total_size, 16);
    l.lds.vtx_attr.mask = lds_per_vertex_output_mask;
    l.lds.prm_attr.mask = lds_per_primitive_output_mask;
    ms_calculate_arrayed_output_layout(&l, max_vertices, max_primitives);
@@ -1318,20 +1311,20 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
       else if (l.lds.vtx_attr.mask)
          ms_move_output(&l.lds.vtx_attr, &l.scratch_ring.vtx_attr);
       else
-         unreachable("API shader uses too much shared memory.");
+         UNREACHABLE("API shader uses too much shared memory.");
 
       ms_calculate_arrayed_output_layout(&l, max_vertices, max_primitives);
    }
 
    if (cross_invocation_indices) {
       /* Indices: flat array of 8-bit vertex indices for each primitive. */
-      l.lds.indices_addr = ALIGN(l.lds.total_size, 16);
+      l.lds.indices_addr = align(l.lds.total_size, 16);
       l.lds.total_size = l.lds.indices_addr + max_primitives * vertices_per_prim;
    }
 
    if (cross_invocation_cull_primitive) {
       /* Cull flags: array of 8-bit cull flags for each primitive, 1=cull, 0=keep. */
-      l.lds.cull_flags_addr = ALIGN(l.lds.total_size, 16);
+      l.lds.cull_flags_addr = align(l.lds.total_size, 16);
       l.lds.total_size = l.lds.cull_flags_addr + max_primitives;
    }
 
@@ -1350,8 +1343,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
                       unsigned wave_size,
                       unsigned hw_workgroup_size,
                       bool multiview,
-                      bool has_query,
-                      bool fast_launch_2)
+                      bool has_query)
 {
    unsigned vertices_per_prim =
       mesa_vertices_per_prim(shader->info.mesh.primitive_type);
@@ -1362,7 +1354,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
       shader->info.per_primitive_outputs & shader->info.outputs_written;
 
    /* Whether the shader uses CullPrimitiveEXT */
-   bool uses_cull = shader->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_CULL_PRIMITIVE);
+   bool uses_cull = shader->info.outputs_written & VARYING_BIT_CULL_PRIMITIVE;
    /* Can't handle indirect register addressing, pretend as if they were cross-invocation. */
    uint64_t cross_invocation_access = shader->info.mesh.ms_cross_invocation_output_access |
                                       (shader->info.outputs_read_indirectly |
@@ -1388,6 +1380,8 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
    unsigned api_workgroup_size = shader->info.workgroup_size[0] *
                                  shader->info.workgroup_size[1] *
                                  shader->info.workgroup_size[2];
+
+   bool fast_launch_2 = hw_info->mesh_fast_launch_2;
 
    lower_ngg_ms_state state = {
       .layout = layout,
@@ -1437,7 +1431,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
    nir_lower_vars_to_ssa(shader);
    nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
    nir_lower_alu_to_scalar(shader, NULL, NULL);
-   nir_lower_phis_to_scalar(shader, true);
+   nir_lower_phis_to_scalar(shader, ac_nir_lower_phis_to_scalar_cb, NULL);
 
    /* Optimize load_local_invocation_index. When the API workgroup is smaller than the HW workgroup,
     * local_invocation_id isn't initialized for all lanes and we can't perform this optimization for

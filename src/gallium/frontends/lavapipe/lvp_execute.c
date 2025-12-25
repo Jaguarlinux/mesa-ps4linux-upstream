@@ -42,13 +42,13 @@
 #include "util/u_memory.h"
 #include "util/u_prim.h"
 #include "util/u_prim_restart.h"
-#include "util/format/u_format_zs.h"
 #include "util/ptralloc.h"
 #include "tgsi/tgsi_from_mesa.h"
 
 #include "vk_blend.h"
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_descriptor_update_template.h"
+#include "vk_synchronization.h"
 #include "vk_util.h"
 #include "vk_enum_to_str.h"
 
@@ -80,11 +80,20 @@ struct lvp_render_attachment {
    bool read_only;
 };
 
+struct lvp_conditional_rendering_state {
+   struct pipe_resource *buffer;
+   uint32_t offset;
+   bool condition;
+   bool enabled;
+};
+
 struct rendering_state {
    struct pipe_context *pctx;
    struct lvp_device *device;
    struct u_upload_mgr *uploader;
    struct cso_context *cso;
+
+   struct util_dynarray releasebufs;
 
    bool blend_dirty;
    bool rs_dirty;
@@ -103,6 +112,7 @@ struct rendering_state {
    bool ib_dirty;
    bool sample_mask_dirty;
    bool min_samples_dirty;
+   bool sample_locations_dirty;
    bool poison_mem;
    bool noop_fs_bound;
    struct pipe_draw_indirect_info indirect_info;
@@ -119,6 +129,7 @@ struct rendering_state {
       float offset_units;
       float offset_scale;
       float offset_clamp;
+      VkDepthBiasRepresentationEXT representation;
       bool enabled;
    } depth_bias;
    struct pipe_rasterizer_state rs_state;
@@ -171,7 +182,6 @@ struct rendering_state {
 
    VkRect2D render_area;
    bool suspending;
-   bool render_cond;
    uint32_t color_att_count;
    struct lvp_render_attachment color_att[PIPE_MAX_COLOR_BUFS];
    struct lvp_render_attachment depth_att;
@@ -190,6 +200,9 @@ struct rendering_state {
    bool sample_shading;
    bool depth_clamp_sets_clip;
 
+   bool sample_locations_enable;
+   uint8_t sample_locations[8];
+
    uint32_t num_so_targets;
    struct pipe_stream_output_target *so_targets[PIPE_MAX_SO_BUFFERS];
    uint32_t so_offsets[PIPE_MAX_SO_BUFFERS];
@@ -201,9 +214,10 @@ struct rendering_state {
    void *tess_states[2];
 
    struct util_dynarray push_desc_sets;
-   struct util_dynarray internal_buffers;
 
    struct lvp_pipeline *exec_graph;
+
+   struct lvp_conditional_rendering_state conditional_rendering;
 
    struct {
       struct lvp_shader *compute_shader;
@@ -275,7 +289,7 @@ static void finish_fence(struct rendering_state *state)
 }
 
 static unsigned
-get_pcbuf_size(struct rendering_state *state, enum pipe_shader_type pstage)
+get_pcbuf_size(struct rendering_state *state, mesa_shader_stage pstage)
 {
    enum lvp_pipeline_type type =
       ffs(lvp_pipeline_types_from_shader_stages(mesa_to_vk_shader_stage(pstage))) - 1;
@@ -283,8 +297,8 @@ get_pcbuf_size(struct rendering_state *state, enum pipe_shader_type pstage)
 }
 
 static void
-update_pcbuf(struct rendering_state *state, enum pipe_shader_type pstage,
-             enum pipe_shader_type api_stage)
+update_pcbuf(struct rendering_state *state, mesa_shader_stage pstage,
+             mesa_shader_stage api_stage)
 {
    unsigned size = get_pcbuf_size(state, api_stage);
    if (size) {
@@ -293,9 +307,13 @@ update_pcbuf(struct rendering_state *state, enum pipe_shader_type pstage,
       cbuf.buffer_size = size;
       cbuf.buffer = NULL;
       cbuf.user_buffer = NULL;
-      u_upload_alloc(state->uploader, 0, size, 64, &cbuf.buffer_offset, &cbuf.buffer, (void**)&mem);
+      struct pipe_resource *releasebuf = NULL;
+      u_upload_alloc(state->uploader, 0, size, 64, &cbuf.buffer_offset, &cbuf.buffer, &releasebuf, (void**)&mem);
+      if (releasebuf) {
+         util_dynarray_append(&state->releasebufs, releasebuf);
+      }
       memcpy(mem, state->push_constants, size);
-      state->pctx->set_constant_buffer(state->pctx, pstage, 0, true, &cbuf);
+      state->pctx->set_constant_buffer(state->pctx, pstage, 0, &cbuf);
    }
    state->pcbuf_dirty[api_stage] = false;
 }
@@ -308,7 +326,7 @@ static void emit_compute_state(struct rendering_state *state)
    if (state->constbuf_dirty[MESA_SHADER_COMPUTE]) {
       for (unsigned i = 0; i < state->num_const_bufs[MESA_SHADER_COMPUTE]; i++)
          state->pctx->set_constant_buffer(state->pctx, MESA_SHADER_COMPUTE,
-                                          i + 1, false, &state->const_buffer[MESA_SHADER_COMPUTE][i]);
+                                          i + 1, &state->const_buffer[MESA_SHADER_COMPUTE][i]);
       state->constbuf_dirty[MESA_SHADER_COMPUTE] = false;
    }
 
@@ -412,6 +430,16 @@ static void emit_state(struct rendering_state *state)
          state->rs_state.offset_tri = true;
          state->rs_state.offset_line = true;
          state->rs_state.offset_point = true;
+
+         state->rs_state.offset_units_unscaled =
+            state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT ||
+            state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_FLOAT_EXT;
+
+         if (state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT) {
+            enum pipe_format depth_format = util_format_get_depth_only(state->depth_att.imgv->pformat);
+            const struct util_format_description *desc = util_format_description(depth_format);
+            state->rs_state.offset_units *= util_get_depth_format_mrd(desc);
+         }
       } else {
          state->rs_state.offset_units = 0.0f;
          state->rs_state.offset_scale = 0.0f;
@@ -475,7 +503,7 @@ static void emit_state(struct rendering_state *state)
    }
 
    if (state->vb_dirty) {
-      cso_set_vertex_buffers(state->cso, state->num_vb, false, state->vb);
+      cso_set_vertex_buffers(state->cso, state->num_vb, state->vb);
       state->vb_dirty = false;
    }
 
@@ -483,7 +511,7 @@ static void emit_state(struct rendering_state *state)
       if (state->constbuf_dirty[sh]) {
          for (unsigned idx = 0; idx < state->num_const_bufs[sh]; idx++)
             state->pctx->set_constant_buffer(state->pctx, sh,
-                                             idx + 1, false, &state->const_buffer[sh][idx]);
+                                             idx + 1, &state->const_buffer[sh][idx]);
       }
       state->constbuf_dirty[sh] = false;
    }
@@ -501,6 +529,13 @@ static void emit_state(struct rendering_state *state)
    if (state->scissor_dirty) {
       state->pctx->set_scissor_states(state->pctx, 0, state->num_scissors, state->scissors);
       state->scissor_dirty = false;
+   }
+
+   if (state->sample_locations_dirty) {
+      state->pctx->set_sample_locations(state->pctx,
+                                        state->sample_locations_enable ? sizeof(state->sample_locations) : 0,
+                                        state->sample_locations);
+      state->sample_locations_dirty = false;
    }
 }
 
@@ -523,7 +558,7 @@ handle_compute_shader(struct rendering_state *state, struct lvp_shader *shader)
 static void handle_compute_pipeline(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
+   VK_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
 
    handle_compute_shader(state, &pipeline->shaders[MESA_SHADER_COMPUTE]);
 }
@@ -531,7 +566,7 @@ static void handle_compute_pipeline(struct vk_cmd_queue_entry *cmd,
 static void handle_ray_tracing_pipeline(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
+   VK_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
 
    struct lvp_shader *shader = &pipeline->shaders[MESA_SHADER_RAYGEN];
 
@@ -590,11 +625,22 @@ update_samples(struct rendering_state *state, VkSampleCountFlags samples)
 }
 
 static void
+update_samplelocs(struct rendering_state *state,
+                  unsigned num_samples,
+                  const struct VkSampleLocationEXT *locations)
+{
+   for (unsigned i = 0; i < MIN2(num_samples, 8); i++) {
+      state->sample_locations[i] = util_iround(CLAMP(locations[i].x, 0.0f, 0.9375f) * 16.0f);
+      state->sample_locations[i] |= util_iround(CLAMP(locations[i].y, 0.0f, 0.9375f) * 16.0f) << 4;
+   }
+}
+
+static void
 handle_graphics_stages(struct rendering_state *state, VkShaderStageFlagBits shader_stages, bool dynamic_tess_origin)
 {
    u_foreach_bit(b, shader_stages) {
       VkShaderStageFlagBits vk_stage = (1 << b);
-      gl_shader_stage stage = vk_to_mesa_shader_stage(vk_stage);
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(vk_stage);
 
       state->has_pcbuf[stage] = false;
 
@@ -643,7 +689,7 @@ static void
 unbind_graphics_stages(struct rendering_state *state, VkShaderStageFlagBits shader_stages)
 {
    u_foreach_bit(vkstage, shader_stages) {
-      gl_shader_stage stage = vk_to_mesa_shader_stage(1<<vkstage);
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(1<<vkstage);
       state->has_pcbuf[stage] = false;
       switch (stage) {
       case MESA_SHADER_FRAGMENT:
@@ -676,14 +722,14 @@ unbind_graphics_stages(struct rendering_state *state, VkShaderStageFlagBits shad
             state->pctx->bind_ms_state(state->pctx, NULL);
          break;
       default:
-         unreachable("what stage is this?!");
+         UNREACHABLE("what stage is this?!");
       }
       state->shaders[stage] = NULL;
    }
 }
 
 static void
-handle_graphics_pushconsts(struct rendering_state *state, gl_shader_stage stage, struct lvp_shader *shader)
+handle_graphics_pushconsts(struct rendering_state *state, mesa_shader_stage stage, struct lvp_shader *shader)
 {
    state->has_pcbuf[stage] = shader->push_constant_size > 0;
    if (!state->has_pcbuf[stage])
@@ -758,6 +804,7 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
          state->depth_bias.offset_units = ps->rs->depth_bias.constant_factor;
          state->depth_bias.offset_scale = ps->rs->depth_bias.slope_factor;
          state->depth_bias.offset_clamp = ps->rs->depth_bias.clamp;
+         state->depth_bias.representation = ps->rs->depth_bias.representation;
       }
 
       if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_RS_CULL_MODE))
@@ -887,6 +934,13 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
          state->sample_mask = ps->ms->sample_mask;
          state->sample_mask_dirty = true;
       }
+      if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS_ENABLE))
+         state->sample_locations_enable = ps->ms->sample_locations_enable;
+      if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_LOCATIONS))
+         if (ps->ms->sample_locations != NULL)
+            update_samplelocs(state, ps->ms->sample_locations->per_pixel,
+                              ps->ms->sample_locations->locations);
+      state->sample_locations_dirty = true;
       if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE)) {
          state->blend_state.alpha_to_coverage = ps->ms->alpha_to_coverage_enable;
          state->blend_state.alpha_to_coverage_dither = state->blend_state.alpha_to_coverage;
@@ -904,6 +958,8 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
       if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_MASK) &&
           !BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE))
          state->rs_state.multisample = false;
+      state->sample_locations_enable = false;
+      state->sample_locations_dirty = true;
       state->sample_shading = false;
       state->force_min_sample = false;
       if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_MS_SAMPLE_MASK)) {
@@ -940,7 +996,7 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
             state->velem.velems[a].instance_divisor = d ? d : UINT32_MAX;
             break;
          default:
-            unreachable("Invalid vertex input rate");
+            UNREACHABLE("Invalid vertex input rate");
          }
 
          if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES)) {
@@ -956,7 +1012,7 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
    }
 
    if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) && ps->ia) {
-      state->info.mode = vk_conv_topology(ps->ia->primitive_topology);
+      state->info.mode = vk_topology_to_mesa(ps->ia->primitive_topology);
       state->rs_dirty = true;
    }
    if (!BITSET_TEST(ps->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) && ps->ia)
@@ -1010,7 +1066,7 @@ static void handle_graphics_pipeline(struct lvp_pipeline *pipeline,
 static void handle_pipeline(struct vk_cmd_queue_entry *cmd,
                             struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
+   VK_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
    pipeline->used = true;
    if (pipeline->type == LVP_PIPELINE_COMPUTE) {
       handle_compute_pipeline(cmd, state);
@@ -1076,7 +1132,7 @@ static void
 handle_set_stage_buffer(struct rendering_state *state,
                         struct pipe_resource *bo,
                         size_t offset,
-                        gl_shader_stage stage,
+                        mesa_shader_stage stage,
                         uint32_t index)
 {
    state->const_buffer[stage][index].buffer = bo;
@@ -1093,7 +1149,7 @@ handle_set_stage_buffer(struct rendering_state *state,
 static void handle_set_stage(struct rendering_state *state,
                              struct lvp_descriptor_set *set,
                              enum lvp_pipeline_type pipeline_type,
-                             gl_shader_stage stage,
+                             mesa_shader_stage stage,
                              uint32_t index)
 {
    state->desc_sets[pipeline_type][index] = set;
@@ -1112,7 +1168,7 @@ apply_dynamic_offsets(struct lvp_descriptor_set **out_set, const uint32_t *offse
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, in_set->layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    memcpy(set->map, in_set->map, in_set->bo->width0);
 
@@ -1139,7 +1195,7 @@ apply_dynamic_offsets(struct lvp_descriptor_set **out_set, const uint32_t *offse
 static void
 handle_descriptor_sets(VkBindDescriptorSetsInfoKHR *bds, struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_pipeline_layout, layout, bds->layout);
+   VK_FROM_HANDLE(lvp_pipeline_layout, layout, bds->layout);
 
    uint32_t dynamic_offset_index = 0;
 
@@ -1216,7 +1272,7 @@ handle_descriptor_sets_cmd(struct vk_cmd_queue_entry *cmd, struct rendering_stat
    handle_descriptor_sets(bds, state);
 }
 
-static struct pipe_surface *create_img_surface_bo(struct rendering_state *state,
+static struct pipe_surface create_img_surface_bo(struct rendering_state *state,
                                                   VkImageSubresourceRange *range,
                                                   struct pipe_resource *bo,
                                                   enum pipe_format pformat,
@@ -1224,28 +1280,27 @@ static struct pipe_surface *create_img_surface_bo(struct rendering_state *state,
                                                   int level)
 {
    if (pformat == PIPE_FORMAT_NONE)
-      return NULL;
+      return (struct pipe_surface){0};
 
-   const struct pipe_surface template = {
+   struct pipe_surface template = {
       .format = pformat,
-      .u.tex.first_layer = range->baseArrayLayer + base_layer,
-      .u.tex.last_layer = range->baseArrayLayer + base_layer + layer_count - 1,
-      .u.tex.level = range->baseMipLevel + level,
+      .texture = bo,
+      .first_layer = range->baseArrayLayer + base_layer,
+      .last_layer = range->baseArrayLayer + base_layer + layer_count - 1,
+      .level = range->baseMipLevel + level,
    };
-
-   return state->pctx->create_surface(state->pctx,
-                                      bo, &template);
-
+   return template;
 }
-static struct pipe_surface *create_img_surface(struct rendering_state *state,
+static struct pipe_surface create_img_surface(struct rendering_state *state,
                                                struct lvp_image_view *imgv,
                                                VkFormat format,
                                                int base_layer, int layer_count)
 {
+   const struct lvp_image *image = (struct lvp_image *)imgv->vk.image;
    VkImageSubresourceRange imgv_subres =
       vk_image_view_subresource_range(&imgv->vk);
 
-   return create_img_surface_bo(state, &imgv_subres, imgv->image->planes[0].bo,
+   return create_img_surface_bo(state, &imgv_subres, image->planes[0].bo,
                                 lvp_vk_format_to_pipe_format(format),
                                 base_layer, layer_count, 0);
 }
@@ -1254,15 +1309,7 @@ static void add_img_view_surface(struct rendering_state *state,
                                  struct lvp_image_view *imgv,
                                  int layer_count)
 {
-   if (imgv->surface) {
-      if ((imgv->surface->u.tex.last_layer - imgv->surface->u.tex.first_layer) != (layer_count - 1))
-         pipe_surface_reference(&imgv->surface, NULL);
-   }
-
-   if (!imgv->surface) {
-      imgv->surface = create_img_surface(state, imgv, imgv->vk.format,
-                                         0, layer_count);
-   }
+   imgv->surface = create_img_surface(state, imgv, imgv->vk.format, 0, layer_count);
 }
 
 static bool
@@ -1287,28 +1334,27 @@ static void clear_attachment_layers(struct rendering_state *state,
                                     uint32_t sclear_val,
                                     union pipe_color_union *col_val)
 {
-   struct pipe_surface *clear_surf = create_img_surface(state,
-                                                        imgv,
-                                                        imgv->vk.format,
-                                                        base_layer,
-                                                        layer_count);
+   struct pipe_surface clear_surf = create_img_surface(state,
+                                                       imgv,
+                                                       imgv->vk.format,
+                                                       base_layer,
+                                                       layer_count);
 
    if (ds_clear_flags) {
       state->pctx->clear_depth_stencil(state->pctx,
-                                       clear_surf,
+                                       &clear_surf,
                                        ds_clear_flags,
                                        dclear_val, sclear_val,
                                        rect->offset.x, rect->offset.y,
                                        rect->extent.width, rect->extent.height,
                                        true);
    } else {
-      state->pctx->clear_render_target(state->pctx, clear_surf,
+      state->pctx->clear_render_target(state->pctx, &clear_surf,
                                        col_val,
                                        rect->offset.x, rect->offset.y,
                                        rect->extent.width, rect->extent.height,
                                        true);
    }
-   state->pctx->surface_destroy(state->pctx, clear_surf);
 }
 
 static void render_clear(struct rendering_state *state)
@@ -1325,7 +1371,6 @@ static void render_clear(struct rendering_state *state)
       color_clear_val.ui[3] = value.color.uint32[3];
 
       struct lvp_image_view *imgv = state->color_att[i].imgv;
-      assert(imgv->surface);
 
       if (state->framebuffer.viewmask) {
          u_foreach_bit(i, state->framebuffer.viewmask)
@@ -1333,7 +1378,7 @@ static void render_clear(struct rendering_state *state)
                                     i, 1, 0, 0, 0, &color_clear_val);
       } else {
          state->pctx->clear_render_target(state->pctx,
-                                          imgv->surface,
+                                          &imgv->surface,
                                           &color_clear_val,
                                           state->render_area.offset.x,
                                           state->render_area.offset.y,
@@ -1363,7 +1408,7 @@ static void render_clear(struct rendering_state *state)
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
          state->pctx->clear_depth_stencil(state->pctx,
-                                          state->ds_imgv->surface,
+                                          &state->ds_imgv->surface,
                                           ds_clear_flags,
                                           dclear_val, sclear_val,
                                           state->render_area.offset.x,
@@ -1392,7 +1437,7 @@ static void render_clear_fast(struct rendering_state *state)
    if (state->framebuffer.viewmask)
       goto slow_clear;
 
-   if (state->render_cond)
+   if (state->conditional_rendering.enabled)
       goto slow_clear;
 
    uint32_t buffers = 0;
@@ -1441,11 +1486,12 @@ slow_clear:
 static struct lvp_image_view *
 destroy_multisample_surface(struct rendering_state *state, struct lvp_image_view *imgv)
 {
-   assert(imgv->image->vk.samples > 1);
+   struct lvp_image *image = (struct lvp_image *)imgv->vk.image;
+   assert(image->vk.samples > 1);
    struct lvp_image_view *base = imgv->multisample;
+   pipe_resource_reference(&image->planes[0].bo, NULL);
    base->multisample = NULL;
-   free((void*)imgv->image);
-   pipe_surface_reference(&imgv->surface, NULL);
+   free((void*)image);
    free(imgv);
    return base;
 }
@@ -1459,9 +1505,10 @@ resolve_ds(struct rendering_state *state, bool multi)
       return;
 
    struct lvp_image_view *src_imgv = state->ds_imgv;
+   const struct lvp_image *src_image = (struct lvp_image *)src_imgv->vk.image;
    if (multi && !src_imgv->multisample)
       return;
-   if (!multi && src_imgv->image->vk.samples == 1)
+   if (!multi && src_imgv->vk.image->samples == 1)
       return;
 
    assert(state->depth_att.resolve_imgv == NULL ||
@@ -1472,7 +1519,7 @@ resolve_ds(struct rendering_state *state, bool multi)
       multi ? src_imgv->multisample :
       state->depth_att.resolve_imgv ? state->depth_att.resolve_imgv :
                                       state->stencil_att.resolve_imgv;
-
+   const struct lvp_image *dst_image = (struct lvp_image *)dst_imgv->vk.image;
    unsigned num_blits = 1;
    if (depth_resolve_mode != stencil_resolve_mode)
       num_blits = 2;
@@ -1486,8 +1533,8 @@ resolve_ds(struct rendering_state *state, bool multi)
 
       struct pipe_blit_info info = {0};
 
-      info.src.resource = src_imgv->image->planes[0].bo;
-      info.dst.resource = dst_imgv->image->planes[0].bo;
+      info.src.resource = src_image->planes[0].bo;
+      info.dst.resource = dst_image->planes[0].bo;
       info.src.format = src_imgv->pformat;
       info.dst.format = dst_imgv->pformat;
       info.filter = PIPE_TEX_FILTER_NEAREST;
@@ -1527,15 +1574,17 @@ resolve_color(struct rendering_state *state, bool multi)
          continue;
 
       struct lvp_image_view *src_imgv = state->color_att[i].imgv;
+      const struct lvp_image *src_image = (struct lvp_image *)src_imgv->vk.image;
       /* skip non-msrtss resolves during msrtss resolve */
       if (multi && !src_imgv->multisample)
          continue;
       struct lvp_image_view *dst_imgv = multi ? src_imgv->multisample : state->color_att[i].resolve_imgv;
+      const struct lvp_image *dst_image = (struct lvp_image *)dst_imgv->vk.image;
 
       struct pipe_blit_info info = { 0 };
 
-      info.src.resource = src_imgv->image->planes[0].bo;
-      info.dst.resource = dst_imgv->image->planes[0].bo;
+      info.src.resource = src_image->planes[0].bo;
+      info.dst.resource = dst_image->planes[0].bo;
       info.src.format = src_imgv->pformat;
       info.dst.format = dst_imgv->pformat;
       info.filter = PIPE_TEX_FILTER_NEAREST;
@@ -1580,17 +1629,19 @@ replicate_attachment(struct rendering_state *state,
                      struct lvp_image_view *src,
                      struct lvp_image_view *dst)
 {
-   unsigned level = dst->surface->u.tex.level;
+   const struct lvp_image *src_image = (struct lvp_image *)src->vk.image;
+   const struct lvp_image *dst_image = (struct lvp_image *)dst->vk.image;
+   unsigned level = dst->surface.level;
    const struct pipe_box box = {
       .x = 0,
       .y = 0,
       .z = 0,
-      .width = u_minify(dst->image->planes[0].bo->width0, level),
-      .height = u_minify(dst->image->planes[0].bo->height0, level),
-      .depth = u_minify(dst->image->planes[0].bo->depth0, level),
+      .width = u_minify(dst_image->planes[0].bo->width0, level),
+      .height = u_minify(dst_image->planes[0].bo->height0, level),
+      .depth = u_minify(dst_image->planes[0].bo->depth0, level),
    };
-   state->pctx->resource_copy_region(state->pctx, dst->image->planes[0].bo, level,
-                                     0, 0, 0, src->image->planes[0].bo, level, &box);
+   state->pctx->resource_copy_region(state->pctx, dst_image->planes[0].bo, level,
+                                     0, 0, 0, src_image->planes[0].bo, level, &box);
 }
 
 static struct lvp_image_view *
@@ -1598,18 +1649,17 @@ create_multisample_surface(struct rendering_state *state, struct lvp_image_view 
 {
    assert(!imgv->multisample);
 
-   struct pipe_resource templ = *imgv->surface->texture;
+   struct pipe_resource templ = *imgv->surface.texture;
    templ.nr_samples = samples;
-   struct lvp_image *image = mem_dup(imgv->image, sizeof(struct lvp_image));
+   struct lvp_image *image = mem_dup(imgv->vk.image, sizeof(struct lvp_image));
    image->vk.samples = samples;
    image->planes[0].pmem = NULL;
    image->planes[0].bo = state->pctx->screen->resource_create(state->pctx->screen, &templ);
 
    struct lvp_image_view *multi = mem_dup(imgv, sizeof(struct lvp_image_view));
-   multi->image = image;
-   multi->surface = state->pctx->create_surface(state->pctx, image->planes[0].bo, imgv->surface);
-   struct pipe_resource *ref = image->planes[0].bo;
-   pipe_resource_reference(&ref, NULL);
+   multi->vk.image = (struct vk_image *)image;
+   multi->surface = imgv->surface;
+   multi->surface.texture = image->planes[0].bo;
    imgv->multisample = multi;
    multi->multisample = imgv;
    if (replicate)
@@ -1627,8 +1677,8 @@ att_needs_replicate(const struct rendering_state *state,
       return true;
    if (state->render_area.offset.x || state->render_area.offset.y)
       return true;
-   if (state->render_area.extent.width < imgv->image->vk.extent.width ||
-       state->render_area.extent.height < imgv->image->vk.extent.height)
+   if (state->render_area.extent.width < imgv->vk.image->extent.width ||
+       state->render_area.extent.height < imgv->vk.image->extent.height)
       return true;
    return false;
 }
@@ -1724,14 +1774,14 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
          struct lvp_image_view *imgv = state->color_att[i].imgv;
          add_img_view_surface(state, imgv,
                               state->framebuffer.layers);
-         if (state->forced_sample_count && imgv->image->vk.samples == 1)
+         if (state->forced_sample_count && imgv->vk.image->samples == 1)
             state->color_att[i].imgv = create_multisample_surface(state, imgv, state->forced_sample_count,
                                                                   att_needs_replicate(state, imgv, state->color_att[i].load_op));
          state->framebuffer.cbufs[i] = state->color_att[i].imgv->surface;
-         assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.cbufs[i]->texture->width0);
-         assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.cbufs[i]->texture->height0);
+         assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.cbufs[i].texture->width0);
+         assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.cbufs[i].texture->height0);
       } else {
-         state->framebuffer.cbufs[i] = NULL;
+         memset(&state->framebuffer.cbufs[i], 0, sizeof(state->framebuffer.cbufs[i]));
       }
    }
 
@@ -1748,7 +1798,7 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
       struct lvp_image_view *imgv = state->ds_imgv;
       add_img_view_surface(state, imgv,
                            state->framebuffer.layers);
-      if (state->forced_sample_count && imgv->image->vk.samples == 1) {
+      if (state->forced_sample_count && imgv->vk.image->samples == 1) {
          VkAttachmentLoadOp load_op;
          if (state->depth_att.load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
              state->stencil_att.load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
@@ -1762,11 +1812,11 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
                                                      att_needs_replicate(state, imgv, load_op));
       }
       state->framebuffer.zsbuf = state->ds_imgv->surface;
-      assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.zsbuf->texture->width0);
-      assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.zsbuf->texture->height0);
+      assert(state->render_area.offset.x + state->render_area.extent.width <= state->framebuffer.zsbuf.texture->width0);
+      assert(state->render_area.offset.y + state->render_area.extent.height <= state->framebuffer.zsbuf.texture->height0);
    } else {
       state->ds_imgv = NULL;
-      state->framebuffer.zsbuf = NULL;
+      memset(&state->framebuffer.zsbuf, 0, sizeof(state->framebuffer.zsbuf));
    }
 
    state->pctx->set_framebuffer_state(state->pctx,
@@ -1785,6 +1835,12 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
    if (!state->poison_mem)
       return;
 
+   /* ensure that textures are correctly framebuffer-referenced in llvmpipe */
+   if (state->fb_remapped) {
+      state->fb_remapped = false;
+      emit_fb_state(state);
+   }
+
    union pipe_color_union color_clear_val;
    memset(color_clear_val.ui, rand() % UINT8_MAX, sizeof(color_clear_val.ui));
 
@@ -1796,7 +1852,7 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                        i, 1, 0, 0, 0, &color_clear_val);
          } else {
             state->pctx->clear_render_target(state->pctx,
-                                             state->color_att[i].imgv->surface,
+                                             &state->color_att[i].imgv->surface,
                                              &color_clear_val,
                                              state->render_area.offset.x,
                                              state->render_area.offset.y,
@@ -1820,7 +1876,7 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
          state->pctx->clear_depth_stencil(state->pctx,
-                                          state->ds_imgv->surface,
+                                          &state->ds_imgv->surface,
                                           ds_clear_flags,
                                           dclear_val, sclear_val,
                                           state->render_area.offset.x,
@@ -1988,6 +2044,24 @@ static void handle_set_depth_bias(struct vk_cmd_queue_entry *cmd,
    state->rs_dirty = true;
 }
 
+static void handle_set_depth_bias2(struct vk_cmd_queue_entry *cmd,
+                                   struct rendering_state *state)
+{
+   VkDepthBiasInfoEXT *info = cmd->u.set_depth_bias2_ext.depth_bias_info;
+
+   state->depth_bias.offset_units = info->depthBiasConstantFactor;
+   state->depth_bias.offset_scale = info->depthBiasSlopeFactor;
+   state->depth_bias.offset_clamp = info->depthBiasClamp;
+
+   const VkDepthBiasRepresentationInfoEXT *representation_info =
+      vk_find_struct_const(info->pNext, DEPTH_BIAS_REPRESENTATION_INFO_EXT);
+   state->depth_bias.representation =
+      representation_info ? representation_info->depthBiasRepresentation
+                          : VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+
+   state->rs_dirty = true;
+}
+
 static void handle_set_blend_constants(struct vk_cmd_queue_entry *cmd,
                                        struct rendering_state *state)
 {
@@ -2034,122 +2108,6 @@ static void handle_set_stencil_reference(struct vk_cmd_queue_entry *cmd,
    state->stencil_ref_dirty = true;
 }
 
-static void
-copy_depth_rect(uint8_t * dst,
-                enum pipe_format dst_format,
-                unsigned dst_stride,
-                unsigned dst_x,
-                unsigned dst_y,
-                unsigned width,
-                unsigned height,
-                const uint8_t * src,
-                enum pipe_format src_format,
-                int src_stride,
-                unsigned src_x,
-                unsigned src_y)
-{
-   int src_stride_pos = src_stride < 0 ? -src_stride : src_stride;
-   int src_blocksize = util_format_get_blocksize(src_format);
-   int src_blockwidth = util_format_get_blockwidth(src_format);
-   int src_blockheight = util_format_get_blockheight(src_format);
-   int dst_blocksize = util_format_get_blocksize(dst_format);
-   int dst_blockwidth = util_format_get_blockwidth(dst_format);
-   int dst_blockheight = util_format_get_blockheight(dst_format);
-
-   assert(src_blocksize > 0);
-   assert(src_blockwidth > 0);
-   assert(src_blockheight > 0);
-
-   dst_x /= dst_blockwidth;
-   dst_y /= dst_blockheight;
-   width = (width + src_blockwidth - 1)/src_blockwidth;
-   height = (height + src_blockheight - 1)/src_blockheight;
-   src_x /= src_blockwidth;
-   src_y /= src_blockheight;
-
-   dst += dst_x * dst_blocksize;
-   src += src_x * src_blocksize;
-   dst += dst_y * dst_stride;
-   src += src_y * src_stride_pos;
-
-   if (dst_format == PIPE_FORMAT_S8_UINT) {
-      if (src_format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
-         util_format_z32_float_s8x24_uint_unpack_s_8uint(dst, dst_stride,
-                                                         src, src_stride,
-                                                         width, height);
-      } else if (src_format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
-         util_format_z24_unorm_s8_uint_unpack_s_8uint(dst, dst_stride,
-                                                      src, src_stride,
-                                                      width, height);
-      } else {
-         abort();
-      }
-   } else if (dst_format == PIPE_FORMAT_Z24X8_UNORM) {
-      util_format_z24_unorm_s8_uint_unpack_z24(dst, dst_stride,
-                                               src, src_stride,
-                                               width, height);
-   } else if (dst_format == PIPE_FORMAT_Z32_FLOAT) {
-      if (src_format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
-         util_format_z32_float_s8x24_uint_unpack_z_float((float *)dst, dst_stride,
-                                                         src, src_stride,
-                                                         width, height);
-      } else {
-         abort();
-      }
-   } else if (dst_format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
-      if (src_format == PIPE_FORMAT_Z32_FLOAT)
-         util_format_z32_float_s8x24_uint_pack_z_float(dst, dst_stride,
-                                                       (float *)src, src_stride,
-                                                       width, height);
-      else if (src_format == PIPE_FORMAT_S8_UINT)
-         util_format_z32_float_s8x24_uint_pack_s_8uint(dst, dst_stride,
-                                                       src, src_stride,
-                                                       width, height);
-      else
-         abort();
-   } else if (dst_format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
-      if (src_format == PIPE_FORMAT_S8_UINT)
-         util_format_z24_unorm_s8_uint_pack_s_8uint(dst, dst_stride,
-                                                    src, src_stride,
-                                                    width, height);
-      else if (src_format == PIPE_FORMAT_Z24X8_UNORM)
-         util_format_z24_unorm_s8_uint_pack_z24(dst, dst_stride,
-                                                src, src_stride,
-                                                width, height);
-      else
-         abort();
-   }
-}
-
-static void
-copy_depth_box(uint8_t *dst,
-               enum pipe_format dst_format,
-               unsigned dst_stride, uint64_t dst_slice_stride,
-               unsigned dst_x, unsigned dst_y, unsigned dst_z,
-               unsigned width, unsigned height, unsigned depth,
-               const uint8_t * src,
-               enum pipe_format src_format,
-               int src_stride, uint64_t src_slice_stride,
-               unsigned src_x, unsigned src_y, unsigned src_z)
-{
-   dst += dst_z * dst_slice_stride;
-   src += src_z * src_slice_stride;
-   for (unsigned z = 0; z < depth; ++z) {
-      copy_depth_rect(dst,
-                      dst_format,
-                      dst_stride,
-                      dst_x, dst_y,
-                      width, height,
-                      src,
-                      src_format,
-                      src_stride,
-                      src_x, src_y);
-
-      dst += dst_slice_stride;
-      src += src_slice_stride;
-   }
-}
-
 static unsigned
 subresource_layercount(const struct lvp_image *image, const VkImageSubresourceLayers *sub)
 {
@@ -2162,7 +2120,7 @@ static void handle_copy_image_to_buffer2(struct vk_cmd_queue_entry *cmd,
                                              struct rendering_state *state)
 {
    const struct VkCopyImageToBufferInfo2 *copycmd = cmd->u.copy_image_to_buffer2.copy_image_to_buffer_info;
-   LVP_FROM_HANDLE(lvp_image, src_image, copycmd->srcImage);
+   VK_FROM_HANDLE(lvp_image, src_image, copycmd->srcImage);
    struct pipe_box box, dbox;
    struct pipe_transfer *src_t, *dst_t;
    uint8_t *src_data, *dst_data;
@@ -2212,7 +2170,7 @@ static void handle_copy_image_to_buffer2(struct vk_cmd_queue_entry *cmd,
       const struct vk_image_buffer_layout buffer_layout =
          vk_image_buffer_copy_layout(&src_image->vk, &copycmd->pRegions[i]);
       if (src_format != dst_format) {
-         copy_depth_box(dst_data, dst_format,
+         lvp_image_copy_depth_box(dst_data, dst_format,
                         buffer_layout.row_stride_B,
                         buffer_layout.image_stride_B,
                         0, 0, 0,
@@ -2235,11 +2193,53 @@ static void handle_copy_image_to_buffer2(struct vk_cmd_queue_entry *cmd,
    }
 }
 
+static void
+handle_copy_memory_to_image_indirect(struct vk_cmd_queue_entry *cmd,
+                                     struct rendering_state *state)
+{
+   const VkCopyMemoryToImageIndirectInfoKHR *copycmd = cmd->u.copy_memory_to_image_indirect_khr.copy_memory_to_image_indirect_info;
+   VK_FROM_HANDLE(lvp_image, image, copycmd->dstImage);
+
+   for (uint32_t i = 0; i < copycmd->copyCount; i++) {
+      uint8_t *ptr = (void*)(uintptr_t)copycmd->copyAddressRange.address;
+      VkCopyMemoryToImageIndirectCommandKHR *copy = (void*)(ptr + i * copycmd->copyAddressRange.stride);
+      VkImageSubresourceLayers sub = copy->imageSubresource;
+      VkOffset3D off = copy->imageOffset;
+      VkExtent3D ext = copy->imageExtent;
+      if (image->vk.image_type == VK_IMAGE_TYPE_3D) {
+         off.z = sub.baseArrayLayer;
+         ext.depth = sub.layerCount;
+         sub.baseArrayLayer = 0;
+         sub.layerCount = 1;
+      }
+      VkMemoryToImageCopy copyregion = {
+         VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+         NULL,
+         (void*)(uintptr_t)copy->srcAddress,
+         copy->bufferRowLength,
+         copy->bufferImageHeight,
+         sub,
+         off,
+         ext,
+      };
+      VkCopyMemoryToImageInfoEXT hiccopy = {
+         VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+         NULL,
+         0,
+         copycmd->dstImage,
+         VK_IMAGE_LAYOUT_GENERAL,
+         1,
+         &copyregion
+      };
+      state->device->vk.dispatch_table.CopyMemoryToImageEXT(lvp_device_to_handle(state->device), &hiccopy);
+   }
+}
+
 static void handle_copy_buffer_to_image(struct vk_cmd_queue_entry *cmd,
                                         struct rendering_state *state)
 {
    const struct VkCopyBufferToImageInfo2 *copycmd = cmd->u.copy_buffer_to_image2.copy_buffer_to_image_info;
-   LVP_FROM_HANDLE(lvp_image, dst_image, copycmd->dstImage);
+   VK_FROM_HANDLE(lvp_image, dst_image, copycmd->dstImage);
 
    for (uint32_t i = 0; i < copycmd->regionCount; i++) {
       const VkBufferImageCopy2 *region = &copycmd->pRegions[i];
@@ -2290,7 +2290,7 @@ static void handle_copy_buffer_to_image(struct vk_cmd_queue_entry *cmd,
       const struct vk_image_buffer_layout buffer_layout =
          vk_image_buffer_copy_layout(&dst_image->vk, &copycmd->pRegions[i]);
       if (src_format != dst_format) {
-         copy_depth_box(dst_data, dst_format,
+         lvp_image_copy_depth_box(dst_data, dst_format,
                         dst_t->stride, dst_t->layer_stride,
                         0, 0, 0,
                         region->imageExtent.width,
@@ -2330,7 +2330,7 @@ find_depth_format(VkFormat format, VkImageAspectFlagBits aspect)
       case VK_FORMAT_D16_UNORM_S8_UINT:
          return PIPE_FORMAT_Z16_UNORM;
       default:
-         unreachable("unsupported format/aspect combo");
+         UNREACHABLE("unsupported format/aspect combo");
       }
    }
    assert(aspect == VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -2341,7 +2341,7 @@ find_depth_format(VkFormat format, VkImageAspectFlagBits aspect)
    case VK_FORMAT_S8_UINT:
       return PIPE_FORMAT_S8_UINT;
    default:
-      unreachable("unsupported format/aspect combo");
+      UNREACHABLE("unsupported format/aspect combo");
    }
 }
 
@@ -2349,8 +2349,8 @@ static void handle_copy_image(struct vk_cmd_queue_entry *cmd,
                               struct rendering_state *state)
 {
    const struct VkCopyImageInfo2 *copycmd = cmd->u.copy_image2.copy_image_info;
-   LVP_FROM_HANDLE(lvp_image, src_image, copycmd->srcImage);
-   LVP_FROM_HANDLE(lvp_image, dst_image, copycmd->dstImage);
+   VK_FROM_HANDLE(lvp_image, src_image, copycmd->srcImage);
+   VK_FROM_HANDLE(lvp_image, dst_image, copycmd->dstImage);
 
    for (uint32_t i = 0; i < copycmd->regionCount; i++) {
       const VkImageCopy2 *region = &copycmd->pRegions[i];
@@ -2406,7 +2406,7 @@ static void handle_copy_image(struct vk_cmd_queue_entry *cmd,
                                              PIPE_MAP_WRITE,
                                              &dst_box,
                                              &dst_t);
-         copy_depth_box(dst_data, dst_format,
+         lvp_image_copy_depth_box(dst_data, dst_format,
                         dst_t->stride, dst_t->layer_stride,
                         0, 0, 0,
                         region->extent.width,
@@ -2430,6 +2430,24 @@ static void handle_copy_image(struct vk_cmd_queue_entry *cmd,
    }
 }
 
+static void handle_copy_memory_indirect(struct vk_cmd_queue_entry *cmd,
+                                        struct rendering_state *state)
+{
+   const VkCopyMemoryIndirectInfoKHR *copycmd = cmd->u.copy_memory_indirect_khr.copy_memory_indirect_info;
+
+   for (uint32_t i = 0; i < copycmd->copyCount; i++) {
+      uint8_t *ptr = (void*)(uintptr_t)copycmd->copyAddressRange.address;
+      VkCopyMemoryIndirectCommandKHR *copy = (void*)(ptr + i * copycmd->copyAddressRange.stride);
+      void *src = (void*)(uintptr_t)copy->srcAddress;
+      void *dst = (void*)(uintptr_t)copy->dstAddress;
+      /* Techincally apps passing in size of zero still need valid pointers,
+       * but in case they don't (which is easy to do) we don't want undefined behavior (or crash) in memcpy.
+       */
+      if (copy->size != 0)
+         memcpy(dst, src, copycmd->copyAddressRange.size);
+   }
+}
+
 static void handle_copy_buffer(struct vk_cmd_queue_entry *cmd,
                                struct rendering_state *state)
 {
@@ -2449,8 +2467,8 @@ static void handle_blit_image(struct vk_cmd_queue_entry *cmd,
                               struct rendering_state *state)
 {
    VkBlitImageInfo2 *blitcmd = cmd->u.blit_image2.blit_image_info;
-   LVP_FROM_HANDLE(lvp_image, src_image, blitcmd->srcImage);
-   LVP_FROM_HANDLE(lvp_image, dst_image, blitcmd->dstImage);
+   VK_FROM_HANDLE(lvp_image, src_image, blitcmd->srcImage);
+   VK_FROM_HANDLE(lvp_image, dst_image, blitcmd->dstImage);
 
    struct pipe_blit_info info = {
       .src.resource = src_image->planes[0].bo,
@@ -2777,7 +2795,7 @@ static void handle_execute_commands(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state, bool print_cmds)
 {
    for (unsigned i = 0; i < cmd->u.execute_commands.command_buffer_count; i++) {
-      LVP_FROM_HANDLE(lvp_cmd_buffer, secondary_buf, cmd->u.execute_commands.command_buffers[i]);
+      VK_FROM_HANDLE(lvp_cmd_buffer, secondary_buf, cmd->u.execute_commands.command_buffers[i]);
       lvp_execute_cmd_buffer(&secondary_buf->vk.cmd_queue.cmds, state, print_cmds);
    }
 }
@@ -2785,16 +2803,10 @@ static void handle_execute_commands(struct vk_cmd_queue_entry *cmd,
 static void handle_event_set2(struct vk_cmd_queue_entry *cmd,
                              struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_event, event, cmd->u.set_event2.event);
+   VK_FROM_HANDLE(lvp_event, event, cmd->u.set_event2.event);
 
-   VkPipelineStageFlags2 src_stage_mask = 0;
-
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->memoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pMemoryBarriers[i].srcStageMask;
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->bufferMemoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pBufferMemoryBarriers[i].srcStageMask;
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->imageMemoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pImageMemoryBarriers[i].srcStageMask;
+   VkPipelineStageFlags2 src_stage_mask =
+      vk_collect_dependency_info_src_stages(cmd->u.set_event2.dependency_info);
 
    if (src_stage_mask & VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT)
       state->pctx->flush(state->pctx, NULL, 0);
@@ -2804,7 +2816,7 @@ static void handle_event_set2(struct vk_cmd_queue_entry *cmd,
 static void handle_event_reset2(struct vk_cmd_queue_entry *cmd,
                                struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_event, event, cmd->u.reset_event2.event);
+   VK_FROM_HANDLE(lvp_event, event, cmd->u.reset_event2.event);
 
    if (cmd->u.reset_event2.stage_mask == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
       state->pctx->flush(state->pctx, NULL, 0);
@@ -2816,7 +2828,7 @@ static void handle_wait_events2(struct vk_cmd_queue_entry *cmd,
 {
    finish_fence(state);
    for (unsigned i = 0; i < cmd->u.wait_events2.event_count; i++) {
-      LVP_FROM_HANDLE(lvp_event, event, cmd->u.wait_events2.events[i]);
+      VK_FROM_HANDLE(lvp_event, event, cmd->u.wait_events2.events[i]);
 
       while (event->event_storage != true);
    }
@@ -2832,10 +2844,10 @@ static void handle_begin_query(struct vk_cmd_queue_entry *cmd,
                                struct rendering_state *state)
 {
    struct vk_cmd_begin_query *qcmd = &cmd->u.begin_query;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
-   if (pool->type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
-       pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+       pool->vk.pipeline_statistics & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
       emit_compute_state(state);
 
    emit_state(state);
@@ -2858,7 +2870,7 @@ static void handle_end_query(struct vk_cmd_queue_entry *cmd,
                              struct rendering_state *state)
 {
    struct vk_cmd_end_query *qcmd = &cmd->u.end_query;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
    assert(pool->queries[qcmd->query]);
 
    state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -2869,10 +2881,10 @@ static void handle_begin_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
                                            struct rendering_state *state)
 {
    struct vk_cmd_begin_query_indexed_ext *qcmd = &cmd->u.begin_query_indexed_ext;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
-   if (pool->type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
-       pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+       pool->vk.pipeline_statistics & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
       emit_compute_state(state);
 
    emit_state(state);
@@ -2895,7 +2907,7 @@ static void handle_end_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
                                          struct rendering_state *state)
 {
    struct vk_cmd_end_query_indexed_ext *qcmd = &cmd->u.end_query_indexed_ext;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
    assert(pool->queries[qcmd->query]);
 
    state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -2905,7 +2917,7 @@ static void handle_reset_query_pool(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
    struct vk_cmd_reset_query_pool *qcmd = &cmd->u.reset_query_pool;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
    if (pool->base_type >= PIPE_QUERY_TYPES)
       return;
@@ -2922,7 +2934,7 @@ static void handle_write_timestamp2(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
    struct vk_cmd_write_timestamp2 *qcmd = &cmd->u.write_timestamp2;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
    if (!(qcmd->stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT))
       state->pctx->flush(state->pctx, NULL, 0);
@@ -2941,7 +2953,7 @@ static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
                                            struct rendering_state *state)
 {
    struct vk_cmd_copy_query_pool_results *copycmd = &cmd->u.copy_query_pool_results;
-   LVP_FROM_HANDLE(lvp_query_pool, pool, copycmd->query_pool);
+   VK_FROM_HANDLE(lvp_query_pool, pool, copycmd->query_pool);
    enum pipe_query_flags flags = (copycmd->flags & VK_QUERY_RESULT_WAIT_BIT) ? PIPE_QUERY_WAIT : 0;
 
    if (copycmd->flags & VK_QUERY_RESULT_PARTIAL_BIT)
@@ -2977,10 +2989,10 @@ static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
       if (pool->queries[i]) {
          unsigned num_results = 0;
          if (copycmd->flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-            if (pool->type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
-               num_results = util_bitcount(pool->pipeline_stats);
+            if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+               num_results = util_bitcount(pool->vk.pipeline_statistics);
             } else
-               num_results = pool-> type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2 : 1;
+               num_results = pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2 : 1;
             state->pctx->get_query_result_resource(state->pctx,
                                                    pool->queries[i],
                                                    flags,
@@ -2989,9 +3001,9 @@ static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
                                                    lvp_buffer_from_handle(copycmd->dst_buffer)->bo,
                                                    offset + num_results * result_size);
          }
-         if (pool->type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+         if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
             num_results = 0;
-            u_foreach_bit(bit, pool->pipeline_stats)
+            u_foreach_bit(bit, pool->vk.pipeline_statistics)
                state->pctx->get_query_result_resource(state->pctx,
                                                       pool->queries[i],
                                                       flags,
@@ -3033,7 +3045,7 @@ static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
 static void handle_clear_color_image(struct vk_cmd_queue_entry *cmd,
                                      struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_image, image, cmd->u.clear_color_image.image);
+   VK_FROM_HANDLE(lvp_image, image, cmd->u.clear_color_image.image);
 
    enum pipe_format format = image->planes[0].bo->format;
    const struct util_format_description *desc = util_format_description(format);
@@ -3075,7 +3087,7 @@ static void handle_clear_color_image(struct vk_cmd_queue_entry *cmd,
 static void handle_clear_ds_image(struct vk_cmd_queue_entry *cmd,
                                   struct rendering_state *state)
 {
-   LVP_FROM_HANDLE(lvp_image, image, cmd->u.clear_depth_stencil_image.image);
+   VK_FROM_HANDLE(lvp_image, image, cmd->u.clear_depth_stencil_image.image);
    for (unsigned i = 0; i < cmd->u.clear_depth_stencil_image.range_count; i++) {
       VkImageSubresourceRange *range = &cmd->u.clear_depth_stencil_image.ranges[i];
       uint32_t ds_clear_flags = 0;
@@ -3086,7 +3098,7 @@ static void handle_clear_ds_image(struct vk_cmd_queue_entry *cmd,
 
       uint32_t level_count = vk_image_subresource_level_count(&image->vk, range);
       for (unsigned j = 0; j < level_count; j++) {
-         struct pipe_surface *surf;
+         struct pipe_surface surf;
          unsigned width, height, depth;
          width = u_minify(image->planes[0].bo->width0, range->baseMipLevel + j);
          height = u_minify(image->planes[0].bo->height0, range->baseMipLevel + j);
@@ -3102,13 +3114,12 @@ static void handle_clear_ds_image(struct vk_cmd_queue_entry *cmd,
                                       0, depth, j);
 
          state->pctx->clear_depth_stencil(state->pctx,
-                                          surf,
+                                          &surf,
                                           ds_clear_flags,
                                           cmd->u.clear_depth_stencil_image.depth_stencil->depth,
                                           cmd->u.clear_depth_stencil_image.depth_stencil->stencil,
                                           0, 0,
                                           width, height, false);
-         state->pctx->surface_destroy(state->pctx, surf);
       }
    }
 }
@@ -3172,8 +3183,8 @@ static void handle_resolve_image(struct vk_cmd_queue_entry *cmd,
                                  struct rendering_state *state)
 {
    VkResolveImageInfo2 *resolvecmd = cmd->u.resolve_image2.resolve_image_info;
-   LVP_FROM_HANDLE(lvp_image, src_image, resolvecmd->srcImage);
-   LVP_FROM_HANDLE(lvp_image, dst_image, resolvecmd->dstImage);
+   VK_FROM_HANDLE(lvp_image, src_image, resolvecmd->srcImage);
+   VK_FROM_HANDLE(lvp_image, dst_image, resolvecmd->dstImage);
 
    struct pipe_blit_info info = {0};
    info.src.resource = src_image->planes[0].bo;
@@ -3251,13 +3262,13 @@ static void handle_push_descriptor_set(struct vk_cmd_queue_entry *cmd,
                                        struct rendering_state *state)
 {
    VkPushDescriptorSetInfoKHR *pds = cmd->u.push_descriptor_set2.push_descriptor_set_info;
-   LVP_FROM_HANDLE(lvp_pipeline_layout, layout, pds->layout);
+   VK_FROM_HANDLE(lvp_pipeline_layout, layout, pds->layout);
    struct lvp_descriptor_set_layout *set_layout = (struct lvp_descriptor_set_layout *)layout->vk.set_layouts[pds->set];
 
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, set_layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    uint32_t types = lvp_pipeline_types_from_shader_stages(pds->stageFlags);
    u_foreach_bit(pipeline_type, types) {
@@ -3288,14 +3299,14 @@ static void handle_push_descriptor_set_with_template(struct vk_cmd_queue_entry *
                                                      struct rendering_state *state)
 {
    VkPushDescriptorSetWithTemplateInfoKHR *pds = cmd->u.push_descriptor_set_with_template2.push_descriptor_set_with_template_info;
-   LVP_FROM_HANDLE(vk_descriptor_update_template, templ, pds->descriptorUpdateTemplate);
-   LVP_FROM_HANDLE(lvp_pipeline_layout, layout, pds->layout);
+   VK_FROM_HANDLE(vk_descriptor_update_template, templ, pds->descriptorUpdateTemplate);
+   VK_FROM_HANDLE(lvp_pipeline_layout, layout, pds->layout);
    struct lvp_descriptor_set_layout *set_layout = (struct lvp_descriptor_set_layout *)layout->vk.set_layouts[pds->set];
 
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, set_layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    struct lvp_descriptor_set *base = state->desc_sets[lvp_pipeline_type_from_bind_point(templ->bind_point)][pds->set];
    if (base)
@@ -3392,6 +3403,7 @@ static void handle_draw_indirect_byte_count(struct vk_cmd_queue_entry *cmd,
                     dibc->counter_buffer_offset,
                     4, &draw.count);
 
+   draw.count -= dibc->counter_offset;
    state->info.start_instance = cmd->u.draw_indirect_byte_count_ext.first_instance;
    state->info.instance_count = cmd->u.draw_indirect_byte_count_ext.instance_count;
    state->info.index_size = 0;
@@ -3400,21 +3412,35 @@ static void handle_draw_indirect_byte_count(struct vk_cmd_queue_entry *cmd,
    state->pctx->draw_vbo(state->pctx, &state->info, 0, NULL, &draw, 1);
 }
 
+static void
+lvp_emit_conditional_rendering(struct rendering_state *state)
+{
+   if (state->conditional_rendering.enabled) {
+      state->pctx->render_condition_mem(
+         state->pctx,
+         state->conditional_rendering.buffer,
+         state->conditional_rendering.offset,
+         state->conditional_rendering.condition);
+   } else {
+      state->pctx->render_condition_mem(state->pctx, NULL, 0, false);
+   }
+}
+
 static void handle_begin_conditional_rendering(struct vk_cmd_queue_entry *cmd,
                                                struct rendering_state *state)
 {
    struct VkConditionalRenderingBeginInfoEXT *bcr = cmd->u.begin_conditional_rendering_ext.conditional_rendering_begin;
-   state->render_cond = true;
-   state->pctx->render_condition_mem(state->pctx,
-                                     lvp_buffer_from_handle(bcr->buffer)->bo,
-                                     bcr->offset,
-                                     bcr->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT);
+   state->conditional_rendering.buffer = lvp_buffer_from_handle(bcr->buffer)->bo;
+   state->conditional_rendering.offset = bcr->offset;
+   state->conditional_rendering.condition = bcr->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+   state->conditional_rendering.enabled = true;
+   lvp_emit_conditional_rendering(state);
 }
 
 static void handle_end_conditional_rendering(struct rendering_state *state)
 {
-   state->render_cond = false;
-   state->pctx->render_condition_mem(state->pctx, NULL, 0, false);
+   state->conditional_rendering.enabled = false;
+   lvp_emit_conditional_rendering(state);
 }
 
 static void handle_set_vertex_input(struct vk_cmd_queue_entry *cmd,
@@ -3479,7 +3505,7 @@ static void handle_set_front_face(struct vk_cmd_queue_entry *cmd,
 static void handle_set_primitive_topology(struct vk_cmd_queue_entry *cmd,
                                           struct rendering_state *state)
 {
-   state->info.mode = vk_conv_topology(cmd->u.set_primitive_topology.primitive_topology);
+   state->info.mode = vk_topology_to_mesa(cmd->u.set_primitive_topology.primitive_topology);
    state->rs_dirty = true;
 }
 
@@ -3679,6 +3705,24 @@ static void handle_set_alpha_to_one(struct vk_cmd_queue_entry *cmd,
       state->rs_state.multisample = true;
 }
 
+static void
+handle_set_sample_locations_enable(struct vk_cmd_queue_entry *cmd,
+                                   struct rendering_state *state)
+{
+   state->sample_locations_dirty |=
+      state->sample_locations_enable != !!cmd->u.set_sample_locations_enable_ext.sample_locations_enable;
+   state->sample_locations_enable = !!cmd->u.set_sample_locations_enable_ext.sample_locations_enable;
+}
+
+static void
+handle_set_sample_locations(struct vk_cmd_queue_entry *cmd,
+                            struct rendering_state *state)
+{
+   const struct VkSampleLocationsInfoEXT *sl_info = cmd->u.set_sample_locations_ext.sample_locations_info;
+   update_samplelocs(state, MIN2(sl_info->sampleLocationsCount, 8), sl_info->pSampleLocations);
+   state->sample_locations_dirty = true;
+}
+
 static void handle_set_halfz(struct vk_cmd_queue_entry *cmd,
                              struct rendering_state *state)
 {
@@ -3781,9 +3825,9 @@ handle_shaders(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
    unsigned new_stages = 0;
    unsigned null_stages = 0;
    for (unsigned i = 0; i < bind->stage_count; i++) {
-      gl_shader_stage stage = vk_to_mesa_shader_stage(bind->stages[i]);
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(bind->stages[i]);
       assert(stage != MESA_SHADER_NONE && stage <= MESA_SHADER_MESH);
-      LVP_FROM_HANDLE(lvp_shader, shader, bind->shaders ? bind->shaders[i] : VK_NULL_HANDLE);
+      VK_FROM_HANDLE(lvp_shader, shader, bind->shaders ? bind->shaders[i] : VK_NULL_HANDLE);
       if (stage == MESA_SHADER_FRAGMENT) {
          if (shader) {
             state->force_min_sample = shader->pipeline_nir->nir->info.fs.uses_sample_shading;
@@ -3857,7 +3901,7 @@ static void handle_draw_mesh_tasks(struct vk_cmd_queue_entry *cmd,
    state->dispatch_info.grid_base[2] = 0;
    state->dispatch_info.draw_count = 1;
    state->dispatch_info.indirect = NULL;
-   state->pctx->draw_mesh_tasks(state->pctx, 0, &state->dispatch_info);
+   state->pctx->draw_mesh_tasks(state->pctx, &state->dispatch_info);
 }
 
 static void handle_draw_mesh_tasks_indirect(struct vk_cmd_queue_entry *cmd,
@@ -3868,7 +3912,7 @@ static void handle_draw_mesh_tasks_indirect(struct vk_cmd_queue_entry *cmd,
    state->dispatch_info.indirect_offset = cmd->u.draw_mesh_tasks_indirect_ext.offset;
    state->dispatch_info.indirect_stride = cmd->u.draw_mesh_tasks_indirect_ext.stride;
    state->dispatch_info.draw_count = cmd->u.draw_mesh_tasks_indirect_ext.draw_count;
-   state->pctx->draw_mesh_tasks(state->pctx, 0, &state->dispatch_info);
+   state->pctx->draw_mesh_tasks(state->pctx, &state->dispatch_info);
 }
 
 static void handle_draw_mesh_tasks_indirect_count(struct vk_cmd_queue_entry *cmd,
@@ -3881,7 +3925,7 @@ static void handle_draw_mesh_tasks_indirect_count(struct vk_cmd_queue_entry *cmd
    state->dispatch_info.draw_count = cmd->u.draw_mesh_tasks_indirect_count_ext.max_draw_count;
    state->dispatch_info.indirect_draw_count_offset = cmd->u.draw_mesh_tasks_indirect_count_ext.count_buffer_offset;
    state->dispatch_info.indirect_draw_count = lvp_buffer_from_handle(cmd->u.draw_mesh_tasks_indirect_count_ext.count_buffer)->bo;
-   state->pctx->draw_mesh_tasks(state->pctx, 0, &state->dispatch_info);
+   state->pctx->draw_mesh_tasks(state->pctx, &state->dispatch_info);
 }
 
 static VkBuffer
@@ -3997,7 +4041,7 @@ process_sequence_ext(struct rendering_state *state,
                cmd->u.bind_index_buffer2.index_type = VK_INDEX_TYPE_UINT16;
                break;
             default:
-               unreachable("unknown DXGI index type!");
+               UNREACHABLE("unknown DXGI index type!");
             }
          }
          cmd->u.bind_index_buffer2.size = data->size;
@@ -4106,7 +4150,7 @@ process_sequence_ext(struct rendering_state *state,
          break;
       }
       default:
-         unreachable("unknown token type");
+         UNREACHABLE("unknown token type");
          break;
       }
       size += lvp_ext_dgc_token_size(elayout, token);
@@ -4268,7 +4312,7 @@ static void
 handle_descriptor_buffer_embedded_samplers(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    const VkBindDescriptorBufferEmbeddedSamplersInfoEXT *bind = cmd->u.bind_descriptor_buffer_embedded_samplers2_ext.bind_descriptor_buffer_embedded_samplers_info;
-   LVP_FROM_HANDLE(lvp_pipeline_layout, layout, bind->layout);
+   VK_FROM_HANDLE(lvp_pipeline_layout, layout, bind->layout);
 
    if (!layout->vk.set_layouts[bind->set])
       return;
@@ -4290,7 +4334,7 @@ handle_descriptor_buffer_offsets(struct vk_cmd_queue_entry *cmd, struct renderin
    uint32_t types = lvp_pipeline_types_from_shader_stages(dbo->stageFlags);
    u_foreach_bit(pipeline_type, types) {
       for (unsigned i = 0; i < dbo->setCount; i++) {
-         LVP_FROM_HANDLE(lvp_pipeline_layout, layout, dbo->layout);
+         VK_FROM_HANDLE(lvp_pipeline_layout, layout, dbo->layout);
          unsigned idx = dbo->firstSet + i;
          state->desc_buffer_offsets[pipeline_type][idx].buffer_index = dbo->pBufferIndices[i];
          state->desc_buffer_offsets[pipeline_type][idx].offset = dbo->pOffsets[i];
@@ -4301,7 +4345,7 @@ handle_descriptor_buffer_offsets(struct vk_cmd_queue_entry *cmd, struct renderin
          } else {
             /* set for all stages */
             u_foreach_bit(stage, set_layout->shader_stages) {
-               gl_shader_stage pstage = vk_to_mesa_shader_stage(1<<stage);
+               mesa_shader_stage pstage = vk_to_mesa_shader_stage(1<<stage);
                handle_set_stage_buffer(state, state->desc_buffers[dbo->pBufferIndices[i]], dbo->pOffsets[i], pstage, idx);
             }
          }
@@ -4311,7 +4355,7 @@ handle_descriptor_buffer_offsets(struct vk_cmd_queue_entry *cmd, struct renderin
 }
 
 static void *
-lvp_push_internal_buffer(struct rendering_state *state, gl_shader_stage stage, uint32_t size)
+lvp_push_internal_buffer(struct rendering_state *state, mesa_shader_stage stage, uint32_t size)
 {
    if (!size)
       return NULL;
@@ -4321,11 +4365,13 @@ lvp_push_internal_buffer(struct rendering_state *state, gl_shader_stage stage, u
    };
 
    uint8_t *mem;
-   u_upload_alloc(state->uploader, 0, size, 64, &buffer.buffer_offset, &buffer.buffer, (void**)&mem);
+   struct pipe_resource *releasebuf = NULL;
+   u_upload_alloc(state->uploader, 0, size, 64, &buffer.buffer_offset, &buffer.buffer, &releasebuf, (void**)&mem);
+   if (releasebuf) {
+      util_dynarray_append(&state->releasebufs, releasebuf);
+   }
 
    state->pctx->set_shader_buffers(state->pctx, stage, 0, 1, &buffer, 0x1);
-
-   util_dynarray_append(&state->internal_buffers, struct pipe_resource *, buffer.buffer);
 
    return mem;
 }
@@ -4436,17 +4482,12 @@ handle_copy_acceleration_structure(struct vk_cmd_queue_entry *cmd, struct render
 {
    struct vk_cmd_copy_acceleration_structure_khr *copy = &cmd->u.copy_acceleration_structure_khr;
 
-   VK_FROM_HANDLE(vk_acceleration_structure, src, copy->info->src);
-   VK_FROM_HANDLE(vk_acceleration_structure, dst, copy->info->dst);
+   VK_FROM_HANDLE(vk_acceleration_structure, src_accel_struct, copy->info->src);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst_accel_struct, copy->info->dst);
 
-   struct pipe_box box = { 0 };
-   u_box_1d(src->offset, MIN2(src->size, dst->size), &box);
-   state->pctx->resource_copy_region(state->pctx,
-                                     lvp_buffer_from_handle(
-                                        vk_buffer_to_handle(dst->buffer))->bo, 0,
-                                     dst->offset, 0, 0,
-                                     lvp_buffer_from_handle(
-                                        vk_buffer_to_handle(src->buffer))->bo, 0, &box);
+   struct lvp_bvh_header *src = (void *)(uintptr_t)vk_acceleration_structure_get_va(src_accel_struct);
+   struct lvp_bvh_header *dst = (void *)(uintptr_t)vk_acceleration_structure_get_va(dst_accel_struct);
+   memcpy(dst, src, src->compacted_size);
 }
 
 static void
@@ -4482,7 +4523,7 @@ handle_copy_acceleration_structure_to_memory(struct vk_cmd_queue_entry *cmd, str
    lvp_device_get_cache_uuid(dst->driver_uuid);
    lvp_device_get_cache_uuid(dst->accel_struct_compat);
    dst->serialization_size = src->serialization_size;
-   dst->compacted_size = accel_struct->size;
+   dst->compacted_size = src->compacted_size;
    dst->instance_count = src->instance_count;
 
    for (uint32_t i = 0; i < src->instance_count; i++) {
@@ -4492,7 +4533,7 @@ handle_copy_acceleration_structure_to_memory(struct vk_cmd_queue_entry *cmd, str
       dst->instances[i] = node[i].bvh_ptr;
    }
 
-   memcpy(&dst->instances[dst->instance_count], src, accel_struct->size);
+   memcpy(&dst->instances[dst->instance_count], src, src->compacted_size);
 }
 
 static void
@@ -4508,31 +4549,33 @@ handle_write_acceleration_structures_properties(struct vk_cmd_queue_entry *cmd, 
    for (uint32_t i = 0; i < write->acceleration_structure_count; i++) {
       VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, write->acceleration_structures[i]);
 
+      struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
+
       switch ((uint32_t)pool->base_type) {
       case LVP_QUERY_ACCELERATION_STRUCTURE_COMPACTED_SIZE:
-         dst[i] = accel_struct->size;
+         dst[i] = header->compacted_size;
          break;
       case LVP_QUERY_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE: {
-         struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
          dst[i] = header->serialization_size;
          break;
       }
       case LVP_QUERY_ACCELERATION_STRUCTURE_SIZE:
-         dst[i] = accel_struct->size;
+         dst[i] = header->compacted_size;
          break;
       case LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT: {
-         struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
          dst[i] = header->instance_count;
          break;
       }
       default:
-         unreachable("Unsupported query type");
+         UNREACHABLE("Unsupported query type");
       }
    }
 }
 
-static void emit_ray_tracing_state(struct rendering_state *state)
+static void
+lvp_trace_rays(struct rendering_state *state, VkTraceRaysIndirectCommand2KHR *command)
 {
+   /* Emit ray tracing state. */
    bool pcbuf_dirty = state->pcbuf_dirty[MESA_SHADER_RAYGEN];
    if (pcbuf_dirty)
       update_pcbuf(state, MESA_SHADER_COMPUTE, MESA_SHADER_RAYGEN);
@@ -4540,7 +4583,7 @@ static void emit_ray_tracing_state(struct rendering_state *state)
    if (state->constbuf_dirty[MESA_SHADER_RAYGEN]) {
       for (unsigned i = 0; i < state->num_const_bufs[MESA_SHADER_RAYGEN]; i++)
          state->pctx->set_constant_buffer(state->pctx, MESA_SHADER_COMPUTE,
-                                          i + 1, false, &state->const_buffer[MESA_SHADER_RAYGEN][i]);
+                                          i + 1, &state->const_buffer[MESA_SHADER_RAYGEN][i]);
       state->constbuf_dirty[MESA_SHADER_RAYGEN] = false;
    }
 
@@ -4549,14 +4592,32 @@ static void emit_ray_tracing_state(struct rendering_state *state)
    state->pcbuf_dirty[MESA_SHADER_COMPUTE] = true;
    state->constbuf_dirty[MESA_SHADER_COMPUTE] = true;
    state->compute_shader_dirty = true;
+
+   /* Dispatch. The spec states that conditional rendering only affects compute dispatches
+    * so ray tracing dispatches have to suspend it.
+    */
+   state->trace_rays_info.grid[0] = DIV_ROUND_UP(command->width, state->trace_rays_info.block[0]);
+   state->trace_rays_info.grid[1] = DIV_ROUND_UP(command->height, state->trace_rays_info.block[1]);
+   state->trace_rays_info.grid[2] = DIV_ROUND_UP(command->depth, state->trace_rays_info.block[2]);
+
+   bool conditional_rendering_enabled = state->conditional_rendering.enabled;
+   if (conditional_rendering_enabled) {
+      state->conditional_rendering.enabled = false;
+      lvp_emit_conditional_rendering(state);
+   }
+
+   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+
+   if (conditional_rendering_enabled) {
+      state->conditional_rendering.enabled = true;
+      lvp_emit_conditional_rendering(state);
+   }
 }
 
 static void
 handle_trace_rays(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_khr *trace = &cmd->u.trace_rays_khr;
-
-   emit_ray_tracing_state(state);
 
    VkTraceRaysIndirectCommand2KHR *command = lvp_push_internal_buffer(
       state, MESA_SHADER_COMPUTE, sizeof(VkTraceRaysIndirectCommand2KHR));
@@ -4578,19 +4639,13 @@ handle_trace_rays(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
       .depth = trace->depth,
    };
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(trace->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(trace->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(trace->depth, state->trace_rays_info.block[2]);
-
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void
 handle_trace_rays_indirect(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_indirect_khr *trace = &cmd->u.trace_rays_indirect_khr;
-
-   emit_ray_tracing_state(state);
 
    size_t indirect_offset;
    VkBuffer _indirect = get_buffer(state, (void *)(uintptr_t)trace->indirect_device_address, &indirect_offset);
@@ -4621,21 +4676,15 @@ handle_trace_rays_indirect(struct vk_cmd_queue_entry *cmd, struct rendering_stat
       .depth = src->depth,
    };
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(src->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(src->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(src->depth, state->trace_rays_info.block[2]);
-
    state->pctx->buffer_unmap(state->pctx, transfer);
 
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void
 handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_trace_rays_indirect2_khr *trace = &cmd->u.trace_rays_indirect2_khr;
-
-   emit_ray_tracing_state(state);
 
    size_t indirect_offset;
    VkBuffer _indirect = get_buffer(state, (void *)(uintptr_t)trace->indirect_device_address, &indirect_offset);
@@ -4650,13 +4699,9 @@ handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_sta
       state, MESA_SHADER_COMPUTE, sizeof(VkTraceRaysIndirectCommand2KHR));
    *command = *src;
 
-   state->trace_rays_info.grid[0] = DIV_ROUND_UP(src->width, state->trace_rays_info.block[0]);
-   state->trace_rays_info.grid[1] = DIV_ROUND_UP(src->height, state->trace_rays_info.block[1]);
-   state->trace_rays_info.grid[2] = DIV_ROUND_UP(src->depth, state->trace_rays_info.block[2]);
-
    state->pctx->buffer_unmap(state->pctx, transfer);
 
-   state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
+   lvp_trace_rays(state, command);
 }
 
 static void
@@ -4784,6 +4829,8 @@ void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
    ENQUEUE_CMD(CmdClearDepthStencilImage)
    ENQUEUE_CMD(CmdClearAttachments)
    ENQUEUE_CMD(CmdResolveImage2)
+   ENQUEUE_CMD(CmdCopyMemoryIndirectKHR)
+   ENQUEUE_CMD(CmdCopyMemoryToImageIndirectKHR)
    ENQUEUE_CMD(CmdBeginQueryIndexedEXT)
    ENQUEUE_CMD(CmdEndQueryIndexedEXT)
    ENQUEUE_CMD(CmdBeginQuery)
@@ -4818,7 +4865,7 @@ void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
    ENQUEUE_CMD(CmdSetRasterizerDiscardEnable)
    ENQUEUE_CMD(CmdSetColorWriteEnableEXT)
    ENQUEUE_CMD(CmdBeginRendering)
-   ENQUEUE_CMD(CmdEndRendering)
+   ENQUEUE_CMD(CmdEndRendering2KHR)
    ENQUEUE_CMD(CmdSetDeviceMask)
    ENQUEUE_CMD(CmdPipelineBarrier2)
    ENQUEUE_CMD(CmdResetEvent2)
@@ -4892,6 +4939,11 @@ void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
    ENQUEUE_CMD(CmdTraceRaysIndirect2KHR)
    ENQUEUE_CMD(CmdTraceRaysIndirectKHR)
    ENQUEUE_CMD(CmdTraceRaysKHR)
+
+   ENQUEUE_CMD(CmdSetDepthBias2EXT)
+
+   ENQUEUE_CMD(CmdSetSampleLocationsEnableEXT)
+   ENQUEUE_CMD(CmdSetSampleLocationsEXT)
 
 #undef ENQUEUE_CMD
 }
@@ -5160,7 +5212,7 @@ static void lvp_execute_cmd_buffer(struct list_head *cmds,
       case VK_CMD_BEGIN_RENDERING:
          handle_begin_rendering(cmd, state);
          break;
-      case VK_CMD_END_RENDERING:
+      case VK_CMD_END_RENDERING2_KHR:
          handle_end_rendering(cmd, state);
          break;
       case VK_CMD_SET_DEVICE_MASK:
@@ -5228,6 +5280,12 @@ static void lvp_execute_cmd_buffer(struct list_head *cmds,
          break;
       case VK_CMD_BIND_SHADERS_EXT:
          handle_shaders(cmd, state);
+         break;
+      case VK_CMD_COPY_MEMORY_INDIRECT_KHR:
+         handle_copy_memory_indirect(cmd, state);
+         break;
+      case VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_KHR:
+         handle_copy_memory_to_image_indirect(cmd, state);
          break;
       case VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT:
          break;
@@ -5300,9 +5358,18 @@ static void lvp_execute_cmd_buffer(struct list_head *cmds,
       case VK_CMD_TRACE_RAYS_KHR:
          handle_trace_rays(cmd, state);
          break;
+      case VK_CMD_SET_DEPTH_BIAS2_EXT:
+         handle_set_depth_bias2(cmd, state);
+         break;
+      case VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT:
+         handle_set_sample_locations_enable(cmd, state);
+         break;
+      case VK_CMD_SET_SAMPLE_LOCATIONS_EXT:
+         handle_set_sample_locations(cmd, state);
+         break;
       default:
          fprintf(stderr, "Unsupported command %s\n", vk_cmd_queue_type_names[cmd->type]);
-         unreachable("Unsupported command");
+         UNREACHABLE("Unsupported command");
          break;
       }
       did_flush = false;
@@ -5325,14 +5392,15 @@ VkResult lvp_execute_cmds(struct lvp_device *device,
    state->dsa_dirty = true;
    state->rs_dirty = true;
    state->vp_dirty = true;
+   state->sample_locations_dirty = true;
    state->rs_state.point_line_tri_clip = true;
    state->rs_state.unclamped_fragment_depth_values = device->vk.enabled_extensions.EXT_depth_range_unrestricted;
    state->sample_mask_dirty = true;
    state->min_samples_dirty = true;
    state->sample_mask = UINT32_MAX;
    state->poison_mem = device->poison_mem;
-   util_dynarray_init(&state->push_desc_sets, NULL);
-   util_dynarray_init(&state->internal_buffers, NULL);
+   state->push_desc_sets = UTIL_DYNARRAY_INIT;
+   state->releasebufs = UTIL_DYNARRAY_INIT;
 
    /* default values */
    state->min_sample_shading = 1;
@@ -5370,12 +5438,13 @@ VkResult lvp_execute_cmds(struct lvp_device *device,
    util_dynarray_foreach (&state->push_desc_sets, struct lvp_descriptor_set *, set)
       lvp_descriptor_set_destroy(device, *set);
 
+   struct pipe_resource **pres = state->releasebufs.data;
+   unsigned count = util_dynarray_num_elements(&state->releasebufs, struct pipe_resource*);
+   for (unsigned j = 0; j < count; j++)
+      pipe_resource_release(state->pctx, pres[j]);
+
    util_dynarray_fini(&state->push_desc_sets);
-
-   util_dynarray_foreach (&state->internal_buffers, struct pipe_resource *, buffer)
-      pipe_resource_reference(buffer, NULL);
-
-   util_dynarray_fini(&state->internal_buffers);
+   util_dynarray_fini(&state->releasebufs);
 
    for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); i++)
       pipe_resource_reference(&state->desc_buffers[i], NULL);

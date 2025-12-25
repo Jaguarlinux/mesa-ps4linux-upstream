@@ -71,9 +71,11 @@ static const struct debug_control_bitset debug_control[] = {
    OPT1("blorp",             DEBUG_BLORP),
    OPT1("nodualobj",         DEBUG_NO_DUAL_OBJECT_GS),
    OPT1("optimizer",         DEBUG_OPTIMIZER),
+   OPT1("mda",               DEBUG_MDA),
    OPT1("ann",               DEBUG_ANNOTATION),
    OPT1("no8",               DEBUG_NO8),
    OPT1("no-oaconfig",       DEBUG_NO_OACONFIG),
+   OPT1("no-fill-opt",       DEBUG_NO_FILL_OPT),
    OPT1("spill_fs",          DEBUG_SPILL_FS),
    OPT1("spill_vec4",        DEBUG_SPILL_VEC4),
    OPT1("cs",                DEBUG_CS),
@@ -87,6 +89,7 @@ static const struct debug_control_bitset debug_control[] = {
    OPT1("do32",              DEBUG_DO32),
    OPT1("norbc",             DEBUG_NO_CCS),
    OPT1("noccs",             DEBUG_NO_CCS),
+   OPT1("noccs-modifier",    DEBUG_NO_CCS_MODIFIER),
    OPT1("nohiz",             DEBUG_NO_HIZ),
    OPT1("color",             DEBUG_COLOR),
    OPT1("reemit",            DEBUG_REEMIT),
@@ -108,6 +111,7 @@ static const struct debug_control_bitset debug_control[] = {
    OPT1("task",              DEBUG_TASK),
    OPT1("mesh",              DEBUG_MESH),
    OPT1("stall",             DEBUG_STALL),
+   OPT1("no-resource-barrier", DEBUG_NO_RESOURCE_BARRIER),
    OPT1("capture-all",       DEBUG_CAPTURE_ALL),
    OPT1("perf-symbol-names", DEBUG_PERF_SYMBOL_NAMES),
    OPT1("swsb-stall",        DEBUG_SWSB_STALL),
@@ -115,13 +119,14 @@ static const struct debug_control_bitset debug_control[] = {
    OPT1("isl",               DEBUG_ISL),
    OPT1("sparse",            DEBUG_SPARSE),
    OPT1("draw_bkp",          DEBUG_DRAW_BKP),
+   OPT1("dispatch_bkp",      DEBUG_DISPATCH_BKP),
    OPT1("bat-stats",         DEBUG_BATCH_STATS),
    OPT1("reg-pressure",      DEBUG_REG_PRESSURE),
    OPT1("shader-print",      DEBUG_SHADER_PRINT),
    OPT1("cl-quiet",          DEBUG_CL_QUIET),
    OPT1("no-send-gather",    DEBUG_NO_SEND_GATHER),
+   OPT1("no-vrt",            DEBUG_NO_VRT),
    OPT1("shaders-lineno",    DEBUG_SHADERS_LINENO),
-   OPT1("show_shader_stage", DEBUG_SHOW_SHADER_STAGE),
    { NULL, }
 #undef OPT1
 #undef OPT2
@@ -151,7 +156,7 @@ static const struct debug_control simd_control[] = {
 };
 
 uint64_t
-intel_debug_flag_for_shader_stage(gl_shader_stage stage)
+intel_debug_flag_for_shader_stage(mesa_shader_stage stage)
 {
    uint64_t flags[] = {
       [MESA_SHADER_VERTEX] = DEBUG_VS,
@@ -208,6 +213,10 @@ uint64_t intel_debug_batch_frame_stop = -1;
 
 uint32_t intel_debug_bkp_before_draw_count = 0;
 uint32_t intel_debug_bkp_after_draw_count = 0;
+uint32_t intel_shader_dump_filter = 0;
+
+uint32_t intel_debug_bkp_before_dispatch_count = 0;
+uint32_t intel_debug_bkp_after_dispatch_count = 0;
 
 static void
 parse_debug_bitset(const char *env, const struct debug_control_bitset *tbl)
@@ -247,9 +256,9 @@ static void
 process_intel_debug_variable_once(void)
 {
    BITSET_ZERO(intel_debug);
-   parse_debug_bitset(getenv("INTEL_DEBUG"), debug_control);
+   parse_debug_bitset(os_get_option("INTEL_DEBUG"), debug_control);
 
-   intel_simd = parse_debug_string(getenv("INTEL_SIMD_DEBUG"), simd_control);
+   intel_simd = parse_debug_string(os_get_option("INTEL_SIMD_DEBUG"), simd_control);
    intel_debug_batch_frame_start =
       debug_get_num_option("INTEL_DEBUG_BATCH_FRAME_START", 0);
    intel_debug_batch_frame_stop =
@@ -259,6 +268,14 @@ process_intel_debug_variable_once(void)
       debug_get_num_option("INTEL_DEBUG_BKP_BEFORE_DRAW_COUNT", 0);
    intel_debug_bkp_after_draw_count =
       debug_get_num_option("INTEL_DEBUG_BKP_AFTER_DRAW_COUNT", 0);
+
+   intel_shader_dump_filter =
+      debug_get_num_option("INTEL_SHADER_DUMP_FILTER", 0);
+
+   intel_debug_bkp_before_dispatch_count =
+      debug_get_num_option("INTEL_DEBUG_BKP_BEFORE_DISPATCH_COUNT", 0);
+   intel_debug_bkp_after_dispatch_count =
+      debug_get_num_option("INTEL_DEBUG_BKP_AFTER_DISPATCH_COUNT", 0);
 
    if (!(intel_simd & DEBUG_FS_SIMD))
       intel_simd |=   DEBUG_FS_SIMD;

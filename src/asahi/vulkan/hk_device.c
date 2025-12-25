@@ -19,8 +19,8 @@
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/lib/agx_bo.h"
 #include "asahi/lib/agx_device.h"
-#include "asahi/libagx/geometry.h"
 #include "compiler/nir/nir_builder.h"
+#include "poly/geometry.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/simple_mtx.h"
@@ -32,6 +32,7 @@
 #include "vk_debug_utils.h"
 #include "vk_device.h"
 #include "vk_pipeline_cache.h"
+#include "vk_shader.h"
 
 #include <fcntl.h>
 #include <xf86drm.h>
@@ -59,16 +60,8 @@ hk_upload_rodata(struct hk_device *dev)
    dev->rodata.bo =
       agx_bo_create(&dev->dev, AGX_SAMPLER_LENGTH, 0, 0, "Read only data");
 
-   dev->sparse.write =
-      agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "Sparse write page");
-
-   if (!dev->rodata.bo || !dev->sparse.write)
+   if (!dev->rodata.bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-   /* The contents of sparse.write are undefined, but making them nonzero helps
-    * fuzz for bugs where we incorrectly read from the write section.
-    */
-   memset(agx_bo_map(dev->sparse.write), 0xCA, AIL_PAGESIZE);
 
    uint8_t *map = agx_bo_map(dev->rodata.bo);
    uint32_t offs = 0;
@@ -83,24 +76,6 @@ hk_upload_rodata(struct hk_device *dev)
    agx_pack_txf_sampler((struct agx_sampler_packed *)(map + offs));
    offs += AGX_SAMPLER_LENGTH;
 
-   /* The image heap is allocated on the device prior to the rodata. The heap
-    * lives as long as the device does and has a stable address (requiring
-    * sparse binding to grow dynamically). That means its address is effectively
-    * rodata and can be uploaded now. agx_usc_uniform requires an indirection to
-    * push the heap address, so this takes care of that indirection up front to
-    * cut an alloc/upload at draw time.
-    */
-   offs = align(offs, sizeof(uint64_t));
-   agx_pack(&dev->rodata.image_heap, USC_UNIFORM, cfg) {
-      cfg.start_halfs = HK_IMAGE_HEAP_UNIFORM;
-      cfg.size_halfs = 4;
-      cfg.buffer = dev->rodata.bo->va->addr + offs;
-   }
-
-   uint64_t *image_heap_ptr = (void *)map + offs;
-   *image_heap_ptr = dev->images.bo->va->addr;
-   offs += sizeof(uint64_t);
-
    /* The heap descriptor isn't strictly readonly data, but we only have a
     * single instance of it device-wide and -- after initializing at heap
     * allocate time -- it is read-only from the CPU perspective. The GPU uses it
@@ -111,15 +86,7 @@ hk_upload_rodata(struct hk_device *dev)
     */
    offs = align(offs, sizeof(uint64_t));
    dev->rodata.heap = dev->rodata.bo->va->addr + offs;
-   offs += sizeof(struct agx_heap);
-
-   /* For null storage descriptors, we need to reserve 16 bytes to catch writes.
-    * No particular content is required; we cannot get robustness2 semantics
-    * without more work.
-    */
-   offs = align(offs, 16);
-   dev->rodata.null_sink = dev->rodata.bo->va->addr + offs;
-   offs += 16;
+   offs += sizeof(struct poly_heap);
 
    return VK_SUCCESS;
 }
@@ -295,31 +262,6 @@ hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
    return VK_SUCCESS;
 }
 
-/*
- * To implement nullDescriptor, the descriptor set code will reference
- * preuploaded null descriptors at fixed offsets in the image heap. Here we
- * upload those descriptors, initializing the image heap.
- */
-static void
-hk_upload_null_descriptors(struct hk_device *dev)
-{
-   struct agx_texture_packed null_tex;
-   struct agx_pbe_packed null_pbe;
-   uint32_t offset_tex, offset_pbe;
-
-   agx_set_null_texture(&null_tex);
-   agx_set_null_pbe(&null_pbe, dev->rodata.null_sink);
-
-   hk_descriptor_table_add(dev, &dev->images, &null_tex, sizeof(null_tex),
-                           &offset_tex);
-
-   hk_descriptor_table_add(dev, &dev->images, &null_pbe, sizeof(null_pbe),
-                           &offset_pbe);
-
-   assert((offset_tex * HK_IMAGE_STRIDE) == HK_NULL_TEX_OFFSET && "static");
-   assert((offset_pbe * HK_IMAGE_STRIDE) == HK_NULL_PBE_OFFSET && "static");
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -417,14 +359,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
              dev->dev.user_timestamp_to_ns.den &&
           "user timestamps are in ns");
 
-   result = hk_descriptor_table_init(dev, &dev->images, AGX_TEXTURE_LENGTH,
-                                     1024, 1024 * 1024);
-   if (result != VK_SUCCESS)
-      goto fail_dev;
-
    result = hk_init_sampler_heap(dev, &dev->samplers);
    if (result != VK_SUCCESS)
-      goto fail_images;
+      goto fail_dev;
 
    result = hk_descriptor_table_init(
       dev, &dev->occlusion_queries, sizeof(uint64_t), AGX_MAX_OCCLUSION_QUERIES,
@@ -435,9 +372,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    result = hk_upload_rodata(dev);
    if (result != VK_SUCCESS)
       goto fail_queries;
-
-   /* Depends on rodata */
-   hk_upload_null_descriptors(dev);
 
    /* XXX: error handling, and should this even go on the device? */
    agx_bg_eot_init(&dev->bg_eot, &dev->dev);
@@ -454,10 +388,14 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_internal_shaders;
 
-   result =
-      hk_queue_init(dev, &dev->queue, &pCreateInfo->pQueueCreateInfos[0], 0);
-   if (result != VK_SUCCESS)
-      goto fail_internal_shaders_2;
+   for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+      for (unsigned q = 0; q < pCreateInfo->pQueueCreateInfos[i].queueCount;
+           q++) {
+         result = hk_queue_init(dev, &pCreateInfo->pQueueCreateInfos[i], q);
+         if (result != VK_SUCCESS)
+            goto fail_queues;
+      }
+   }
 
    struct vk_pipeline_cache_create_info cache_info = {
       .weak_ref = true,
@@ -465,7 +403,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
    if (dev->mem_cache == NULL) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      goto fail_queue;
+      goto fail_queues;
    }
 
    result = hk_device_init_meta(dev);
@@ -483,7 +421,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       .robustness = &vk_robustness_disabled,
       .stage = MESA_SHADER_FRAGMENT,
    };
-   hk_compile_shader(dev, &info, NULL, pAllocator, &dev->null_fs);
+   hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &dev->null_fs);
    if (!dev->null_fs) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail_meta;
@@ -497,8 +435,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    agx_scratch_init(&dev->dev, &dev->scratch.cs);
 
    u_rwlock_init(&dev->external_bos.lock);
-   util_dynarray_init(&dev->external_bos.counts, NULL);
-   util_dynarray_init(&dev->external_bos.list, NULL);
+   dev->external_bos.counts = UTIL_DYNARRAY_INIT;
+   dev->external_bos.list = UTIL_DYNARRAY_INIT;
 
    return VK_SUCCESS;
 
@@ -506,23 +444,22 @@ fail_meta:
    hk_device_finish_meta(dev);
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->mem_cache, NULL);
-fail_queue:
-   hk_queue_finish(dev, &dev->queue);
-fail_rodata:
-   agx_bo_unreference(&dev->dev, dev->rodata.bo);
-   agx_bo_unreference(&dev->dev, dev->sparse.write);
-fail_bg_eot:
-   agx_bg_eot_cleanup(&dev->bg_eot);
-fail_internal_shaders_2:
+fail_queues:
+   vk_foreach_queue_safe(iter, &dev->vk) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      hk_queue_finish(dev, queue);
+   }
    hk_destroy_internal_shaders(dev, &dev->kernels, false);
 fail_internal_shaders:
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
+fail_bg_eot:
+   agx_bg_eot_cleanup(&dev->bg_eot);
+fail_rodata:
+   agx_bo_unreference(&dev->dev, dev->rodata.bo);
 fail_queries:
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
 fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
-fail_images:
-   hk_descriptor_table_finish(dev, &dev->images);
 fail_dev:
    agx_close_device(&dev->dev);
 fail_fd:
@@ -551,7 +488,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
 
    vk_pipeline_cache_destroy(dev->mem_cache, NULL);
-   hk_queue_finish(dev, &dev->queue);
+
+   vk_foreach_queue_safe(iter, &dev->vk) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      hk_queue_finish(dev, queue);
+   }
+
    vk_device_finish(&dev->vk);
 
    agx_scratch_fini(&dev->scratch.vs);
@@ -564,10 +506,8 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
-   hk_descriptor_table_finish(dev, &dev->images);
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
-   agx_bo_unreference(&dev->dev, dev->sparse.write);
    agx_bo_unreference(&dev->dev, dev->heap);
    agx_bg_eot_cleanup(&dev->bg_eot);
    agx_close_device(&dev->dev);

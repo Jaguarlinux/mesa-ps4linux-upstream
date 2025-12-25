@@ -124,16 +124,16 @@ libagx_lower_txf_robustness(constant struct agx_texture_packed *ptr,
    return valid ? x : 0xFFF0;
 }
 
-static uint32_t
-calculate_twiddled_coordinates(ushort2 coord, uint16_t tile_w_px,
-                               uint16_t tile_h_px, uint32_t aligned_width_px)
+uint32_t
+libagx_twiddle_coordinates(ushort2 coord, uint16_t tile_w_px,
+                           uint16_t tile_h_px, uint32_t aligned_width_px)
 {
    /* Modulo by the tile width/height to get the offsets within the tile */
    ushort2 tile_mask_vec = (ushort2)(tile_w_px - 1, tile_h_px - 1);
    uint32_t tile_mask = upsample(tile_mask_vec.y, tile_mask_vec.x);
    uint32_t coord_xy = upsample(coord.y, coord.x);
    ushort2 offs_px = as_ushort2(coord_xy & tile_mask);
-   uint32_t offset_within_tile_px = nir_interleave_agx(offs_px.x, offs_px.y);
+   uint32_t offset_within_tile_px = nir_interleave(offs_px.x, offs_px.y);
 
    /* Get the coordinates of the corner of the tile */
    ushort2 tile_px = as_ushort2(coord_xy & ~tile_mask);
@@ -183,9 +183,9 @@ libagx_image_texel_address(constant const struct agx_pbe_packed *ptr,
          aligned_width_px = align(width_px, d.tile_width_sw);
       }
 
-      total_px = calculate_twiddled_coordinates(
-         convert_ushort2(coord.xy), d.tile_width_sw, d.tile_height_sw,
-         aligned_width_px);
+      total_px =
+         libagx_twiddle_coordinates(convert_ushort2(coord.xy), d.tile_width_sw,
+                                    d.tile_height_sw, aligned_width_px);
    }
 
    uint samples_log2 = is_msaa ? d.sample_count_log2_sw : 0;

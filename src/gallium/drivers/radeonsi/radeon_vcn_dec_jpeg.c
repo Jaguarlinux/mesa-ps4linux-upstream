@@ -28,7 +28,7 @@ static struct pb_buffer_lean *radeon_jpeg_get_decode_param(struct radeon_decoder
    struct si_texture *chroma, *chromav;
 
    dec->jpg.bsd_size = align(dec->bs_size, 128);
-   dec->jpg.dt_luma_top_offset = luma->surface.u.gfx9.surf_offset;
+   dec->jpg.dt_luma_top_offset = luma->surface.u.gfx9.surf_offset | (luma->surface.tile_swizzle << 8);
    dec->jpg.dt_chroma_top_offset = 0;
    dec->jpg.dt_chromav_top_offset = 0;
    dec->jpg.dt_swizzle_mode = luma->surface.u.gfx9.swizzle_mode;
@@ -80,12 +80,14 @@ static struct pb_buffer_lean *radeon_jpeg_get_decode_param(struct radeon_decoder
          chromav = (struct si_texture *)((struct vl_video_buffer *)target)->resources[2];
          dec->jpg.dt_chromav_top_offset = chromav->surface.u.gfx9.surf_offset;
          chroma = (struct si_texture *)((struct vl_video_buffer*)target)->resources[1];
-         dec->jpg.dt_chroma_top_offset = chroma->surface.u.gfx9.surf_offset;
+         dec->jpg.dt_chroma_top_offset =
+            chroma->surface.u.gfx9.surf_offset | (chroma->surface.tile_swizzle << 8);
          dec->jpg.dt_uv_pitch = chroma->surface.u.gfx9.surf_pitch * chroma->surface.bpe;
          break;
       case PIPE_FORMAT_NV12:
          chroma = (struct si_texture *)((struct vl_video_buffer*)target)->resources[1];
-         dec->jpg.dt_chroma_top_offset = chroma->surface.u.gfx9.surf_offset;
+         dec->jpg.dt_chroma_top_offset =
+            chroma->surface.u.gfx9.surf_offset | (chroma->surface.tile_swizzle << 8);
          dec->jpg.dt_uv_pitch = chroma->surface.u.gfx9.surf_pitch * chroma->surface.bpe;
          break;
       case PIPE_FORMAT_YUYV:
@@ -412,21 +414,21 @@ bool send_cmd_jpeg(struct radeon_decoder *dec, struct pipe_video_buffer *target,
                    struct pipe_picture_desc *picture)
 {
    struct pb_buffer_lean *dt;
-   struct rvid_buffer *bs_buf;
+   struct si_resource *bs_buf;
 
-   bs_buf = &dec->bs_buffers[dec->cur_buffer];
+   bs_buf = dec->bs_buffers[dec->cur_buffer];
 
    memset(dec->bs_ptr, 0, align(dec->bs_size, 128) - dec->bs_size);
-   dec->ws->buffer_unmap(dec->ws, bs_buf->res->buf);
+   dec->ws->buffer_unmap(dec->ws, bs_buf->buf);
    dec->bs_ptr = NULL;
 
    dt = radeon_jpeg_get_decode_param(dec, target, picture);
 
    if (dec->jpg_reg.version == RDECODE_JPEG_REG_VER_V1) {
-      send_cmd_bitstream(dec, bs_buf->res->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
+      send_cmd_bitstream(dec, bs_buf->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
       send_cmd_target(dec, dt, 0, RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM);
    } else {
-      send_cmd_bitstream_direct(dec, bs_buf->res->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
+      send_cmd_bitstream_direct(dec, bs_buf->buf, 0, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
       send_cmd_target_direct(dec, dt, 0, RADEON_USAGE_WRITE, RADEON_DOMAIN_VRAM, target->buffer_format);
    }
 

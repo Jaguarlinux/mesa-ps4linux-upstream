@@ -20,6 +20,7 @@ extern "C" {
 #define AMD_MAX_WGP        60
 
 struct amdgpu_gpu_info;
+struct drm_amdgpu_info_device;
 
 struct amd_ip_info {
    uint8_t ver_major;
@@ -31,12 +32,49 @@ struct amd_ip_info {
    uint32_t ib_pad_dw_mask;
 };
 
+struct ac_cu_info {
+   uint32_t max_waves_per_simd;
+   uint32_t num_physical_sgprs_per_simd;
+   uint32_t num_physical_wave64_vgprs_per_simd;
+   uint32_t num_simd_per_compute_unit;
+   uint32_t min_sgpr_alloc;
+   uint32_t max_sgpr_alloc;
+   uint32_t sgpr_alloc_granularity;
+   uint32_t min_wave64_vgpr_alloc;
+   uint32_t max_vgpr_alloc;
+   uint32_t wave64_vgpr_alloc_granularity;
+
+   /* Flags */
+   bool has_lds_bank_count_16 : 1;
+   bool has_sram_ecc_enabled : 1;
+   /* Whether image_sample* instructions can be either a sampler or no-sampler access.*/
+   bool has_point_sample_accel : 1;
+   bool has_fast_fma32 : 1;
+   /* Whether chips support fused v_fma_mix* instructions.
+    * Otherwise, unfused v_mad_mix* is available on GFX9.
+    */
+   bool has_fma_mix : 1;
+   /* Whether chips support unfused multiply-add instructions. */
+   bool has_mad32 : 1;
+   /* Whether chips support double rate packed math instructions. */
+   bool has_packed_math_16bit : 1;
+   /* Whether chips support dot product instructions. A subset of these support a smaller
+    * instruction encoding which accumulates with the destination.
+    */
+   bool has_accelerated_dot_product : 1;
+   /* Device supports hardware-accelerated raytracing using
+    * image_bvh*_intersect_ray instructions
+    */
+   bool has_image_bvh_intersect_ray : 1;
+   /* Some GFX6 GPUs have a bug where it only looks at the x writemask component. */
+   bool has_gfx6_mrt_export_bug : 1;
+   /* Pre-GFX9: A bug where the alpha component of 10_10_10_2 formats is always unsigned.*/
+   bool has_vtx_format_alpha_adjust_bug : 1;
+};
+
 struct radeon_info {
    /* Device info. */
-   const char *name;
-   char lowercase_name[32];
-   const char *marketing_name;
-   char dev_filename[32];
+   char marketing_name[64];
    uint32_t num_se;           /* only enabled SEs */
    uint32_t num_rb;           /* only enabled RBs */
    uint32_t num_cu;           /* only enabled CUs */
@@ -80,7 +118,6 @@ struct radeon_info {
 
    /* Flags. */
    bool family_overridden; /* AMD_FORCE_FAMILY was used, skip command submission */
-   bool is_pro_graphics;
    bool has_graphics; /* false if the chip is compute-only */
    bool has_clear_state;
    bool has_distributed_tess;
@@ -91,15 +128,15 @@ struct radeon_info {
    bool rbplus_allowed; /* if RB+ is allowed */
    bool has_load_ctx_reg_pkt;
    bool has_out_of_order_rast;
-   bool has_packed_math_16bit;
-   bool has_accelerated_dot_product;
    bool cpdma_prefetch_writes_memory;
    bool has_gfx9_scissor_bug;
-   bool has_tc_compat_zrange_bug;
+   bool has_htile_stencil_mipmap_bug;
+   bool has_htile_tc_z_clear_bug_without_stencil;
+   bool has_htile_tc_z_clear_bug_with_stencil;
    bool has_small_prim_filter_sample_loc_bug;
    bool has_ls_vgpr_init_bug;
    bool has_pops_missed_overlap_bug;
-   bool has_null_index_buffer_clamping_bug;
+   bool has_cb_lt16bit_int_clamp_bug;
    bool has_zero_index_buffer_bug;
    bool has_image_load_dcc_bug;
    bool has_two_planes_iterate256_bug;
@@ -120,6 +157,7 @@ struct radeon_info {
    bool has_ngg_passthru_no_msg;
    bool has_export_conflict_bug;
    bool has_attr_ring_wait_bug;
+   bool cp_dma_supports_sparse;
    bool has_vrs_ds_export_bug;
    bool has_taskmesh_indirect0_bug;
    bool sdma_supports_sparse;      /* Whether SDMA can safely access sparse resources. */
@@ -154,6 +192,8 @@ struct radeon_info {
     * AnisoPoint is treated as Point.
     */
    bool conformant_trunc_coord;
+   /* Support GS_FAST_LAUNCH(2) for mesh shaders. */
+   bool mesh_fast_launch_2;
 
    /* Display features. */
    /* There are 2 display DCC codepaths, because display expects unaligned DCC. */
@@ -176,6 +216,7 @@ struct radeon_info {
    uint32_t address32_hi;
    bool has_dedicated_vram;
    bool all_vram_visible;
+   uint64_t virtual_address_max;
    bool has_l2_uncached;
    bool r600_has_virtual_memory;
    uint32_t max_tcc_blocks;
@@ -185,11 +226,10 @@ struct radeon_info {
    bool cp_dma_use_L2;
    unsigned pc_lines;
    uint32_t lds_size_per_workgroup;
-   uint32_t lds_alloc_granularity;
-   uint32_t lds_encode_granularity;
 
    /* CP info. */
    bool gfx_ib_pad_with_type2;
+   bool can_chain_ib2;
    bool has_cp_dma;
    uint32_t me_fw_version;
    uint32_t me_fw_feature;
@@ -205,6 +245,7 @@ struct radeon_info {
    uint32_t vcn_dec_version;
    uint32_t vcn_enc_major_version;
    uint32_t vcn_enc_minor_version;
+   uint32_t vcn_fw_revision;
    struct video_caps_info {
       struct video_codec_cap {
          uint32_t valid;
@@ -219,6 +260,7 @@ struct radeon_info {
    enum vcn_version vcn_ip_version;
    enum sdma_version sdma_ip_version;
    enum rt_version rt_ip_version;
+   enum vpe_version vpe_ip_version;
 
    /* Kernel & winsys capabilities. */
    uint32_t drm_major; /* version */
@@ -231,17 +273,24 @@ struct radeon_info {
    bool has_syncobj;
    bool has_timeline_syncobj;
    bool has_fence_to_handle;
-   bool has_local_buffers;
+   bool has_vm_always_valid;
    bool has_bo_metadata;
    bool has_eqaa_surface_allocator;
-   bool has_sparse_vm_mappings;
+   /* Sparse bindings and basic sparse features (2D image, etc.) */
+   bool has_sparse;
+   /* 3D sparse images */
+   bool has_sparse_image_3d;
+   /* 3D sparse images with standard block shape */
+   bool has_sparse_image_standard_3d;
+   /* Mip levels do not need to be aligned to the sparse block size */
+   bool has_sparse_unaligned_mip_size;
    bool has_gang_submit;
    bool has_gpuvm_fault_query;
    bool has_pcie_bandwidth_info;
    bool has_stable_pstate;
    /* Whether SR-IOV is enabled or amdgpu.mcbp=1 was set on the kernel command line. */
-   bool register_shadowing_required;
-   bool has_zerovram_support;
+   bool has_kernelq_reg_shadowing;
+   bool has_default_zerovram_support;
    bool has_tmz_support;
    bool has_trap_handler_support;
    bool kernel_has_modifiers;
@@ -263,6 +312,7 @@ struct radeon_info {
    bool uses_kernel_cu_mask;
 
    /* Shader cores. */
+   struct ac_cu_info cu_info;
    uint16_t cu_mask[AMD_MAX_SE][AMD_MAX_SA_PER_SE];
    uint32_t r600_max_quad_pipes; /* wave size / 16 */
    uint32_t max_good_cu_per_sa;
@@ -270,16 +320,6 @@ struct radeon_info {
    uint32_t max_se;             /* number of shader engines incl. disabled ones */
    uint32_t max_sa_per_se;      /* shader arrays per shader engine */
    uint32_t num_cu_per_sh;
-   uint32_t max_waves_per_simd;
-   uint32_t num_physical_sgprs_per_simd;
-   uint32_t num_physical_wave64_vgprs_per_simd;
-   uint32_t num_simd_per_compute_unit;
-   uint32_t min_sgpr_alloc;
-   uint32_t max_sgpr_alloc;
-   uint32_t sgpr_alloc_granularity;
-   uint32_t min_wave64_vgpr_alloc;
-   uint32_t max_vgpr_alloc;
-   uint32_t wave64_vgpr_alloc_granularity;
    uint32_t scratch_wavesize_granularity_shift;
    uint32_t scratch_wavesize_granularity;
    uint32_t max_scratch_waves;
@@ -330,13 +370,11 @@ struct radeon_info {
       uint32_t shadow_alignment;
       uint32_t csa_size;
       uint32_t csa_alignment;
+      uint32_t eop_size;
+      uint32_t eop_alignment;
+      uint32_t sdma_csa_size;
+      uint32_t sdma_csa_alignment;
    } fw_based_mcbp;
-   bool has_fw_based_shadowing;
-
-   /* Device supports hardware-accelerated raytracing using
-    * image_bvh*_intersect_ray instructions
-    */
-   bool has_image_bvh_intersect_ray;
 };
 
 enum ac_query_gpu_info_result {
@@ -347,11 +385,12 @@ enum ac_query_gpu_info_result {
 
 enum ac_query_gpu_info_result ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
                                                 bool require_pci_bus_info);
+void ac_fill_cu_info(struct radeon_info *info, struct drm_amdgpu_info_device *device_info);
 
 void ac_compute_driver_uuid(char *uuid, size_t size);
 
 void ac_compute_device_uuid(const struct radeon_info *info, char *uuid, size_t size);
-void ac_print_gpu_info(const struct radeon_info *info, FILE *f);
+void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd);
 int ac_get_gs_table_depth(enum amd_gfx_level gfx_level, enum radeon_family family);
 void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_config_p,
                           uint32_t *raster_config_1_p, uint32_t *se_tile_repeat_p);
@@ -404,6 +443,28 @@ void ac_get_task_info(const struct radeon_info *info,
 uint32_t ac_memory_ops_per_clock(uint32_t vram_type);
 
 uint32_t ac_gfx103_get_cu_mask_ps(const struct radeon_info *info);
+
+/* Number of entries in the mesh shader scratch ring.
+ * This depends on VGT_GS_MAX_WAVE_ID which is set by the kernel
+ * and is impossible to query. We leave it on its maximum value
+ * because real applications are unlikely to use it.
+ *
+ * The maximum ID on GFX10.3 is 2047 (0x7ff), so we need 2048 entries.
+ */
+#define AC_MESH_SCRATCH_NUM_ENTRIES 2048
+
+/* Size of each entry in the mesh shader scratch ring.
+ * We must ensure that the absolute maximum mesh shader output fits here.
+ *
+ * Mesh shaders can create up to 256 vertices/primitives per workgroup,
+ * and up to the following amount of outputs:
+ * - 32 parameters
+ * - 4 positions (clip/cull distance, etc.)
+ * - 4 per-primitive built-in outputs (layer, view index, prim id, VRS rate)
+ * - primitive indices which are always kept in LDS
+ * That is a total of 32+4+4=40 output slots x 16 bytes per slot x 256 = 160K bytes.
+ */
+#define AC_MESH_SCRATCH_ENTRY_BYTES (160 * 1024)
 
 #ifdef __cplusplus
 }

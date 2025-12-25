@@ -28,9 +28,7 @@ EPHEMERAL=(
 )
 
 DEPS=(
-    bindgen
     bison
-    cbindgen
     ccache
     clang-devel
     flex
@@ -53,7 +51,6 @@ DEPS=(
     "pkgconfig(libglvnd)"
     "pkgconfig(libva)"
     "pkgconfig(pciaccess)"
-    "pkgconfig(vdpau)"
     "pkgconfig(vulkan)"
     "pkgconfig(x11)"
     "pkgconfig(x11-xcb)"
@@ -81,7 +78,6 @@ DEPS=(
     python3-ply
     python3-pycparser
     python3-yaml
-    rust-packaging
     spirv-tools-devel
     spirv-llvm-translator-devel
     vulkan-headers
@@ -106,6 +102,10 @@ cd $XORGMACROS_VERSION; ./configure; make install; cd ..
 rm -rf $XORGMACROS_VERSION
 
 . .gitlab-ci/container/install-meson.sh
+
+. .gitlab-ci/container/build-rust.sh build
+
+. .gitlab-ci/container/build-bindgen.sh
 
 . .gitlab-ci/container/build-mold.sh
 

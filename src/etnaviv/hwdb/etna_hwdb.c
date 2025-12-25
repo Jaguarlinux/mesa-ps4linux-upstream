@@ -34,10 +34,10 @@ etna_query_feature_db(struct etna_core_info *info)
    if (!db)
       return false;
 
+   etna_core_enable_feature(info, ETNA_FEATURE_CORE_GPU);
+
    if (db->NNCoreCount)
-      info->type = ETNA_CORE_NPU;
-   else
-      info->type = ETNA_CORE_GPU;
+      etna_core_enable_feature(info, ETNA_FEATURE_CORE_NPU);
 
    /* Features: */
    ETNA_FEATURE(REG_FastClear, FAST_CLEAR);
@@ -69,7 +69,7 @@ etna_query_feature_db(struct etna_core_info *info)
    ETNA_FEATURE(REG_SuperTiledTexture, SUPERTILED_TEXTURE);
    ETNA_FEATURE(REG_LogicOp, LOGIC_OP);
    ETNA_FEATURE(REG_Halti1, HALTI1);
-   ETNA_FEATURE(REG_SeamlessCubeMap, SEAMLESS_CUBE_MAP);
+   ETNA_FEATURE(TX_SEAMLESS_CUBE, SEAMLESS_CUBE_MAP);
    ETNA_FEATURE(REG_LineLoop, LINE_LOOP);
    ETNA_FEATURE(REG_TextureTileStatus, TEXTURE_TILED_READ);
    ETNA_FEATURE(REG_BugFixes8, BUG_FIXES8);
@@ -94,6 +94,7 @@ etna_query_feature_db(struct etna_core_info *info)
 
    ETNA_FEATURE(CACHE128B256BPERLINE, CACHE128B256BPERLINE);
    ETNA_FEATURE(NEW_GPIPE, NEW_GPIPE);
+   ETNA_FEATURE(NO_ANISTRO_FILTER, NO_ANISO);
    ETNA_FEATURE(NO_ASTC, NO_ASTC);
    ETNA_FEATURE(V4Compression, V4_COMPRESSION);
 
@@ -108,8 +109,12 @@ etna_query_feature_db(struct etna_core_info *info)
    ETNA_FEATURE(VIP_V7, VIP_V7);
    ETNA_FEATURE(NN_XYDP0, NN_XYDP0);
 
+   ETNA_FEATURE(MSAA_FRAGMENT_OPERATION, MSAA_FRAGMENT_OPERATION);
+   ETNA_FEATURE(REG_RSS8, S8);
+   ETNA_FEATURE(HWTFB, HWTFB);
+
    /* Limits: */
-   if (info->type == ETNA_CORE_GPU) {
+   if (etna_core_has_feature(info, ETNA_FEATURE_CORE_GPU)) {
       info->gpu.max_instructions = db->InstructionCount;
       info->gpu.vertex_output_buffer_size = db->VertexOutputBufferSize;
       info->gpu.vertex_cache_size = db->VertexCacheSize;
@@ -119,7 +124,9 @@ etna_query_feature_db(struct etna_core_info *info)
       info->gpu.pixel_pipes = db->NumPixelPipes;
       info->gpu.max_varyings = db->VaryingCount;
       info->gpu.num_constants = db->NumberOfConstants;
-   } else {
+   }
+
+   if (etna_core_has_feature(info, ETNA_FEATURE_CORE_NPU)) {
       info->npu.nn_core_count = db->NNCoreCount;
       info->npu.nn_mad_per_core = db->NNMadPerCore;
       info->npu.tp_core_count = db->TPEngine_CoreCount;

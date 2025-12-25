@@ -58,16 +58,6 @@ extra_libs_libglx = []
 extra_deps_libgl = []
 extra_ld_args_libgl = []
 
-# dri2
-if with_x11_dri2
-  files_libglx += files(
-    'dri2.c',
-    'dri2_glx.c',
-    'dri2.h',
-    'dri2_priv.h',
-  )
-endif
-
 if with_dri_platform == 'drm'
   files_libglx += files('dri3_glx.c', 'dri3_priv.h')
 endif
@@ -103,7 +93,7 @@ else
   )
 endif
 
-glx_gallium_link = [libpipe_loader_dynamic]
+glx_gallium_link = []
 if with_dri
   glx_gallium_link += libgallium_dri
 endif
@@ -122,7 +112,7 @@ libglx = static_library(
   ],
   dependencies : [
     idep_mesautil, idep_xmlconfig,
-    dep_libdrm, dep_dri2proto, dep_glproto, dep_x11, dep_xext, dep_glvnd, dep_xxf86vm, dep_xshmfence, dep_xfixes,
+    dep_libdrm, dep_glproto, dep_x11, dep_xext, dep_glvnd, dep_xxf86vm, dep_xshmfence,
   ],
 )
 
@@ -137,13 +127,24 @@ libgl = shared_library(
   link_args : [ld_args_bsymbolic, ld_args_gc_sections, extra_ld_args_libgl],
   dependencies : [
     dep_libdrm, dep_dl, dep_m, dep_thread, dep_x11, dep_xcb_glx, dep_xcb,
-    dep_x11_xcb, dep_xcb_dri2, dep_xext, dep_xfixes, dep_xxf86vm,
-    dep_xcb_shm, extra_deps_libgl,
+    dep_x11_xcb, dep_xext, dep_xxf86vm, dep_xcb_shm, extra_deps_libgl,
   ],
   version : gl_lib_version,
   darwin_versions : '4.0.0',
   install : true,
 )
+
+if not with_glvnd
+  pkg.generate(
+    name : 'glx',
+    description : 'Mesa GLX Library',
+    version : meson.project_version(),
+    libraries : libgl,
+    libraries_private : gl_priv_libs,
+    requires_private : gl_priv_reqs,
+    variables : ['glx_tls=yes'],
+  )
+endif
 
 if with_symbols_check
   libgl_symbols_file = with_glvnd ? 'glvnd-symbols.txt' : 'libgl-symbols.txt'

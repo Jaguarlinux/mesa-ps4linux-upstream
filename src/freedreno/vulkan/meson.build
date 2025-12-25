@@ -51,6 +51,32 @@ libtu_files = files(
   'tu_util.cc',
 )
 
+libtu_files += custom_target(
+  'float32_spv.h',
+  input : float32_glsl_file,
+  output : 'float32_spv.h',
+  command : [
+    prog_glslang, '--no-link', '-V', '-S', 'comp', '-x', '-o', '@OUTPUT@', '@INPUT@',
+    glslang_quiet, glslang_depfile,
+  ],
+  depfile : 'float32_spv.h.d',
+)
+
+libtu_files += custom_target(
+  'float64_spv.h',
+  input : [glsl2spirv, float64_glsl_file],
+  output : 'float64_spv.h',
+  command : [
+    prog_python, '@INPUT@', '@OUTPUT@',
+    prog_glslang,
+    '--vn', 'float64_spv_source',
+    '--glsl-version', '450',
+    '-Olib',
+    glslang_depfile,
+  ],
+  depfile : 'float64_spv.h.d',
+)
+
 subdir('bvh')
 
 libtu_includes = [
@@ -61,7 +87,7 @@ libtu_includes = [
 
 tu_link_with = []
 tu_deps = []
-tu_flags = []
+tu_flags = [sse2_args]
 
 tu_wsi = false
 
@@ -81,11 +107,6 @@ endif
 
 if tu_wsi
   libtu_files += 'tu_wsi.cc'
-endif
-
-if with_platform_android
-  libtu_files += files('tu_android.cc')
-  tu_deps += [dep_android]
 endif
 
 if with_xlib_lease
@@ -199,15 +220,18 @@ if with_symbols_check
   )
 endif
 
+icd_file_name = libname_prefix + 'vulkan_freedreno.' + libname_suffix
+
 freedreno_icd = custom_target(
   'freedreno_icd',
   input : [vk_icd_gen, vk_api_xml],
-  output : 'freedreno_icd.@0@.json'.format(host_machine.cpu()),
+  output : 'freedreno_icd.' + vulkan_manifest_suffix,
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
-    '--lib-path', join_paths(get_option('prefix'), get_option('libdir'),
-                             'libvulkan_freedreno.so'),
+    '--sizeof-pointer', sizeof_pointer,
+    '--icd-lib-path', vulkan_icd_lib_path,
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,
@@ -224,12 +248,12 @@ _dev_icd = custom_target(
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
-    '--lib-path', meson.current_build_dir() / 'libvulkan_freedreno.so',
+    '--sizeof-pointer', sizeof_pointer,
+    '--icd-lib-path', meson.current_build_dir(),
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
-# Deprecated: replaced by VK_DRIVER_FILES above
-devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())

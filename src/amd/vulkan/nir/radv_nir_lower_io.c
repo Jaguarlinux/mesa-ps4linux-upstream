@@ -9,6 +9,7 @@
 #include "ac_nir.h"
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_tcs_info.h"
 #include "radv_device.h"
 #include "radv_nir.h"
 #include "radv_physical_device.h"
@@ -21,14 +22,14 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
 }
 
 void
-radv_nir_lower_io_to_scalar_early(nir_shader *nir, nir_variable_mode mask)
+radv_nir_lower_io_vars_to_scalar(nir_shader *nir, nir_variable_mode mask)
 {
    bool progress = false;
 
-   NIR_PASS(progress, nir, nir_lower_io_to_scalar_early, mask);
+   NIR_PASS(progress, nir, nir_lower_io_vars_to_scalar, mask);
    if (progress) {
       /* Optimize the new vector code and then remove dead vars */
-      NIR_PASS(_, nir, nir_copy_prop);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_shrink_vectors, true);
 
       if (mask & nir_var_shader_out) {
@@ -99,7 +100,7 @@ radv_recompute_fs_input_bases_callback(UNUSED nir_builder *b, nir_intrinsic_inst
       new_base = s->num_always_per_vertex + s->num_potentially_per_primitive +
                  util_bitcount64(s->always_per_primitive & location_mask);
    } else {
-      unreachable("invalid FS input");
+      UNREACHABLE("invalid FS input");
    }
 
    if (new_base != old_base) {
@@ -142,10 +143,10 @@ radv_nir_lower_io(struct radv_device *device, nir_shader *nir)
     */
    NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_shader_in | nir_var_shader_out, NULL,
             nir_lower_direct_array_deref_of_vec_load | nir_lower_indirect_array_deref_of_vec_load |
-            nir_lower_direct_array_deref_of_vec_store | nir_lower_indirect_array_deref_of_vec_store);
+               nir_lower_direct_array_deref_of_vec_store | nir_lower_indirect_array_deref_of_vec_store);
 
    if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, nir_vectorize_tess_levels);
+      NIR_PASS(_, nir, nir_lower_tess_level_array_vars_to_vec);
    }
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
@@ -156,10 +157,8 @@ radv_nir_lower_io(struct radv_device *device, nir_shader *nir)
                nir_lower_io_lower_64bit_to_32 | nir_lower_io_use_interpolated_input_intrinsics);
    }
 
-   /* This pass needs actual constants */
+   /* Fold constant offset srcs for IO. */
    NIR_PASS(_, nir, nir_opt_constant_folding);
-
-   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in | nir_var_shader_out);
 
    if (nir->xfb_info) {
       NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
@@ -168,7 +167,7 @@ radv_nir_lower_io(struct radv_device *device, nir_shader *nir)
          /* The total number of shader outputs is required for computing the pervertex LDS size for
           * VS/TES when lowering NGG streamout.
           */
-         nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, nir->info.stage);
+         nir_assign_io_var_locations(nir, nir_var_shader_out);
       }
    }
 
@@ -229,24 +228,33 @@ radv_nir_lower_io_to_mem(struct radv_device *device, struct radv_shader_stage *s
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       if (info->vs.as_ls) {
          NIR_PASS(_, nir, ac_nir_lower_ls_outputs_to_mem, map_output, pdev->info.gfx_level, info->vs.tcs_in_out_eq,
-                    info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
+                  info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
          return true;
       } else if (info->vs.as_es) {
-         NIR_PASS(_, nir, ac_nir_lower_es_outputs_to_mem, map_output, pdev->info.gfx_level, info->esgs_itemsize, info->gs_inputs_read);
+         NIR_PASS(_, nir, ac_nir_lower_es_outputs_to_mem, map_output, pdev->info.gfx_level, info->esgs_itemsize,
+                  info->gs_inputs_read);
          return true;
       }
    } else if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
       NIR_PASS(_, nir, ac_nir_lower_hs_inputs_to_mem, map_input, pdev->info.gfx_level, info->vs.tcs_in_out_eq,
-                 info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
-      NIR_PASS(_, nir, ac_nir_lower_hs_outputs_to_mem, &info->tcs.info, map_output, pdev->info.gfx_level,
-                 info->tcs.tes_inputs_read, info->tcs.tes_patch_inputs_read, info->wave_size);
+               info->vs.tcs_inputs_via_temp, info->vs.tcs_inputs_via_lds);
+
+      nir_tcs_info tcs_info;
+      nir_gather_tcs_info(nir, &tcs_info, nir->info.tess._primitive_mode, nir->info.tess.spacing);
+      ac_nir_tess_io_info tess_io_info;
+      ac_nir_get_tess_io_info(nir, &tcs_info, info->tcs.tes_inputs_read, info->tcs.tes_patch_inputs_read, map_output,
+                              true, &tess_io_info);
+
+      NIR_PASS(_, nir, ac_nir_lower_hs_outputs_to_mem, &tcs_info, &tess_io_info, map_output, pdev->info.gfx_level,
+               info->wave_size);
 
       return true;
    } else if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
       NIR_PASS(_, nir, ac_nir_lower_tes_inputs_to_mem, map_input);
 
       if (info->tes.as_es) {
-         NIR_PASS(_, nir, ac_nir_lower_es_outputs_to_mem, map_output, pdev->info.gfx_level, info->esgs_itemsize, info->gs_inputs_read);
+         NIR_PASS(_, nir, ac_nir_lower_es_outputs_to_mem, map_output, pdev->info.gfx_level, info->esgs_itemsize,
+                  info->gs_inputs_read);
       }
 
       return true;
@@ -254,11 +262,10 @@ radv_nir_lower_io_to_mem(struct radv_device *device, struct radv_shader_stage *s
       NIR_PASS(_, nir, ac_nir_lower_gs_inputs_to_mem, map_input, pdev->info.gfx_level, false);
       return true;
    } else if (nir->info.stage == MESA_SHADER_TASK) {
-      ac_nir_lower_task_outputs_to_mem(nir, pdev->task_info.payload_entry_size, pdev->task_info.num_entries,
-                                       info->cs.has_query);
+      ac_nir_lower_task_outputs_to_mem(nir, info->cs.has_query);
       return true;
    } else if (nir->info.stage == MESA_SHADER_MESH) {
-      ac_nir_lower_mesh_inputs_to_mem(nir, pdev->task_info.payload_entry_size, pdev->task_info.num_entries);
+      ac_nir_lower_mesh_inputs_to_mem(nir);
       return true;
    }
 

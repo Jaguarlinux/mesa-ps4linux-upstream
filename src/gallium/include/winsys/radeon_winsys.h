@@ -24,8 +24,10 @@
 #define RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW                                                   \
    (PIPE_FLUSH_ASYNC | RADEON_FLUSH_START_NEXT_GFX_IB_NOW)
 
+#include "amd/common/ac_cmdbuf.h"
 #include "amd/common/ac_gpu_info.h"
 #include "amd/common/ac_surface.h"
+#include "amd/common/ac_pm4.h"
 #include "pipebuffer/pb_buffer.h"
 
 /* Tiling flags. */
@@ -66,6 +68,7 @@ enum radeon_bo_flag
   RADEON_FLAG_WINSYS_SLAB_BACKING = (1 << 11), /* only used by the winsys */
   RADEON_FLAG_GFX12_ALLOW_DCC = (1 << 12), /* allow DCC, VRAM only */
   RADEON_FLAG_CLEAR_VRAM = (1 << 13),
+  RADEON_FLAG_NO_VMA = (1 << 14), /* frontend assigns addresses */
 };
 
 static inline void
@@ -131,14 +134,6 @@ enum radeon_value_id
    RADEON_CURRENT_SCLK,
    RADEON_CURRENT_MCLK,
    RADEON_CS_THREAD_TIME,
-};
-
-enum radeon_ctx_priority
-{
-   RADEON_CTX_PRIORITY_LOW = 0,
-   RADEON_CTX_PRIORITY_MEDIUM,
-   RADEON_CTX_PRIORITY_HIGH,
-   RADEON_CTX_PRIORITY_REALTIME,
 };
 
 enum radeon_ctx_pstate
@@ -214,18 +209,15 @@ enum radeon_ctx_pstate
 struct winsys_handle;
 struct radeon_winsys_ctx;
 
-struct radeon_cmdbuf_chunk {
-   unsigned cdw;    /* Number of used dwords. */
-   unsigned max_dw; /* Maximum number of dwords. */
-   uint32_t *buf;   /* The base pointer of the chunk. */
-};
-
 struct radeon_cmdbuf {
-   struct radeon_cmdbuf_chunk current;
-   struct radeon_cmdbuf_chunk *prev;
+   struct ac_cmdbuf current;
+   struct ac_cmdbuf *prev;
    uint16_t num_prev; /* Number of previous chunks. */
    uint16_t max_prev; /* Space in array pointed to by prev. */
    unsigned prev_dw;  /* Total number of dwords in previous chunks. */
+
+   struct radeon_cmdbuf *gang_cs;
+   bool gang;
 
    /* Memory usage of the buffer list. These are always 0 for preamble IBs. */
    uint32_t used_vram_kb;
@@ -409,7 +401,7 @@ struct radeon_winsys {
     * \param md        Metadata
     */
    void (*buffer_set_metadata)(struct radeon_winsys *ws, struct pb_buffer_lean *buf,
-                               struct radeon_bo_metadata *md, struct radeon_surf *surf);
+                               struct radeon_bo_metadata *md, const struct radeon_surf *surf);
 
    /**
     * Get a winsys buffer from a winsys handle. The internal structure
@@ -517,6 +509,33 @@ struct radeon_winsys {
     */
    enum radeon_bo_flag (*buffer_get_flags)(struct pb_buffer_lean *buf);
 
+   /**
+    * Query the valid virtual memory range of the device for use with alloc_vm.
+    */
+   void (*va_range)(struct radeon_winsys *rws, uint64_t *start, uint64_t *end);
+
+   /**
+    * Reserves a virtual memory range for use through buffer_assign_vma. Start and size must be
+    * within the limits of va_range otherwise this function will return NULL.
+    */
+   struct pipe_vm_allocation *(*alloc_vm)(struct radeon_winsys *rws, uint64_t start, uint64_t size);
+
+   /**
+    * Frees a virtual memory range reservation.
+    */
+   void (*free_vm)(struct radeon_winsys *rws, struct pipe_vm_allocation *alloc);
+
+   /**
+    * Assigns the given address to buf.
+    *
+    * \param buf        The buffer the address gets assigned to. This buffer must have been created
+    *                   with the RADEON_FLAG_NO_VMA flag.
+    * \param address    Address to be assigned. Needs to be within a range previously reserved
+    *                   through alloc_vm or 0.
+    */
+   bool (*buffer_assign_vma)(struct radeon_winsys *rws, struct pb_buffer_lean *buf,
+                             uint64_t address);
+
    /**************************************************************************
     * Command submission.
     *
@@ -528,13 +547,9 @@ struct radeon_winsys {
     * Create a command submission context.
     * Various command streams can be submitted to the same context.
     *
-    * \param allow_context_lost  If true, lost contexts skip command submission and report
-    *                            the reset status.
-    *                            If false, losing the context results in undefined behavior.
+    * \param flags  PIPE_CONTEXT_* flags (priority, allow losing the context)
     */
-   struct radeon_winsys_ctx *(*ctx_create)(struct radeon_winsys *ws,
-                                           enum radeon_ctx_priority priority,
-                                           bool allow_context_lost);
+   struct radeon_winsys_ctx *(*ctx_create)(struct radeon_winsys *ws, unsigned flags);
 
    /**
     * Destroy a context.
@@ -720,6 +735,8 @@ struct radeon_winsys {
    void (*fence_reference)(struct radeon_winsys *ws, struct pipe_fence_handle **dst,
                            struct pipe_fence_handle *src);
 
+   struct pipe_fence_handle *(*semaphore_create)(struct radeon_winsys *ws);
+
    /**
     * Create a new fence object corresponding to the given syncobj fd.
     */
@@ -755,6 +772,13 @@ struct radeon_winsys {
                        const struct pipe_resource *tex, uint64_t flags,
                        unsigned bpe, enum radeon_surf_mode mode, struct radeon_surf *surf);
 
+   uint64_t (*surface_offset_from_coord)(struct radeon_winsys *rws,
+                                         const struct radeon_info *info,
+                                         const struct radeon_surf *surf,
+                                         const struct pipe_resource *tex,
+                                         unsigned level, unsigned x, unsigned y,
+                                         unsigned layer);
+
    uint64_t (*query_value)(struct radeon_winsys *ws, enum radeon_value_id value);
 
    bool (*read_registers)(struct radeon_winsys *ws, unsigned reg_offset, unsigned num_registers,
@@ -771,10 +795,32 @@ struct radeon_winsys {
    bool (*cs_set_pstate)(struct radeon_cmdbuf *rcs, enum radeon_ctx_pstate state);
 
    /**
-    * Pass the VAs to the buffers where various information is saved by the FW during mcbp.
+    * Submits the preamble IB, which is the IB that initializes immutable registers and states.
+    * This must be the first IB for that queue type, and it affects all current and future contexts.
+    * If the IB has been submitted already, the call is ignored.
     */
-   void (*cs_set_mcbp_reg_shadowing_va)(struct radeon_cmdbuf *rcs, uint64_t regs_va,
-                                                                  uint64_t csa_va);
+   bool (*userq_submit_cs_preamble_ib_once)(struct radeon_cmdbuf *rcs, struct ac_pm4_state *pm4);
+
+   /**
+    * Create and add a compute command stream to existing rcs command stream which will
+    * be combined as a gang submission to GPU.
+    */
+   bool (*cs_create_compute_gang)(struct radeon_cmdbuf *rcs);
+
+   /**
+    * In case of gfx11.5, register shadowing enabling and shadow regs addresses has to be done
+    * using CONTEXT_CONTROL and LOAD_* packets. Also these packets have to be sumitted for every
+    * job.
+    */
+   bool (*userq_f32_init_reg_shadowing)(struct radeon_cmdbuf *rcs, struct ac_pm4_state *pm4);
+
+   /**
+    * Gets the shadow regs va address from the given radeon_cmdbuf. The radeon_cmdbuf will be gfx_cs
+    * and it is per context. In case of userqueue, The shadow regs va address is per userqueue. The
+    * gfx_cs will be for tied to a userqueue and the shadow regs va address returned will be for
+    * that userqueue.
+    */
+   uint64_t (*userq_f32_get_shadow_regs_va)(struct radeon_cmdbuf *rcs);
 };
 
 static inline bool radeon_emitted(struct radeon_cmdbuf *rcs, unsigned num_dw)

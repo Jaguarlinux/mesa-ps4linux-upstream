@@ -4,10 +4,14 @@
 use crate::ir::*;
 use crate::legalize::{
     src_is_reg, swap_srcs_if_not_reg, LegalizeBuildHelpers, LegalizeBuilder,
+    PadValue,
+};
+use crate::sm30_instr_latencies::{
+    encode_kepler_shader, instr_exec_latency, instr_latency,
+    latency_upper_bound, KeplerInstructionEncoder,
 };
 use bitview::{
     BitMutView, BitMutViewable, BitView, BitViewable, SetBit, SetField,
-    SetFieldU64,
 };
 
 use rustc_hash::FxHashMap;
@@ -60,34 +64,17 @@ impl ShaderModel for ShaderModel32 {
     }
 
     fn exec_latency(&self, op: &Op) -> u32 {
-        // TODO
-        match op {
-            Op::CCtl(_)
-            | Op::MemBar(_)
-            | Op::Bra(_)
-            | Op::SSy(_)
-            | Op::Sync(_)
-            | Op::Brk(_)
-            | Op::PBk(_)
-            | Op::Cont(_)
-            | Op::PCnt(_)
-            | Op::Exit(_)
-            | Op::Bar(_)
-            | Op::Kill(_)
-            | Op::OutFinal(_) => 13,
-            _ => 1,
-        }
+        instr_exec_latency(self.sm, op)
     }
 
     fn raw_latency(
         &self,
-        _write: &Op,
-        _dst_idx: usize,
+        write: &Op,
+        dst_idx: usize,
         _read: &Op,
         _src_idx: usize,
     ) -> u32 {
-        // TODO
-        13
+        instr_latency(self.sm, write, dst_idx)
     }
 
     fn war_latency(
@@ -97,7 +84,6 @@ impl ShaderModel for ShaderModel32 {
         _write: &Op,
         _dst_idx: usize,
     ) -> u32 {
-        // TODO
         // We assume the source gets read in the first 4 cycles.  We don't know
         // how quickly the write will happen.  This is all a guess.
         4
@@ -105,31 +91,35 @@ impl ShaderModel for ShaderModel32 {
 
     fn waw_latency(
         &self,
-        _a: &Op,
-        _a_dst_idx: usize,
+        a: &Op,
+        a_dst_idx: usize,
         _a_has_pred: bool,
         _b: &Op,
         _b_dst_idx: usize,
     ) -> u32 {
         // We know our latencies are wrong so assume the wrote could happen
         // anywhere between 0 and instr_latency(a) cycles
-
-        // TODO
-        13
+        instr_latency(self.sm, a, a_dst_idx)
     }
 
     fn paw_latency(&self, _write: &Op, _dst_idx: usize) -> u32 {
-        // TODO
         13
     }
 
-    fn worst_latency(&self, _write: &Op, _dst_idx: usize) -> u32 {
-        // TODO
-        15
+    fn worst_latency(&self, write: &Op, dst_idx: usize) -> u32 {
+        instr_latency(self.sm, write, dst_idx)
+    }
+
+    fn latency_upper_bound(&self) -> u32 {
+        latency_upper_bound()
+    }
+
+    fn max_instr_delay(&self) -> u8 {
+        32
     }
 
     fn legalize_op(&self, b: &mut LegalizeBuilder, op: &mut Op) {
-        as_sm32_op_mut(op).legalize(b);
+        op.legalize(b);
     }
 
     fn encode_shader(&self, s: &Shader<'_>) -> Vec<u32> {
@@ -139,7 +129,6 @@ impl ShaderModel for ShaderModel32 {
 
 trait SM32Op {
     fn legalize(&mut self, b: &mut LegalizeBuilder);
-    #[allow(dead_code)]
     fn encode(&self, e: &mut SM32Encoder<'_>);
 }
 
@@ -151,13 +140,11 @@ fn true_reg() -> RegRef {
     RegRef::new(RegFile::Pred, 7, 1)
 }
 
-#[allow(dead_code)]
 struct SM32Encoder<'a> {
     sm: &'a ShaderModel32,
     ip: usize,
     labels: &'a FxHashMap<Label, usize>,
     inst: [u32; 2],
-    sched: u8,
 }
 
 impl BitViewable for SM32Encoder<'_> {
@@ -173,12 +160,6 @@ impl BitViewable for SM32Encoder<'_> {
 impl BitMutViewable for SM32Encoder<'_> {
     fn set_bit_range_u64(&mut self, range: Range<usize>, val: u64) {
         BitMutView::new(&mut self.inst).set_bit_range_u64(range, val);
-    }
-}
-
-impl SetFieldU64 for SM32Encoder<'_> {
-    fn set_field_u64(&mut self, range: Range<usize>, val: u64) {
-        BitMutView::new(&mut self.inst).set_field_u64(range, val);
     }
 }
 
@@ -325,23 +306,6 @@ impl SM32Encoder<'_> {
             },
         );
     }
-
-    fn set_instr_dependency(&mut self, _deps: &InstrDeps) {
-        // TODO: schedulng
-        //let mut sched = BitMutView::new(&mut self.sched);
-        //sched.set_field(0..5, deps.delay);
-        self.sched = 0x00;
-        // 0x00: wait for 32 cycles
-        // 0x04: dual-issue with next instruction
-        // 0xc2 if TEXBAR
-        // 0x40 if EXPORT
-        // 0x20 otherwise(?)
-
-        // 0x80: global memory bit
-        // 0x40: EXPORT(?)
-        // 0x20: suspend for N cycles (N = bitmask 0x1f)
-        // 0x10: shared memory?
-    }
 }
 
 //
@@ -392,7 +356,7 @@ impl SM32Encoder<'_> {
             RRR,
         }
         let src1 = AluSrc::from_src(src1);
-        let src2 = src2.map(|s| AluSrc::from_src(s));
+        let src2 = src2.map(AluSrc::from_src);
 
         if let Some(dst) = dst {
             self.set_dst(dst);
@@ -473,9 +437,9 @@ impl SM32Op for OpFAdd {
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::F32);
 
         if src1.as_imm_not_f20().is_some()
-            && self.rnd_mode != FRndMode::NearestEven
+            && (self.saturate || self.rnd_mode != FRndMode::NearestEven)
         {
-            // Hardware cannot encode long-immediate + rounding mode
+            // Hardware cannot encode long-immediate + rounding mode or saturation
             b.copy_alu_src(src1, GPR, SrcType::F32);
         }
     }
@@ -488,8 +452,8 @@ impl SM32Op for OpFAdd {
             e.set_field(23..55, imm32);
 
             assert!(self.rnd_mode == FRndMode::NearestEven);
+            assert!(!self.saturate);
 
-            e.set_bit(22, self.saturate);
             e.set_bit(56, self.srcs[1].src_mod.has_fneg());
             e.set_bit(58, self.ftz);
             e.set_bit(60, self.srcs[1].src_mod.has_fabs());
@@ -639,6 +603,7 @@ impl SM32Op for OpFMul {
             assert!(self.rnd_mode == FRndMode::NearestEven);
             e.set_bit(56, self.ftz);
             e.set_bit(57, self.dnz);
+            e.set_bit(58, self.saturate);
         } else {
             e.encode_form_immreg(
                 0xc34,
@@ -654,6 +619,7 @@ impl SM32Op for OpFMul {
             e.set_bit(47, self.ftz);
             e.set_bit(48, self.dnz);
             e.set_bit(51, fneg);
+            e.set_bit(53, self.saturate);
         }
     }
 }
@@ -674,7 +640,7 @@ impl SM32Op for OpRro {
             }
             SrcRef::CBuf(cb) => {
                 e.set_opcode(0x648, 2);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
             }
             _ => panic!("Invalid Rro src"),
         }
@@ -805,6 +771,9 @@ impl SM32Op for OpFSet {
         // 48..50: and, or, xor?
         e.set_float_cmp_op(51..55, self.cmp_op);
 
+        // Without ".bf" it sets the register to -1 (int) if true
+        e.set_bit(55, true); // .bf
+
         e.set_bit(56, self.srcs[1].src_mod.has_fneg());
         e.set_bit(57, self.srcs[0].src_mod.has_fabs());
 
@@ -897,7 +866,7 @@ impl SM32Op for OpFSwz {
             },
         );
 
-        e.set_bit(41, false); // .NDV
+        e.set_tex_ndv(41, self.deriv_mode);
         e.set_bit(47, self.ftz); // .FTZ
         e.set_bit(50, false); // .CC
     }
@@ -1082,7 +1051,7 @@ impl SM32Op for OpBfe {
         use RegFile::GPR;
         b.copy_alu_src_if_not_reg(&mut self.base, GPR, SrcType::ALU);
         if let SrcRef::Imm32(imm) = &mut self.range.src_ref {
-            *imm = *imm & 0xffff; // Only the lower 2 bytes matter
+            *imm &= 0xffff; // Only the lower 2 bytes matter
         }
     }
 
@@ -1116,7 +1085,7 @@ impl SM32Op for OpFlo {
             }
             SrcRef::CBuf(cb) => {
                 e.set_opcode(0x618, 2);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
             }
             _ => panic!("Invalid flo src"),
         }
@@ -1247,7 +1216,6 @@ impl SM32Op for OpIMad {
     }
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
-        // TODO: long immediate, ex: 0xa1081800019c0801 (not handled by codegen)
         e.encode_form_immreg(
             0xa00,
             0x110,
@@ -1268,7 +1236,6 @@ impl SM32Op for OpIMad {
         // 52: .x
         e.set_bit(51, self.signed);
         // 50: cc
-        // 22: .s
     }
 }
 
@@ -1524,7 +1491,6 @@ impl SM32Op for OpShf {
                 _ => panic!("Invalid shift data type"),
             },
         );
-        e.set_bit(22, false); // .s
     }
 }
 
@@ -1839,6 +1805,11 @@ impl SM32Op for OpShfl {
         use RegFile::GPR;
         b.copy_alu_src_if_not_reg(&mut self.src, GPR, SrcType::GPR);
         b.copy_alu_src_if_not_reg_or_imm(&mut self.lane, GPR, SrcType::ALU);
+        // shfl.up alone requires lane to be 4-aligned ¯\_(ツ)_/¯
+        if self.op == ShflOp::Up {
+            b.align_reg(&mut self.lane, 4, PadValue::Zero);
+        }
+
         b.copy_alu_src_if_not_reg_or_imm(&mut self.c, GPR, SrcType::ALU);
         self.reduce_lane_c_imm();
     }
@@ -1902,7 +1873,6 @@ impl SM32Op for OpPSetP {
 
         e.set_pred_set_op(27..29, self.ops[0]);
         e.set_pred_set_op(48..50, self.ops[1]);
-        // 22: .s
     }
 }
 
@@ -1938,6 +1908,15 @@ impl SM32Encoder<'_> {
                 _ => panic!("Unknown LOD mode"),
             },
         );
+    }
+
+    fn set_tex_ndv(&mut self, bit: usize, deriv_mode: TexDerivMode) {
+        let ndv = match deriv_mode {
+            TexDerivMode::Auto => false,
+            TexDerivMode::NonDivergent => true,
+            _ => panic!("{deriv_mode} is not supported"),
+        };
+        self.set_bit(bit, ndv);
     }
 }
 
@@ -1986,7 +1965,7 @@ impl SM32Op for OpTex {
 
         e.set_field(34..38, self.channel_mask.to_bits());
         e.set_tex_dim(38..41, self.dim);
-        e.set_bit(41, false); // ToDo: NDV
+        e.set_tex_ndv(41, self.deriv_mode);
         e.set_bit(42, self.z_cmpr);
         e.set_bit(43, self.offset_mode == TexOffsetMode::AddOffI);
         e.set_tex_lod_mode(44..47, self.lod_mode);
@@ -2113,6 +2092,7 @@ impl SM32Op for OpTmml {
 
         e.set_field(34..38, self.channel_mask.to_bits());
         e.set_tex_dim(38..41, self.dim);
+        e.set_tex_ndv(41, self.deriv_mode);
     }
 }
 
@@ -2149,7 +2129,6 @@ impl SM32Op for OpTxd {
 
         e.set_field(34..38, self.channel_mask.to_bits());
         e.set_tex_dim(38..41, self.dim);
-        e.set_bit(41, false); // ToDo: NDV
         e.set_bit(54, self.offset_mode == TexOffsetMode::AddOffI);
     }
 }
@@ -2193,6 +2172,306 @@ impl SM32Op for OpTxq {
         // phase: (default|.t|.p|inv)
         e.set_field(32..34, 0x2_u8);
         e.set_field(34..38, self.channel_mask.to_bits());
+    }
+}
+
+impl SM32Op for OpSuClamp {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        use RegFile::GPR;
+
+        b.copy_alu_src_if_not_reg(&mut self.coords, GPR, SrcType::ALU);
+        b.copy_alu_src_if_i20_overflow(&mut self.params, GPR, SrcType::ALU);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.encode_form_immreg(
+            0xb00,
+            0x180,
+            Some(&self.dst),
+            &self.coords,
+            &self.params,
+            None,
+            false,
+        );
+
+        e.set_field(42..48, self.imm);
+        e.set_pred_dst(48..51, &self.out_of_bounds);
+
+        e.set_bit(51, self.is_s32);
+        let round = match self.round {
+            SuClampRound::R1 => 0,
+            SuClampRound::R2 => 1,
+            SuClampRound::R4 => 2,
+            SuClampRound::R8 => 3,
+            SuClampRound::R16 => 4,
+        };
+        let mode = match self.mode {
+            SuClampMode::StoredInDescriptor => 0_u8,
+            SuClampMode::PitchLinear => 5,
+            SuClampMode::BlockLinear => 10,
+        };
+        e.set_field(52..56, mode + round);
+        e.set_bit(56, self.is_2d); // .1d
+    }
+}
+
+impl SM32Op for OpSuBfm {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        use RegFile::GPR;
+
+        b.copy_alu_src_if_not_reg(&mut self.srcs[0], GPR, SrcType::ALU);
+        b.copy_alu_src_if_i20_overflow(&mut self.srcs[1], GPR, SrcType::ALU);
+        b.copy_alu_src_if_not_reg(&mut self.srcs[2], GPR, SrcType::ALU);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.encode_form_immreg(
+            0xb68,
+            0x1e8,
+            Some(&self.dst),
+            &self.srcs[0],
+            &self.srcs[1],
+            Some(&self.srcs[2]),
+            false,
+        );
+
+        e.set_bit(50, self.is_3d);
+        e.set_pred_dst(51..54, &self.pdst);
+    }
+}
+
+impl SM32Op for OpSuEau {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        use RegFile::GPR;
+
+        b.copy_alu_src_if_not_reg(&mut self.off, GPR, SrcType::ALU);
+        b.copy_alu_src_if_i20_overflow(&mut self.bit_field, GPR, SrcType::ALU);
+        b.copy_alu_src_if_not_reg(&mut self.addr, GPR, SrcType::ALU);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.encode_form_immreg(
+            0xb6c,
+            0x1ec,
+            Some(&self.dst),
+            &self.off,
+            &self.bit_field,
+            Some(&self.addr),
+            false,
+        );
+    }
+}
+
+impl SM32Op for OpIMadSp {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        use RegFile::GPR;
+
+        let [src0, src1, src2] = &mut self.srcs;
+
+        b.copy_alu_src_if_not_reg(src0, GPR, SrcType::ALU);
+        b.copy_alu_src_if_i20_overflow(src1, GPR, SrcType::ALU);
+        b.copy_alu_src_if_not_reg(src2, GPR, SrcType::ALU);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.encode_form_immreg(
+            0xa40,
+            0x140,
+            Some(&self.dst),
+            &self.srcs[0],
+            &self.srcs[1],
+            Some(&self.srcs[2]),
+            false,
+        );
+
+        match self.mode {
+            IMadSpMode::Explicit([src0, src1, src2]) => {
+                use IMadSpSrcType::*;
+                assert!(
+                    src2.sign() == (src1.sign() || src0.sign()),
+                    "Cannot encode imadsp signed combination"
+                );
+
+                e.set_bit(51, src0.sign());
+                e.set_field(
+                    52..54,
+                    match src0.unsigned() {
+                        U32 => 0_u8,
+                        U24 => 1,
+                        U16Lo => 2,
+                        U16Hi => 3,
+                        _ => unreachable!(),
+                    },
+                );
+
+                e.set_field(
+                    54..56,
+                    match src2.unsigned() {
+                        U32 => 0_u8,
+                        U24 => 1,
+                        U16Lo => 2,
+                        U16Hi => {
+                            panic!("src2 u16h1 not encodable")
+                        }
+                        _ => unreachable!(),
+                    },
+                );
+                e.set_bit(56, src1.sign());
+
+                // Don't trust nvdisasm on this, this is inverted
+                e.set_field(
+                    57..58,
+                    match src1.unsigned() {
+                        U24 => 1_u8,
+                        U16Lo => 0,
+                        _ => panic!("imadsp src[1] can only be 16 or 24 bits"),
+                    },
+                );
+            }
+            IMadSpMode::FromSrc1 => {
+                e.set_field(54..56, 3_u8);
+            }
+        }
+    }
+}
+
+impl SM32Encoder<'_> {
+    fn set_ld_cache_op(&mut self, range: Range<usize>, op: LdCacheOp) {
+        let cache_op = match op {
+            LdCacheOp::CacheAll => 0_u8,
+            LdCacheOp::CacheGlobal => 1_u8,
+            LdCacheOp::CacheStreaming => 2_u8,
+            LdCacheOp::CacheInvalidate => 3_u8,
+            _ => panic!("Unsupported cache op: ld{op}"),
+        };
+        self.set_field(range, cache_op);
+    }
+
+    fn set_st_cache_op(&mut self, range: Range<usize>, op: StCacheOp) {
+        let cache_op = match op {
+            StCacheOp::WriteBack => 0_u8,
+            StCacheOp::CacheGlobal => 1_u8,
+            StCacheOp::CacheStreaming => 2_u8,
+            StCacheOp::WriteThrough => 3_u8,
+        };
+        self.set_field(range, cache_op);
+    }
+
+    fn set_su_ga_offset_mode(
+        &mut self,
+        range: Range<usize>,
+        off_type: SuGaOffsetMode,
+    ) {
+        assert!(range.len() == 2);
+        self.set_field(
+            range,
+            match off_type {
+                SuGaOffsetMode::U32 => 0_u8,
+                SuGaOffsetMode::S32 => 1_u8,
+                SuGaOffsetMode::U8 => 2_u8,
+                SuGaOffsetMode::S8 => 3_u8,
+            },
+        );
+    }
+}
+
+impl SM32Op for OpSuLdGa {
+    fn legalize(&mut self, _b: &mut LegalizeBuilder) {}
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        match &self.format.src_ref {
+            SrcRef::CBuf(cb) => {
+                e.set_opcode(0x300, 2);
+                e.set_mem_type(56..59, self.mem_type);
+
+                e.set_ld_cache_op(54..56, self.cache_op);
+                e.set_src_cbuf(23..42, cb);
+            }
+            SrcRef::Zero | SrcRef::Reg(_) => {
+                e.set_opcode(0x798, 2);
+                e.set_mem_type(33..36, self.mem_type);
+
+                e.set_ld_cache_op(31..33, self.cache_op);
+                e.set_reg_src(23..31, &self.format);
+            }
+            _ => panic!("Unhandled format src type"),
+        }
+
+        // surface pred: 42..46
+        e.set_pred_src(42..46, &self.out_of_bounds);
+
+        // Surface clamp:
+        // 0: zero
+        // 1: trap
+        // 3: sdcl
+        e.set_field(46..48, 0_u8);
+
+        e.set_su_ga_offset_mode(52..54, self.offset_mode);
+
+        e.set_dst(&self.dst);
+
+        // address
+        e.set_reg_src(10..18, &self.addr);
+    }
+}
+
+impl SM32Op for OpSuStGa {
+    fn legalize(&mut self, _b: &mut LegalizeBuilder) {}
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        match &self.format.src_ref {
+            SrcRef::CBuf(cb) => {
+                e.set_opcode(0x380, 2);
+
+                // Surface clamp: [ignore, trap, invalid, sdcl]
+                e.set_field(2..4, 0_u8);
+
+                match self.image_access {
+                    ImageAccess::Binary(mem_type) => {
+                        e.set_field(4..8, 0); // channel mask
+                        e.set_mem_type(56..59, mem_type); // mem_type
+                    }
+                    ImageAccess::Formatted(mask) => {
+                        e.set_field(4..8, mask.to_bits()); // channel mask
+                        e.set_field(56..59, 0_u8); // mem_type
+                    }
+                };
+
+                e.set_su_ga_offset_mode(8..10, self.offset_mode);
+                e.set_src_cbuf(23..42, cb);
+                e.set_st_cache_op(54..56, self.cache_op);
+            }
+            SrcRef::Zero | SrcRef::Reg(_) => {
+                e.set_opcode(0x79c, 2);
+
+                e.set_reg_src(2..10, &self.format);
+
+                // Surface clamp: [ignore, trap, invalid, sdcl]
+                e.set_field(23..25, 0_u8);
+
+                match self.image_access {
+                    ImageAccess::Binary(mem_type) => {
+                        e.set_field(25..29, 0); // channel mask
+                        e.set_mem_type(33..36, mem_type); // mem_type
+                    }
+                    ImageAccess::Formatted(mask) => {
+                        e.set_field(25..29, mask.to_bits()); // channel mask
+                        e.set_field(33..36, 0_u8); // mem_type
+                    }
+                };
+
+                e.set_su_ga_offset_mode(29..31, self.offset_mode);
+                e.set_st_cache_op(31..33, self.cache_op);
+            }
+            _ => panic!("Unhandled format src type"),
+        }
+
+        // out_of_bounds pred
+        e.set_pred_src(50..54, &self.out_of_bounds);
+
+        // address
+        e.set_reg_src(10..18, &self.addr);
+        e.set_reg_src(42..50, &self.data);
     }
 }
 
@@ -2269,7 +2548,6 @@ impl SM32Op for OpLd {
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
         // Missing:
-        // 0x774 for load locked
         // 0x7c8 for indirect const load
         match self.access.space {
             MemSpace::Global(_) => {
@@ -2277,7 +2555,7 @@ impl SM32Op for OpLd {
 
                 e.set_field(23..55, self.offset);
                 e.set_mem_access(55..59, &self.access);
-                // 59..61 cache hints (.ca, .cg, .cs, .cv)
+                e.set_ld_cache_op(59..61, self.access.ld_cache_op(e.sm));
             }
             MemSpace::Local | MemSpace::Shared => {
                 let opc = match self.access.space {
@@ -2287,9 +2565,8 @@ impl SM32Op for OpLd {
                 };
                 e.set_opcode(opc, 2);
 
-                // 22..23 .s?
                 e.set_field(23..47, self.offset);
-                // 47..49: cache hints (.ca, .cg, .lu, .cv)
+                e.set_ld_cache_op(47..49, self.access.ld_cache_op(e.sm));
                 e.set_mem_access(50..54, &self.access);
             }
         }
@@ -2332,21 +2609,35 @@ impl SM32Op for OpLdc {
     }
 }
 
+impl SM32Op for OpLdSharedLock {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        legalize_ext_instr(self, b);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.set_opcode(0x774, 2);
+        e.set_dst(&self.dst);
+        e.set_reg_src(10..18, &self.addr);
+        e.set_field(23..47, self.offset);
+
+        e.set_pred_dst(48..51, &self.locked);
+        e.set_mem_type(51..54, self.mem_type);
+    }
+}
+
 impl SM32Op for OpSt {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         legalize_ext_instr(self, b);
     }
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
-        // Missing:
-        // 0x784 for store locked
         match self.access.space {
             MemSpace::Global(_) => {
                 e.set_opcode(0xe00, 0);
 
                 e.set_field(23..55, self.offset);
                 e.set_mem_access(55..59, &self.access);
-                // 59..61 cache hints (.ca, .cg, .cs, .cv)
+                e.set_st_cache_op(59..61, self.access.st_cache_op(e.sm));
             }
             MemSpace::Local | MemSpace::Shared => {
                 let opc = match self.access.space {
@@ -2356,14 +2647,31 @@ impl SM32Op for OpSt {
                 };
                 e.set_opcode(opc, 2);
 
-                // 22..23 .s?
                 e.set_field(23..47, self.offset);
-                // 47..49: cache hints (.ca, .cg, .lu, .cv)
+                e.set_st_cache_op(47..49, self.access.st_cache_op(e.sm));
                 e.set_mem_access(50..54, &self.access);
             }
         }
         e.set_reg_src(2..10, &self.data);
         e.set_reg_src(10..18, &self.addr);
+    }
+}
+
+impl SM32Op for OpStSCheckUnlock {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        legalize_ext_instr(self, b);
+    }
+
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        e.set_opcode(0x784, 2);
+
+        e.set_reg_src(2..10, &self.data);
+        e.set_reg_src(10..18, &self.addr);
+
+        e.set_field(23..47, self.offset);
+        e.set_st_cache_op(47..49, StCacheOp::WriteBack);
+        e.set_pred_dst(48..51, &self.locked);
+        e.set_mem_type(51..54, self.mem_type);
     }
 }
 
@@ -2507,7 +2815,6 @@ impl SM32Op for OpAL2P {
 
         e.set_dst(&self.dst);
         e.set_reg_src(10..18, &self.offset);
-        // 22: .s
         e.set_field(23..34, self.addr);
         e.set_bit(35, self.output);
 
@@ -2526,7 +2833,6 @@ impl SM32Op for OpALd {
 
         e.set_dst(&self.dst);
         e.set_reg_src(10..18, &self.offset);
-        // 22: .s
         e.set_field(23..34, self.addr);
 
         if self.phys {
@@ -2553,7 +2859,6 @@ impl SM32Op for OpASt {
 
         e.set_reg_src(2..10, &self.data);
         e.set_reg_src(10..18, &self.offset);
-        // 22: .s
         e.set_field(23..34, self.addr);
 
         if self.phys {
@@ -2729,6 +3034,12 @@ impl SM32Op for OpSync {
         // emit nop.s
         e.set_opcode(0x858, 2);
         e.set_field(10..14, 0xf_u8); // flags
+
+        // sync bit (.s)
+        // Kepler doesn't really have a "sync" instruction, instead
+        // every instruction can become a sync if the bit 22 is enabled.
+        // TODO: instead of adding a nop.s add the .s modifier to the
+        //       next instruction (and handle addresses accordingly)
         e.set_bit(22, true); // .s
     }
 }
@@ -2895,6 +3206,8 @@ impl SM32Op for OpPixLd {
                 other => panic!("Unsupported PixVal: {other}"),
             },
         );
+
+        e.set_pred_dst(48..51, &Dst::None); // dst1
     }
 }
 
@@ -2963,171 +3276,136 @@ impl SM32Op for OpOut {
     }
 }
 
-// TODO: instructions left behind from codegen rewrite,
+// Instructions left behind from codegen rewrite,
 // we might use them in the future:
 // - 0x138 pret.noinc
 // - 0x1b8 quadon (enable all threads in quad)
 // - 0x1c0 quadpop (redisable them)
 // - 0x190 ret
-macro_rules! as_sm50_op_match {
-    ($op: expr) => {
+macro_rules! sm32_op_match {
+    ($op: expr, |$x: ident| $y: expr) => {
         match $op {
-            Op::FAdd(op) => op,
-            Op::FFma(op) => op,
-            Op::FMnMx(op) => op,
-            Op::FMul(op) => op,
-            Op::Rro(op) => op,
-            Op::MuFu(op) => op,
-            Op::FSet(op) => op,
-            Op::FSetP(op) => op,
-            Op::FSwz(op) => op,
-            Op::DAdd(op) => op,
-            Op::DFma(op) => op,
-            Op::DMnMx(op) => op,
-            Op::DMul(op) => op,
-            Op::DSetP(op) => op,
-            Op::Bfe(op) => op,
-            Op::Flo(op) => op,
-            Op::IAdd2(op) => op,
-            Op::IAdd2X(op) => op,
-            Op::IMad(op) => op,
-            Op::IMul(op) => op,
-            Op::IMnMx(op) => op,
-            Op::ISetP(op) => op,
-            Op::Lop2(op) => op,
-            Op::PopC(op) => op,
-            Op::Shf(op) => op,
-            Op::Shl(op) => op,
-            Op::Shr(op) => op,
-            Op::F2F(op) => op,
-            Op::F2I(op) => op,
-            Op::I2F(op) => op,
-            Op::I2I(op) => op,
-            Op::Mov(op) => op,
-            Op::Prmt(op) => op,
-            Op::Sel(op) => op,
-            Op::Shfl(op) => op,
-            Op::PSetP(op) => op,
-            Op::Tex(op) => op,
-            Op::Tld(op) => op,
-            Op::Tld4(op) => op,
-            Op::Tmml(op) => op,
-            Op::Txd(op) => op,
-            Op::Txq(op) => op,
-            Op::Ld(op) => op,
-            Op::Ldc(op) => op,
-            Op::St(op) => op,
-            Op::Atom(op) => op,
-            Op::AL2P(op) => op,
-            Op::ALd(op) => op,
-            Op::ASt(op) => op,
-            Op::Ipa(op) => op,
-            Op::CCtl(op) => op,
-            Op::MemBar(op) => op,
-            Op::Bra(op) => op,
-            Op::SSy(op) => op,
-            Op::Sync(op) => op,
-            Op::Brk(op) => op,
-            Op::PBk(op) => op,
-            Op::Cont(op) => op,
-            Op::PCnt(op) => op,
-            Op::Exit(op) => op,
-            Op::Bar(op) => op,
-            Op::TexDepBar(op) => op,
-            Op::ViLd(op) => op,
-            Op::Kill(op) => op,
-            Op::Nop(op) => op,
-            Op::PixLd(op) => op,
-            Op::S2R(op) => op,
-            Op::Vote(op) => op,
-            Op::Out(op) => op,
+            Op::FAdd($x) => $y,
+            Op::FFma($x) => $y,
+            Op::FMnMx($x) => $y,
+            Op::FMul($x) => $y,
+            Op::Rro($x) => $y,
+            Op::MuFu($x) => $y,
+            Op::FSet($x) => $y,
+            Op::FSetP($x) => $y,
+            Op::FSwz($x) => $y,
+            Op::DAdd($x) => $y,
+            Op::DFma($x) => $y,
+            Op::DMnMx($x) => $y,
+            Op::DMul($x) => $y,
+            Op::DSetP($x) => $y,
+            Op::Bfe($x) => $y,
+            Op::Flo($x) => $y,
+            Op::IAdd2($x) => $y,
+            Op::IAdd2X($x) => $y,
+            Op::IMad($x) => $y,
+            Op::IMul($x) => $y,
+            Op::IMnMx($x) => $y,
+            Op::ISetP($x) => $y,
+            Op::Lop2($x) => $y,
+            Op::PopC($x) => $y,
+            Op::Shf($x) => $y,
+            Op::Shl($x) => $y,
+            Op::Shr($x) => $y,
+            Op::F2F($x) => $y,
+            Op::F2I($x) => $y,
+            Op::I2F($x) => $y,
+            Op::I2I($x) => $y,
+            Op::Mov($x) => $y,
+            Op::Prmt($x) => $y,
+            Op::Sel($x) => $y,
+            Op::Shfl($x) => $y,
+            Op::PSetP($x) => $y,
+            Op::Tex($x) => $y,
+            Op::Tld($x) => $y,
+            Op::Tld4($x) => $y,
+            Op::Tmml($x) => $y,
+            Op::Txd($x) => $y,
+            Op::Txq($x) => $y,
+            Op::SuClamp($x) => $y,
+            Op::SuBfm($x) => $y,
+            Op::SuEau($x) => $y,
+            Op::IMadSp($x) => $y,
+            Op::SuLdGa($x) => $y,
+            Op::SuStGa($x) => $y,
+            Op::Ld($x) => $y,
+            Op::Ldc($x) => $y,
+            Op::LdSharedLock($x) => $y,
+            Op::St($x) => $y,
+            Op::StSCheckUnlock($x) => $y,
+            Op::Atom($x) => $y,
+            Op::AL2P($x) => $y,
+            Op::ALd($x) => $y,
+            Op::ASt($x) => $y,
+            Op::Ipa($x) => $y,
+            Op::CCtl($x) => $y,
+            Op::MemBar($x) => $y,
+            Op::Bra($x) => $y,
+            Op::SSy($x) => $y,
+            Op::Sync($x) => $y,
+            Op::Brk($x) => $y,
+            Op::PBk($x) => $y,
+            Op::Cont($x) => $y,
+            Op::PCnt($x) => $y,
+            Op::Exit($x) => $y,
+            Op::Bar($x) => $y,
+            Op::TexDepBar($x) => $y,
+            Op::ViLd($x) => $y,
+            Op::Kill($x) => $y,
+            Op::Nop($x) => $y,
+            Op::PixLd($x) => $y,
+            Op::S2R($x) => $y,
+            Op::Vote($x) => $y,
+            Op::Out($x) => $y,
             _ => panic!("Unhandled instruction {}", $op),
         }
     };
 }
 
-fn as_sm32_op(op: &Op) -> &dyn SM32Op {
-    as_sm50_op_match!(op)
+impl SM32Op for Op {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        sm32_op_match!(self, |op| op.legalize(b));
+    }
+    fn encode(&self, e: &mut SM32Encoder<'_>) {
+        sm32_op_match!(self, |op| op.encode(e));
+    }
 }
 
-fn as_sm32_op_mut(op: &mut Op) -> &mut dyn SM32Op {
-    as_sm50_op_match!(op)
-}
-
-fn encode_instr(
-    instr: Option<&Box<Instr>>,
-    sm: &ShaderModel32,
-    labels: &FxHashMap<Label, usize>,
-    encoded: &mut Vec<u32>,
-) -> u8 {
-    let mut e = SM32Encoder {
-        sm: sm,
-        ip: encoded.len() * 4,
-        labels,
-        inst: [0_u32; 2],
-        sched: 0,
-    };
-
-    if let Some(instr) = instr {
-        as_sm32_op(&instr.op).encode(&mut e);
+impl KeplerInstructionEncoder for ShaderModel32 {
+    fn encode_instr(
+        &self,
+        instr: &Instr,
+        labels: &FxHashMap<Label, usize>,
+        encoded: &mut Vec<u32>,
+    ) {
+        let mut e = SM32Encoder {
+            sm: self,
+            ip: encoded.len() * 4,
+            labels,
+            inst: [0_u32; 2],
+        };
+        instr.op.encode(&mut e);
         e.set_pred(&instr.pred);
-        e.set_instr_dependency(&instr.deps);
-    } else {
-        let nop = OpNop { label: None };
-        nop.encode(&mut e);
-        e.set_pred(&true.into());
-        e.set_instr_dependency(&InstrDeps::new());
+        encoded.extend(&e.inst[..]);
     }
 
-    encoded.extend(&e.inst[..]);
+    fn prepare_sched_instr<'a>(
+        &self,
+        sched_instr: &'a mut [u32; 2],
+    ) -> impl BitMutViewable + 'a {
+        let mut bv = BitMutView::new(sched_instr);
+        bv.set_field(0..2, 0b00);
+        bv.set_field(58..64, 0b000010); // 0x08
 
-    e.sched
+        BitMutView::new_subset(sched_instr, 2..58)
+    }
 }
 
 fn encode_sm32_shader(sm: &ShaderModel32, s: &Shader<'_>) -> Vec<u32> {
-    assert!(s.functions.len() == 1);
-    let func = &s.functions[0];
-
-    let mut ip = 0_usize;
-    let mut labels = FxHashMap::default();
-    for b in &func.blocks {
-        // We ensure blocks will have groups of 7 instructions with a
-        // schedule instruction before each groups.  As we should never jump
-        // to a schedule instruction, we account for that here.
-        labels.insert(b.label, ip + 8);
-
-        let block_num_instrs = b.instrs.len().next_multiple_of(7);
-
-        // Every 7 instructions, we have a new schedule instruction so we
-        // need to account for that.
-        ip += (block_num_instrs + (block_num_instrs / 7)) * 8;
-    }
-
-    let mut encoded = Vec::new();
-    for b in &func.blocks {
-        for sched_chunk in b.instrs.chunks(7) {
-            let sched_i = encoded.len();
-            let mut sched_instr = [0u32; 2];
-            encoded.extend(&sched_instr[..]); // Push now, will edit later
-            let mut bv = BitMutView::new(&mut sched_instr);
-            bv.set_field(0..2, 0b00);
-            bv.set_field(58..64, 0b000010); // 0x80
-            let mut bv = bv.subset_mut(2..58);
-
-            for (i, instr) in sched_chunk.iter().enumerate() {
-                let sched =
-                    encode_instr(Some(instr), sm, &labels, &mut encoded);
-
-                bv.set_field(i * 8..(i + 1) * 8, sched);
-            }
-            // Encode remaining ops in chunk as NOPs
-            for _ in sched_chunk.len()..7 {
-                encode_instr(None, sm, &labels, &mut encoded);
-            }
-            encoded[sched_i] = sched_instr[0];
-            encoded[sched_i + 1] = sched_instr[1];
-        }
-    }
-
-    encoded
+    encode_kepler_shader(sm, s)
 }

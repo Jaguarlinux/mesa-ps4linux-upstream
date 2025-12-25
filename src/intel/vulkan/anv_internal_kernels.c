@@ -24,8 +24,8 @@
 #include "anv_private.h"
 
 #include "compiler/intel_nir.h"
-#include "compiler/brw_compiler.h"
-#include "compiler/brw_nir.h"
+#include "compiler/brw/brw_compiler.h"
+#include "compiler/brw/brw_nir.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "dev/intel_debug.h"
@@ -48,17 +48,25 @@ lower_base_workgroup_id(nir_builder *b, nir_intrinsic_instr *intrin,
    return true;
 }
 
-static struct anv_shader_bin *
+static void
+check_sends(struct genisa_stats *stats, unsigned send_count)
+{
+   assert(stats->spill_count == 0);
+   assert(stats->fill_count == 0);
+   assert(stats->send_messages == send_count);
+}
+
+static struct anv_shader_internal *
 compile_shader(struct anv_device *device,
                enum anv_internal_kernel_name shader_name,
-               gl_shader_stage stage,
+               mesa_shader_stage stage,
                const char *name,
                const void *hash_key,
                uint32_t hash_key_size,
                uint32_t sends_count_expectation)
 {
    const nir_shader_compiler_options *nir_options =
-      device->physical->compiler->nir_options[stage];
+      &device->physical->compiler->nir_options[stage];
 
    nir_builder b = nir_builder_init_simple_shader(stage, nir_options,
                                                   "%s", name);
@@ -68,19 +76,19 @@ compile_shader(struct anv_device *device,
 
    nir_shader *nir = b.shader;
 
-   NIR_PASS_V(nir, nir_lower_vars_to_ssa);
-   NIR_PASS_V(nir, nir_opt_cse);
-   NIR_PASS_V(nir, nir_opt_gcm, true);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_gcm, true);
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 1,
    };
-   NIR_PASS_V(nir, nir_opt_peephole_select, &peephole_select_options);
+   NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
 
-   NIR_PASS_V(nir, nir_lower_variable_initializers, ~0);
+   NIR_PASS(_, nir, nir_lower_variable_initializers, ~0);
 
-   NIR_PASS_V(nir, nir_split_var_copies);
-   NIR_PASS_V(nir, nir_split_per_member_structs);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_split_per_member_structs);
 
    if (stage == MESA_SHADER_COMPUTE) {
       nir->info.workgroup_size[0] = 16;
@@ -92,22 +100,19 @@ compile_shader(struct anv_device *device,
    struct brw_nir_compiler_opts opts = {};
    brw_preprocess_nir(compiler, nir, &opts);
 
-   NIR_PASS_V(nir, nir_propagate_invariant, false);
+   NIR_PASS(_, nir, nir_propagate_invariant, false);
 
    if (stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS_V(nir, nir_lower_input_attachments,
-                 &(nir_input_attachment_options) {
-                    .use_fragcoord_sysval = true,
-                    .use_layer_id_sysval = true,
-                 });
+      NIR_PASS(_, nir, nir_lower_input_attachments,
+                 &(nir_input_attachment_options) { });
    } else {
       nir_lower_compute_system_values_options options = {
          .has_base_workgroup_id = true,
          .lower_cs_local_id_to_index = true,
-         .lower_workgroup_id_to_index = gl_shader_stage_is_mesh(stage),
+         .lower_workgroup_id_to_index = mesa_shader_stage_is_mesh(stage),
       };
-      NIR_PASS_V(nir, nir_lower_compute_system_values, &options);
-      NIR_PASS_V(nir, nir_shader_intrinsics_pass, lower_base_workgroup_id,
+      NIR_PASS(_, nir, nir_lower_compute_system_values, &options);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_base_workgroup_id,
                  nir_metadata_control_flow, NULL);
    }
 
@@ -117,9 +122,9 @@ compile_shader(struct anv_device *device,
    nir->info.shared_size = 0;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   NIR_PASS_V(nir, nir_copy_prop);
-   NIR_PASS_V(nir, nir_opt_constant_folding);
-   NIR_PASS_V(nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
 
    union brw_any_prog_key key;
    memset(&key, 0, sizeof(key));
@@ -128,7 +133,7 @@ compile_shader(struct anv_device *device,
    memset(&prog_data, 0, sizeof(prog_data));
 
    if (stage == MESA_SHADER_COMPUTE) {
-      NIR_PASS_V(nir, brw_nir_lower_cs_intrinsics,
+      NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics,
                  device->info, &prog_data.cs);
    }
 
@@ -140,19 +145,20 @@ compile_shader(struct anv_device *device,
       .callback = brw_nir_should_vectorize_mem,
       .robust_modes = (nir_variable_mode)0,
    };
-   NIR_PASS_V(nir, nir_opt_load_store_vectorize, &options);
+   NIR_PASS(_, nir, nir_opt_load_store_vectorize, &options);
 
    nir->num_uniforms = uniform_size;
 
+   void *temp_ctx = ralloc_context(NULL);
+
    prog_data.base.nr_params = nir->num_uniforms / 4;
+   prog_data.base.param = rzalloc_array(temp_ctx, uint32_t, prog_data.base.nr_params);
 
    brw_nir_analyze_ubo_ranges(compiler, nir, prog_data.base.ubo_ranges);
 
-   void *temp_ctx = ralloc_context(NULL);
-
    const unsigned *program;
    if (stage == MESA_SHADER_FRAGMENT) {
-      struct brw_compile_stats stats[3];
+      struct genisa_stats stats[3];
       struct brw_compile_fs_params params = {
          .base = {
             .nir = nir,
@@ -169,28 +175,18 @@ compile_shader(struct anv_device *device,
       if (!INTEL_DEBUG(DEBUG_SHADER_PRINT)) {
          unsigned stat_idx = 0;
          if (prog_data.wm.dispatch_8) {
-            assert(stats[stat_idx].spills == 0);
-            assert(stats[stat_idx].fills == 0);
-            assert(stats[stat_idx].sends == sends_count_expectation);
-            stat_idx++;
+            check_sends(&stats[stat_idx++], sends_count_expectation);
          }
          if (prog_data.wm.dispatch_16) {
-            assert(stats[stat_idx].spills == 0);
-            assert(stats[stat_idx].fills == 0);
-            assert(stats[stat_idx].sends == sends_count_expectation);
-            stat_idx++;
+            check_sends(&stats[stat_idx++], sends_count_expectation);
          }
          if (prog_data.wm.dispatch_32) {
-            assert(stats[stat_idx].spills == 0);
-            assert(stats[stat_idx].fills == 0);
-            assert(stats[stat_idx].sends ==
-                   sends_count_expectation *
-                   (device->info->ver < 20 ? 2 : 1));
-            stat_idx++;
+            check_sends(&stats[stat_idx++], sends_count_expectation *
+                                            (device->info->ver < 20 ? 2 : 1));
          }
       }
    } else {
-      struct brw_compile_stats stats;
+      struct genisa_stats stats;
       struct brw_compile_cs_params params = {
          .base = {
             .nir = nir,
@@ -205,15 +201,13 @@ compile_shader(struct anv_device *device,
       program = brw_compile_cs(compiler, &params);
 
       if (!INTEL_DEBUG(DEBUG_SHADER_PRINT)) {
-         assert(stats.spills == 0);
-         assert(stats.fills == 0);
-         assert(stats.sends == sends_count_expectation);
+         check_sends(&stats, sends_count_expectation);
       }
    }
 
    assert(prog_data.base.total_scratch == 0);
    assert(program != NULL);
-   struct anv_shader_bin *kernel = NULL;
+   struct anv_shader_internal *kernel = NULL;
    if (program == NULL)
       goto exit;
 
@@ -243,14 +237,14 @@ exit:
 VkResult
 anv_device_get_internal_shader(struct anv_device *device,
                                enum anv_internal_kernel_name name,
-                               struct anv_shader_bin **out_bin)
+                               struct anv_shader_internal **out_bin)
 {
    const struct {
       struct {
          char name[40];
       } key;
 
-      gl_shader_stage stage;
+      mesa_shader_stage stage;
 
       uint32_t        send_count;
    } internal_kernels[] = {
@@ -303,7 +297,7 @@ anv_device_get_internal_shader(struct anv_device *device,
       },
    };
 
-   struct anv_shader_bin *bin =
+   struct anv_shader_internal *bin =
       p_atomic_read(&device->internal_kernels[name]);
    if (bin != NULL) {
       *out_bin = bin;
@@ -336,7 +330,7 @@ anv_device_get_internal_shader(struct anv_device *device,
    /* The cache already has a reference and it's not going anywhere so
     * there is no need to hold a second reference.
     */
-   anv_shader_bin_unref(device, bin);
+   anv_shader_internal_unref(device, bin);
 
    p_atomic_set(&device->internal_kernels[name], bin);
 

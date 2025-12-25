@@ -50,6 +50,27 @@ const unsigned const_resource_plane_order_YVU[3] = {
    1
 };
 
+static enum pipe_format
+vl_get_plane_format(enum pipe_format format, unsigned plane)
+{
+   enum pipe_format fmt = util_format_get_plane_format(format, plane);
+
+   switch (fmt) {
+   case PIPE_FORMAT_X6R10_UNORM:
+   case PIPE_FORMAT_X4R12_UNORM:
+      return PIPE_FORMAT_R16_UNORM;
+   case PIPE_FORMAT_X6R10X6G10_UNORM:
+   case PIPE_FORMAT_X4R12X4G12_UNORM:
+      return PIPE_FORMAT_R16G16_UNORM;
+   case PIPE_FORMAT_YUYV:
+      return PIPE_FORMAT_R8G8_R8B8_UNORM;
+   case PIPE_FORMAT_UYVY:
+      return PIPE_FORMAT_G8R8_B8R8_UNORM;
+   default:
+      return fmt;
+   }
+}
+
 void
 vl_get_video_buffer_formats(struct pipe_screen *screen, enum pipe_format format,
                             enum pipe_format out_format[VL_NUM_COMPONENTS])
@@ -58,14 +79,9 @@ vl_get_video_buffer_formats(struct pipe_screen *screen, enum pipe_format format,
    unsigned i;
 
    for (i = 0; i < num_planes; i++)
-      out_format[i] = util_format_get_plane_format(format, i);
+      out_format[i] = vl_get_plane_format(format, i);
    for (; i < VL_NUM_COMPONENTS; i++)
       out_format[i] = PIPE_FORMAT_NONE;
-
-   if (format == PIPE_FORMAT_YUYV)
-      out_format[0] = PIPE_FORMAT_R8G8_R8B8_UNORM;
-   else if (format == PIPE_FORMAT_UYVY)
-      out_format[0] = PIPE_FORMAT_G8R8_B8R8_UNORM;
 }
 
 const unsigned *
@@ -219,9 +235,6 @@ vl_video_buffer_destroy(struct pipe_video_buffer *buffer)
       pipe_resource_reference(&buf->resources[i], NULL);
    }
 
-   for (i = 0; i < VL_MAX_SURFACES; ++i)
-      pipe_surface_reference(&buf->surfaces[i], NULL);
-
    vl_video_buffer_set_associated_data(buffer, NULL, NULL, NULL);
 
    FREE(buffer);
@@ -339,46 +352,35 @@ error:
    return NULL;
 }
 
-static struct pipe_surface **
-vl_video_buffer_surfaces(struct pipe_video_buffer *buffer)
+static struct pipe_surface *
+vl_video_buffer_get_surfaces(struct pipe_video_buffer *buffer)
 {
    struct vl_video_buffer *buf = (struct vl_video_buffer *)buffer;
-   struct pipe_surface surf_templ;
-   struct pipe_context *pipe;
+   return &buf->surfaces[0];
+}
+
+static void
+vl_video_buffer_surfaces(struct vl_video_buffer *buf)
+{
    unsigned i, j, array_size, surf;
 
    assert(buf);
 
-   pipe = buf->base.context;
-
-   array_size = buffer->interlaced ? 2 : 1;
+   array_size = buf->base.interlaced ? 2 : 1;
    for (i = 0, surf = 0; i < VL_NUM_COMPONENTS; ++i) {
       for (j = 0; j < array_size; ++j, ++surf) {
          assert(surf < VL_MAX_SURFACES);
 
          if (!buf->resources[i]) {
-            pipe_surface_reference(&buf->surfaces[surf], NULL);
+            memset(&buf->surfaces[surf], 0, sizeof(buf->surfaces[0]));
             continue;
          }
 
-         if (!buf->surfaces[surf]) {
-            memset(&surf_templ, 0, sizeof(surf_templ));
-            surf_templ.format = vl_video_buffer_surface_format(buf->resources[i]->format);
-            surf_templ.u.tex.first_layer = surf_templ.u.tex.last_layer = j;
-            buf->surfaces[surf] = pipe->create_surface(pipe, buf->resources[i], &surf_templ);
-            if (!buf->surfaces[surf])
-               goto error;
-         }
+         buf->surfaces[surf].texture = buf->resources[i];
+         buf->surfaces[surf].format = vl_video_buffer_surface_format(buf->resources[i]->format);
+         buf->surfaces[surf].first_layer = buf->surfaces[surf].last_layer = j;
       }
    }
-
-   return buf->surfaces;
-
-error:
-   for (i = 0; i < VL_MAX_SURFACES; ++i )
-      pipe_surface_reference(&buf->surfaces[i], NULL);
-
-   return NULL;
 }
 
 struct pipe_video_buffer *
@@ -495,7 +497,7 @@ vl_video_buffer_create_ex2(struct pipe_context *pipe,
    buffer->base.get_resources = vl_video_buffer_resources;
    buffer->base.get_sampler_view_planes = vl_video_buffer_sampler_view_planes;
    buffer->base.get_sampler_view_components = vl_video_buffer_sampler_view_components;
-   buffer->base.get_surfaces = vl_video_buffer_surfaces;
+   buffer->base.get_surfaces = vl_video_buffer_get_surfaces;
 
    for (i = 0; i < num_planes; ++i)
       buffer->resources[i] = resources[i];
@@ -505,6 +507,8 @@ vl_video_buffer_create_ex2(struct pipe_context *pipe,
       struct pipe_resource *res = resources[i];
       pipe_resource_reference(&res, NULL);
    }
+
+   vl_video_buffer_surfaces(buffer);
 
    return &buffer->base;
 }

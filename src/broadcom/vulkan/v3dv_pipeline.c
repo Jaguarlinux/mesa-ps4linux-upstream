@@ -123,8 +123,7 @@ v3dv_destroy_pipeline(struct v3dv_pipeline *pipeline,
       pipeline->default_attribute_values = NULL;
    }
 
-   if (pipeline->executables.mem_ctx)
-      ralloc_free(pipeline->executables.mem_ctx);
+   ralloc_free(pipeline->executables.mem_ctx);
 
    if (pipeline->layout)
       v3dv_pipeline_layout_unref(device, pipeline->layout, pAllocator);
@@ -162,7 +161,6 @@ v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo)
       .lower_uadd_sat = true,
       .lower_usub_sat = true,
       .lower_iadd_sat = true,
-      .lower_all_io_to_temps = true,
       .lower_extract_byte = true,
       .lower_extract_word = true,
       .lower_insert_byte = true,
@@ -207,6 +205,8 @@ v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo)
       .lower_ufind_msb = true,
       .has_fsub = true,
       .has_isub = true,
+      .has_imul24 = true,
+      .has_umul24 = true,
       .has_uclz = true,
       .vertex_id_zero_based = false, /* FIXME: to set this to true, the intrinsic
                                       * needs to be supported */
@@ -252,12 +252,49 @@ lookup_ycbcr_conversion(const void *_pipeline_layout, uint32_t set,
    }
 }
 
+static bool
+try_lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
+{
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_input_attachment_coord: {
+      b->cursor = nir_before_instr(&intrin->instr);
+
+      nir_variable *pos_var =
+         nir_get_variable_with_location(b->shader, nir_var_shader_in,
+                                        VARYING_SLOT_POS, glsl_vec4_type());
+      nir_def *pos = nir_f2i32(b, nir_load_var(b, pos_var));
+
+      nir_variable *layer_var =
+         nir_get_variable_with_location(b->shader, nir_var_shader_in,
+                                        VARYING_SLOT_LAYER, glsl_int_type());
+      layer_var->data.interpolation = INTERP_MODE_FLAT;
+      nir_def *layer = nir_load_var(b, layer_var);
+
+      nir_def *coord = nir_vec3(b, nir_channel(b, pos, 0),
+                                   nir_channel(b, pos, 1),
+                                   layer);
+      nir_def_replace(&intrin->def, coord);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
+lower_intrinsics(nir_shader *s)
+{
+   return nir_shader_intrinsics_pass(s, try_lower_intrinsic,
+                                       nir_metadata_control_flow, NULL);
+}
+
 static void
 preprocess_nir(nir_shader *nir)
 {
    const struct nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
       .frag_coord = true,
       .point_coord = true,
+      .layer_id = true,
    };
    NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals_to_varyings);
 
@@ -270,16 +307,18 @@ preprocess_nir(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_shader_out);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      NIR_PASS(_, nir, nir_lower_io_to_vector, nir_var_shader_out);
+      NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_input_attachments,
-                 &(nir_input_attachment_options) {
-                    .use_fragcoord_sysval = false,
-                       });
+               &(nir_input_attachment_options) {
+                  .use_ia_coord_intrin = true,
+               });
+
+      NIR_PASS(_, nir, lower_intrinsics);
    }
 
-   NIR_PASS_V(nir, nir_lower_io_to_temporaries,
-              nir_shader_get_entrypoint(nir), true, false);
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
    NIR_PASS(_, nir, nir_lower_system_values);
 
@@ -311,9 +350,10 @@ preprocess_nir(nir_shader *nir)
    /* Lower a bunch of stuff */
    NIR_PASS(_, nir, nir_lower_var_copies);
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_shader_in, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_shader_in, UINT32_MAX);
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs,
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_function_temp, 2);
 
    NIR_PASS(_, nir, nir_lower_array_deref_of_vec,
@@ -336,7 +376,7 @@ shader_module_compile_to_nir(struct v3dv_device *device,
    const nir_shader_compiler_options *nir_options =
       v3dv_pipeline_get_nir_options(&device->devinfo);
 
-   gl_shader_stage gl_stage = broadcom_shader_stage_to_gl(stage->stage);
+   mesa_shader_stage gl_stage = broadcom_shader_stage_to_gl(stage->stage);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -455,11 +495,11 @@ lower_load_push_constant(nir_builder *b, nir_intrinsic_instr *instr,
 static struct v3dv_descriptor_map*
 pipeline_get_descriptor_map(struct v3dv_pipeline *pipeline,
                             VkDescriptorType desc_type,
-                            gl_shader_stage gl_stage,
+                            mesa_shader_stage gl_stage,
                             bool is_sampler)
 {
    enum broadcom_shader_stage broadcom_stage =
-      gl_shader_stage_to_broadcom(gl_stage);
+      mesa_shader_stage_to_broadcom(gl_stage);
 
    assert(pipeline->shared_data &&
           pipeline->shared_data->maps[broadcom_stage]);
@@ -485,7 +525,7 @@ pipeline_get_descriptor_map(struct v3dv_pipeline *pipeline,
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
       return &pipeline->shared_data->maps[broadcom_stage]->ssbo_map;
    default:
-      unreachable("Descriptor type unknown or not having a descriptor map");
+      UNREACHABLE("Descriptor type unknown or not having a descriptor map");
    }
 }
 
@@ -518,7 +558,7 @@ lower_vulkan_resource_index(nir_builder *b,
                                      b->shader->info.stage, false);
 
       if (!const_val)
-         unreachable("non-constant vulkan_resource_index array index");
+         UNREACHABLE("non-constant vulkan_resource_index array index");
 
       /* At compile-time we will need to know if we are processing a UBO load
        * for an inline or a regular UBO so we can handle inline loads like
@@ -545,7 +585,7 @@ lower_vulkan_resource_index(nir_builder *b,
    }
 
    default:
-      unreachable("unsupported descriptor type for vulkan_resource_index");
+      UNREACHABLE("unsupported descriptor type for vulkan_resource_index");
       break;
    }
 
@@ -586,10 +626,10 @@ lower_tex_src(nir_builder *b,
    uint8_t plane = tex_instr_get_and_remove_plane_src(instr);
 
    /* We compute first the offsets */
-   nir_deref_instr *deref = nir_instr_as_deref(src->src.ssa->parent_instr);
+   nir_deref_instr *deref = nir_def_as_deref(src->src.ssa);
    while (deref->deref_type != nir_deref_type_var) {
       nir_deref_instr *parent =
-         nir_instr_as_deref(deref->parent.ssa->parent_instr);
+         nir_def_as_deref(deref->parent.ssa);
 
       assert(deref->deref_type == nir_deref_type_array);
 
@@ -720,7 +760,7 @@ lower_image_deref(nir_builder *b,
 
    while (deref->deref_type != nir_deref_type_var) {
       nir_deref_instr *parent =
-         nir_instr_as_deref(deref->parent.ssa->parent_instr);
+         nir_def_as_deref(deref->parent.ssa);
 
       assert(deref->deref_type == nir_deref_type_array);
 
@@ -878,8 +918,7 @@ lower_point_coord_cb(nir_builder *b, nir_intrinsic_instr *intr, void *_state)
    result =
       nir_vector_insert_imm(b, result,
                             nir_fsub_imm(b, 1.0, nir_channel(b, result, 1)), 1);
-   nir_def_rewrite_uses_after(&intr->def,
-                                  result, result->parent_instr);
+   nir_def_rewrite_uses_after(&intr->def, result);
    return true;
 }
 
@@ -895,14 +934,11 @@ static void
 lower_fs_io(nir_shader *nir)
 {
    /* Our backend doesn't handle array fragment shader outputs */
-   NIR_PASS_V(nir, nir_lower_io_arrays_to_elements_no_indirects, false);
+   NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_FRAGMENT);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_FRAGMENT);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, 0);
@@ -911,25 +947,19 @@ lower_fs_io(nir_shader *nir)
 static void
 lower_gs_io(struct nir_shader *nir)
 {
-   NIR_PASS_V(nir, nir_lower_io_arrays_to_elements_no_indirects, false);
+   NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_GEOMETRY);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_GEOMETRY);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 }
 
 static void
 lower_vs_io(struct nir_shader *nir)
 {
-   NIR_PASS_V(nir, nir_lower_io_arrays_to_elements_no_indirects, false);
+   NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_VERTEX);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_VERTEX);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    /* FIXME: if we call nir_lower_io, we get a crash later. Likely because it
     * overlaps with v3d_nir_lower_io. Need further research though.
@@ -949,8 +979,7 @@ shader_debug_output(const char *message, void *data)
 
 static void
 pipeline_populate_v3d_key(struct v3d_key *key,
-                          const struct v3dv_pipeline_stage *p_stage,
-                          uint32_t ucp_enables)
+                          const struct v3dv_pipeline_stage *p_stage)
 {
    assert(p_stage->pipeline->shared_data &&
           p_stage->pipeline->shared_data->maps[p_stage->stage]);
@@ -983,20 +1012,8 @@ pipeline_populate_v3d_key(struct v3d_key *key,
       key->is_last_geometry_stage = false;
       break;
    default:
-      unreachable("unsupported shader stage");
+      UNREACHABLE("unsupported shader stage");
    }
-
-   /* Vulkan doesn't have fixed function state for user clip planes. Instead,
-    * shaders can write to gl_ClipDistance[], in which case the SPIR-V compiler
-    * takes care of adding a single compact array variable at
-    * VARYING_SLOT_CLIP_DIST0, so we don't need any user clip plane lowering.
-    *
-    * The only lowering we are interested is specific to the fragment shader,
-    * where we want to emit discards to honor writes to gl_ClipDistance[] in
-    * previous stages. This is done via nir_lower_clip_fs() so we only set up
-    * the ucp enable mask for that stage.
-    */
-   key->ucp_enables = ucp_enables;
 
    const VkPipelineRobustnessBufferBehaviorEXT robust_buffer_enabled =
       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
@@ -1012,26 +1029,10 @@ pipeline_populate_v3d_key(struct v3d_key *key,
       p_stage->robustness.images == robust_image_enabled;
 }
 
-/* FIXME: anv maps to hw primitive type. Perhaps eventually we would do the
- * same. For not using prim_mode that is the one already used on v3d
- */
-static const enum mesa_prim vk_to_mesa_prim[] = {
-   [VK_PRIMITIVE_TOPOLOGY_POINT_LIST] = MESA_PRIM_POINTS,
-   [VK_PRIMITIVE_TOPOLOGY_LINE_LIST] = MESA_PRIM_LINES,
-   [VK_PRIMITIVE_TOPOLOGY_LINE_STRIP] = MESA_PRIM_LINE_STRIP,
-   [VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST] = MESA_PRIM_TRIANGLES,
-   [VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP] = MESA_PRIM_TRIANGLE_STRIP,
-   [VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN] = MESA_PRIM_TRIANGLE_FAN,
-   [VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY] = MESA_PRIM_LINES_ADJACENCY,
-   [VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY] = MESA_PRIM_LINE_STRIP_ADJACENCY,
-   [VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY] = MESA_PRIM_TRIANGLES_ADJACENCY,
-   [VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY] = MESA_PRIM_TRIANGLE_STRIP_ADJACENCY,
-};
-
 uint32_t
 v3dv_pipeline_primitive(VkPrimitiveTopology vk_prim)
 {
-   return v3d_hw_prim_type(vk_to_mesa_prim[vk_prim]);
+   return v3d_hw_prim_type(vk_topology_to_mesa(vk_prim));
 }
 
 static const enum pipe_logicop vk_to_pipe_logicop[] = {
@@ -1145,6 +1146,13 @@ v3d_fs_key_set_color_attachment(struct v3d_fs_key *key,
       key->f32_color_rb |= 1 << index;
    }
 
+   if ((desc->is_unorm || desc->is_snorm) && desc->channel[0].size == 16) {
+           key->norm_16 |= 1 << index;
+           key->f32_color_rb |= 1 << index;
+   }
+   if (desc->is_snorm)
+           key->snorm |= 1 << index;
+
    if (util_format_is_pure_uint(fb_pipe_format))
       key->f32_color_rb |= 1 << index;
    else if (util_format_is_pure_sint(fb_pipe_format))
@@ -1166,11 +1174,23 @@ pipeline_populate_v3d_fs_key(struct v3d_fs_key *key,
    struct v3dv_device *device = p_stage->pipeline->device;
    assert(device);
 
-   pipeline_populate_v3d_key(&key->base, p_stage, ucp_enables);
+   pipeline_populate_v3d_key(&key->base, p_stage);
+
+   /* Vulkan doesn't have fixed function state for user clip planes. Instead,
+    * shaders can write to gl_ClipDistance[], in which case the SPIR-V compiler
+    * takes care of adding a single compact array variable at
+    * VARYING_SLOT_CLIP_DIST0, so we don't need any user clip plane lowering.
+    *
+    * The only lowering we are interested is specific to the fragment shader,
+    * where we want to emit discards to honor writes to gl_ClipDistance[] in
+    * previous stages. This is done via nir_lower_clip_fs() so we only set up
+    * the ucp enable mask for that stage.
+    */
+   key->ucp_enables = ucp_enables;
 
    const VkPipelineInputAssemblyStateCreateInfo *ia_info =
       pCreateInfo->pInputAssemblyState;
-   uint8_t topology = vk_to_mesa_prim[ia_info->topology];
+   uint8_t topology = vk_topology_to_mesa(ia_info->topology);
 
    key->is_points = (topology == MESA_PRIM_POINTS);
    key->is_lines = (topology >= MESA_PRIM_LINES &&
@@ -1255,12 +1275,12 @@ pipeline_populate_v3d_gs_key(struct v3d_gs_key *key,
 
    memset(key, 0, sizeof(*key));
 
-   pipeline_populate_v3d_key(&key->base, p_stage, 0);
+   pipeline_populate_v3d_key(&key->base, p_stage);
 
    struct v3dv_pipeline *pipeline = p_stage->pipeline;
 
    key->per_vertex_point_size =
-      p_stage->nir->info.outputs_written & (1ull << VARYING_SLOT_PSIZ);
+      p_stage->nir->info.outputs_written & VARYING_BIT_PSIZ;
 
    key->is_coord = broadcom_shader_stage_is_binning(p_stage->stage);
 
@@ -1298,12 +1318,12 @@ pipeline_populate_v3d_vs_key(struct v3d_vs_key *key,
    assert(device);
 
    memset(key, 0, sizeof(*key));
-   pipeline_populate_v3d_key(&key->base, p_stage, 0);
+   pipeline_populate_v3d_key(&key->base, p_stage);
 
    struct v3dv_pipeline *pipeline = p_stage->pipeline;
 
    key->per_vertex_point_size =
-      p_stage->nir->info.outputs_written & (1ull << VARYING_SLOT_PSIZ);
+      p_stage->nir->info.outputs_written & VARYING_BIT_PSIZ;
 
    key->is_coord = broadcom_shader_stage_is_binning(p_stage->stage);
 
@@ -1369,6 +1389,7 @@ pipeline_populate_v3d_vs_key(struct v3d_vs_key *key,
          &vi_info->pVertexAttributeDescriptions[i];
       assert(desc->location < MAX_VERTEX_ATTRIBS);
       if (desc->format == VK_FORMAT_B8G8R8A8_UNORM ||
+          desc->format == VK_FORMAT_A2R10G10B10_UINT_PACK32 ||
           desc->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
          key->va_swap_rb_mask |= 1 << (VERT_ATTRIB_GENERIC0 + desc->location);
       }
@@ -1653,7 +1674,7 @@ pipeline_compile_shader_variant(struct v3dv_pipeline_stage *p_stage,
    struct v3dv_pipeline *pipeline = p_stage->pipeline;
    struct v3dv_physical_device *physical_device = pipeline->device->pdevice;
    const struct v3d_compiler *compiler = physical_device->compiler;
-   gl_shader_stage gl_stage = broadcom_shader_stage_to_gl(p_stage->stage);
+   mesa_shader_stage gl_stage = broadcom_shader_stage_to_gl(p_stage->stage);
 
    if (V3D_DBG(NIR) || v3d_debug_flag_for_shader_stage(gl_stage)) {
       fprintf(stderr, "Just before v3d_compile: %s prog %d NIR:\n",
@@ -1707,11 +1728,11 @@ link_shaders(nir_shader *producer, nir_shader *consumer)
    assert(consumer);
 
    if (producer->options->lower_to_scalar) {
-      NIR_PASS(_, producer, nir_lower_io_to_scalar_early, nir_var_shader_out);
-      NIR_PASS(_, consumer, nir_lower_io_to_scalar_early, nir_var_shader_in);
+      NIR_PASS(_, producer, nir_lower_io_vars_to_scalar, nir_var_shader_out);
+      NIR_PASS(_, consumer, nir_lower_io_vars_to_scalar, nir_var_shader_in);
    }
 
-   nir_lower_io_arrays_to_elements(producer, consumer);
+   nir_lower_io_array_vars_to_elements(producer, consumer);
 
    v3d_optimize_nir(NULL, producer);
    v3d_optimize_nir(NULL, consumer);
@@ -1748,8 +1769,8 @@ pipeline_lower_nir(struct v3dv_pipeline *pipeline,
    assert(pipeline->shared_data &&
           pipeline->shared_data->maps[p_stage->stage]);
 
-   NIR_PASS_V(p_stage->nir, nir_vk_lower_ycbcr_tex,
-              lookup_ycbcr_conversion, layout);
+   NIR_PASS(_, p_stage->nir, nir_vk_lower_ycbcr_tex,
+            lookup_ycbcr_conversion, layout);
 
    nir_shader_gather_info(p_stage->nir, nir_shader_get_entrypoint(p_stage->nir));
 
@@ -1971,7 +1992,7 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
 
    const VkPipelineInputAssemblyStateCreateInfo *ia_info =
       pCreateInfo->pInputAssemblyState;
-   key->topology = vk_to_mesa_prim[ia_info->topology];
+   key->topology = vk_topology_to_mesa(ia_info->topology);
 
    const VkPipelineColorBlendStateCreateInfo *cb_info =
       pipeline->rasterization_enabled ? pCreateInfo->pColorBlendState : NULL;
@@ -2050,6 +2071,14 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
          key->f32_color_rb |= 1 << i;
       }
 
+      if ((desc->is_unorm || desc->is_snorm) && desc->channel[0].size == 16) {
+         key->norm_16 |= 1 << i;
+         key->f32_color_rb |= 1 << i;
+      }
+
+      if (desc->is_snorm)
+         key->snorm |= 1 << i;
+
       if (util_format_is_pure_uint(fb_pipe_format))
          key->f32_color_rb |= 1 << i;
       else if (util_format_is_pure_sint(fb_pipe_format))
@@ -2063,6 +2092,7 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
          &vi_info->pVertexAttributeDescriptions[i];
       assert(desc->location < MAX_VERTEX_ATTRIBS);
       if (desc->format == VK_FORMAT_B8G8R8A8_UNORM ||
+          desc->format == VK_FORMAT_A2R10G10B10_UINT_PACK32 ||
           desc->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
          key->va_swap_rb_mask |= 1 << (VERT_ATTRIB_GENERIC0 + desc->location);
       }
@@ -2179,8 +2209,8 @@ write_creation_feedback(struct v3dv_pipeline *pipeline,
       assert(feedback_stage_count <= stage_count);
 
       for (uint32_t i = 0; i < feedback_stage_count; i++) {
-         gl_shader_stage s = vk_to_mesa_shader_stage(stages[i].stage);
-         enum broadcom_shader_stage bs = gl_shader_stage_to_broadcom(s);
+         mesa_shader_stage s = vk_to_mesa_shader_stage(stages[i].stage);
+         enum broadcom_shader_stage bs = mesa_shader_stage_to_broadcom(s);
 
          create_feedback->pPipelineStageCreationFeedbacks[i] =
             pipeline->stages[bs]->feedback;
@@ -2217,7 +2247,7 @@ multiview_gs_input_primitive_from_pipeline(struct v3dv_pipeline *pipeline)
       /* Since we don't allow GS with multiview, we can only see non-adjacency
        * primitives.
        */
-      unreachable("Unexpected pipeline primitive type");
+      UNREACHABLE("Unexpected pipeline primitive type");
    }
 }
 
@@ -2238,7 +2268,7 @@ multiview_gs_output_primitive_from_pipeline(struct v3dv_pipeline *pipeline)
       /* Since we don't allow GS with multiview, we can only see non-adjacency
        * primitives.
        */
-      unreachable("Unexpected pipeline primitive type");
+      UNREACHABLE("Unexpected pipeline primitive type");
    }
 }
 
@@ -2258,8 +2288,7 @@ pipeline_add_multiview_gs(struct v3dv_pipeline *pipeline,
                                                   "multiview broadcast gs");
    nir_shader *nir = b.shader;
    nir->info.inputs_read = vs_nir->info.outputs_written;
-   nir->info.outputs_written = vs_nir->info.outputs_written |
-                               (1ull << VARYING_SLOT_LAYER);
+   nir->info.outputs_written = vs_nir->info.outputs_written | VARYING_BIT_LAYER;
 
    uint32_t vertex_count = mesa_vertices_per_prim(pipeline->topology);
    nir->info.gs.input_primitive =
@@ -2405,7 +2434,7 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
     */
    for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
       const VkPipelineShaderStageCreateInfo *sinfo = &pCreateInfo->pStages[i];
-      gl_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
 
       struct v3dv_pipeline_stage *p_stage =
          vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*p_stage), 8,
@@ -2418,7 +2447,7 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
          p_atomic_inc_return(&physical_device->next_program_id);
 
       enum broadcom_shader_stage broadcom_stage =
-         gl_shader_stage_to_broadcom(stage);
+         mesa_shader_stage_to_broadcom(stage);
 
       p_stage->pipeline = pipeline;
       p_stage->stage = broadcom_stage;
@@ -2910,7 +2939,7 @@ pipeline_init(struct v3dv_pipeline *pipeline,
 
    const VkPipelineInputAssemblyStateCreateInfo *ia_info =
       pCreateInfo->pInputAssemblyState;
-   pipeline->topology = vk_to_mesa_prim[ia_info->topology];
+   pipeline->topology = vk_topology_to_mesa(ia_info->topology);
 
    struct vk_graphics_pipeline_all_state all;
    struct vk_graphics_pipeline_state pipeline_state = { };
@@ -3135,7 +3164,7 @@ lower_compute(struct nir_shader *nir)
    struct nir_lower_compute_system_values_options sysval_options = {
       .has_base_workgroup_id = true,
    };
-   NIR_PASS_V(nir, nir_lower_compute_system_values, &sysval_options);
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &sysval_options);
 }
 
 static VkResult
@@ -3153,7 +3182,7 @@ pipeline_compile_compute(struct v3dv_pipeline *pipeline,
    struct v3dv_physical_device *physical_device = device->pdevice;
 
    const VkPipelineShaderStageCreateInfo *sinfo = &info->stage;
-   gl_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
+   mesa_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
 
    struct v3dv_pipeline_stage *p_stage =
       vk_zalloc2(&device->vk.alloc, alloc, sizeof(*p_stage), 8,
@@ -3163,7 +3192,7 @@ pipeline_compile_compute(struct v3dv_pipeline *pipeline,
 
    p_stage->program_id = p_atomic_inc_return(&physical_device->next_program_id);
    p_stage->pipeline = pipeline;
-   p_stage->stage = gl_shader_stage_to_broadcom(stage);
+   p_stage->stage = mesa_shader_stage_to_broadcom(stage);
    p_stage->entrypoint = sinfo->pName;
    p_stage->module = vk_shader_module_from_handle(sinfo->module);
    p_stage->spec_info = sinfo->pSpecializationInfo;
@@ -3234,7 +3263,7 @@ pipeline_compile_compute(struct v3dv_pipeline *pipeline,
 
    struct v3d_key key;
    memset(&key, 0, sizeof(key));
-   pipeline_populate_v3d_key(&key, p_stage, 0);
+   pipeline_populate_v3d_key(&key, p_stage);
    pipeline->shared_data->variants[BROADCOM_SHADER_COMPUTE] =
       pipeline_compile_shader_variant(p_stage, &key, sizeof(key),
                                       alloc, &result);
@@ -3487,8 +3516,7 @@ pipeline_collect_executable_data(struct v3dv_pipeline *pipeline)
          .nir_str = nir_str,
          .qpu_str = qpu_str,
       };
-      util_dynarray_append(&pipeline->executables.data,
-                           struct v3dv_pipeline_executable_data, data);
+      util_dynarray_append(&pipeline->executables.data, data);
    }
 }
 
@@ -3560,7 +3588,7 @@ v3dv_GetPipelineExecutablePropertiesKHR(
    util_dynarray_foreach(&pipeline->executables.data,
                          struct v3dv_pipeline_executable_data, exe) {
       vk_outarray_append_typed(VkPipelineExecutablePropertiesKHR, &out, props) {
-         gl_shader_stage mesa_stage = broadcom_shader_stage_to_gl(exe->stage);
+         mesa_shader_stage mesa_stage = broadcom_shader_stage_to_gl(exe->stage);
          props->stages = mesa_to_vk_shader_stage(mesa_stage);
 
          VK_PRINT_STR(props->name, "%s (%s)",

@@ -44,7 +44,7 @@
 void
 _mesa_init_performance_queries(struct gl_context *ctx)
 {
-   _mesa_InitHashTable(&ctx->PerfQuery.Objects, ctx->Shared->ReuseGLNames);
+   _mesa_InitHashTable(&ctx->PerfQuery.Objects);
 }
 
 static void
@@ -319,7 +319,7 @@ pipe_counter_type_enum_to_gl_type(enum pipe_perf_counter_type type)
    case PIPE_PERF_COUNTER_TYPE_RAW: return GL_PERFQUERY_COUNTER_RAW_INTEL;
    case PIPE_PERF_COUNTER_TYPE_TIMESTAMP: return GL_PERFQUERY_COUNTER_TIMESTAMP_INTEL;
    default:
-      unreachable("Unknown counter type");
+      UNREACHABLE("Unknown counter type");
    }
 }
 
@@ -333,7 +333,7 @@ pipe_counter_data_type_to_gl_type(enum pipe_perf_counter_data_type type)
    case PIPE_PERF_COUNTER_DATA_TYPE_FLOAT: return GL_PERFQUERY_COUNTER_DATA_FLOAT_INTEL;
    case PIPE_PERF_COUNTER_DATA_TYPE_DOUBLE: return GL_PERFQUERY_COUNTER_DATA_DOUBLE_INTEL;
    default:
-      unreachable("Unknown counter data type");
+      UNREACHABLE("Unknown counter data type");
    }
 }
 

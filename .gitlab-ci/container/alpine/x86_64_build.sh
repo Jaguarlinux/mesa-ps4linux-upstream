@@ -20,31 +20,29 @@ DEPS=(
     bison
     ccache
     "clang${LLVM_VERSION}-dev"
-    cmake
     clang-dev
+    cmake
     coreutils
     curl
+    elfutils-dev
+    expat-dev
     flex
-    gcc
     g++
-    git
+    gcc
     gettext
+    git
     glslang
     graphviz
-    linux-headers
-    "llvm${LLVM_VERSION}-static"
-    "llvm${LLVM_VERSION}-dev"
-    meson
-    mold
-    musl-dev
-    expat-dev
-    elfutils-dev
     libclc-dev
     libdrm-dev
-    libva-dev
     libpciaccess-dev
-    zlib-dev
-    python3-dev
+    libva-dev
+    linux-headers
+    "llvm${LLVM_VERSION}-dev"
+    "llvm${LLVM_VERSION}-static"
+    mold
+    musl-dev
+    ninja-build
     py3-clang
     py3-cparser
     py3-mako
@@ -52,17 +50,27 @@ DEPS=(
     py3-pip
     py3-ply
     py3-yaml
-    vulkan-headers
-    spirv-tools-dev
+    python3-dev
     spirv-llvm-translator-dev
+    spirv-tools-dev
     util-macros
+    vulkan-headers
+    zlib-dev
 )
 
 apk --no-cache add "${DEPS[@]}" "${EPHEMERAL[@]}"
 
+# shellcheck disable=2016  # we're not trying to evaluate $PATH now
+echo 'export PATH="/usr/lib/ninja-build/bin/:$PATH"' > /etc/profile.d/ninja-path.sh
+source /etc/profile.d/ninja-path.sh
+
 pip3 install --break-system-packages sphinx===8.2.3 hawkmoth===0.19.0
 
 . .gitlab-ci/container/container_pre_build.sh
+
+. .gitlab-ci/container/install-meson.sh
+
+. .gitlab-ci/container/build-rust.sh build
 
 EXTRA_MESON_ARGS='--prefix=/usr' \
 . .gitlab-ci/container/build-wayland.sh

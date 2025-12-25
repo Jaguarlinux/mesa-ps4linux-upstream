@@ -170,11 +170,60 @@ impl BitSet<usize> {
         }
         self.words.len() * 32
     }
+
+    /// Search for a set of `count` consecutive elements that are not present in
+    /// the set. The found set must obey the alignment requirements specified by
+    /// align_offset and align_mul. All elements in the found set will be >=
+    /// start_point. Returns the least element of the found set.
+    ///
+    /// align_mul must be a power of two <= 16
+    pub fn find_aligned_unset_range(
+        &self,
+        start_point: usize,
+        count: usize,
+        align_mul: usize,
+        align_offset: usize,
+    ) -> usize {
+        assert!(align_mul <= 16);
+        assert!(align_offset + count <= align_mul);
+        assert!(count > 0);
+        let every_n = every_nth_bit(align_mul) << align_offset;
+
+        let mut word_idx = start_point / 32;
+        let mut mask = !(u32::MAX << (start_point % 32));
+        loop {
+            let word = mask | self.words.get(word_idx).unwrap_or(&0);
+
+            let unset_word = u64::from(!word);
+            let every_n_64 = u64::from(every_n);
+            // If every bit in a sequence is set, then adding one to the bottom
+            // bit will cause it to carry past the top bit. Carry-in for a bit
+            // is true if the bit in the addition result does not match the same
+            // bit in a ^ b. We do this in u64 to handle the case where we carry
+            // past the top bit.
+            let carry = (unset_word + every_n_64) ^ (unset_word ^ every_n_64);
+            let found = u32::try_from(carry >> count).unwrap() & every_n;
+
+            if found != 0 {
+                return word_idx * 32
+                    + usize::try_from(found.trailing_zeros()).unwrap();
+            }
+
+            word_idx += 1;
+            mask = 0;
+        }
+    }
+}
+
+fn every_nth_bit(n: usize) -> u32 {
+    assert!(0 < n && n < 32);
+    assert!(n.is_power_of_two());
+    u32::MAX / ((1 << n) - 1)
 }
 
 impl<K> BitSet<K> {
     /// Evaluate an expression and store its value in self
-    pub fn assign<B>(&mut self, value: BitSetStream<B>)
+    pub fn assign<B>(&mut self, value: BitSetStream<B, K>)
     where
         B: BitSetStreamTrait,
     {
@@ -193,7 +242,7 @@ impl<K> BitSet<K> {
     /// Returns true if the value of self changes, or false otherwise. If you
     /// don't need the return value of this function, consider using the `|=`
     /// operator instead.
-    pub fn union_with<B>(&mut self, other: BitSetStream<B>) -> bool
+    pub fn union_with<B>(&mut self, other: BitSetStream<B, K>) -> bool
     where
         B: BitSetStreamTrait,
     {
@@ -211,13 +260,16 @@ impl<K> BitSet<K> {
         added_bits
     }
 
-    pub fn s<'a>(
-        &'a self,
+    pub fn s(
+        &self,
         _: RangeFull,
-    ) -> BitSetStream<impl 'a + BitSetStreamTrait> {
-        BitSetStream(BitSetStreamFromBitSet {
-            iter: self.words.iter().copied(),
-        })
+    ) -> BitSetStream<impl '_ + BitSetStreamTrait, K> {
+        BitSetStream(
+            BitSetStreamFromBitSet {
+                iter: self.words.iter().copied(),
+            },
+            PhantomData,
+        )
     }
 }
 
@@ -240,6 +292,7 @@ impl FromIterator<usize> for BitSet {
     }
 }
 
+#[expect(clippy::len_without_is_empty)]
 pub trait BitSetStreamTrait {
     /// Get the next word
     ///
@@ -269,15 +322,15 @@ where
     }
 }
 
-pub struct BitSetStream<T>(T)
+pub struct BitSetStream<T, K>(T, PhantomData<K>)
 where
     T: BitSetStreamTrait;
 
-impl<T> From<BitSetStream<T>> for BitSet
+impl<T, K> From<BitSetStream<T, K>> for BitSet<K>
 where
     T: BitSetStreamTrait,
 {
-    fn from(value: BitSetStream<T>) -> Self {
+    fn from(value: BitSetStream<T, K>) -> Self {
         let mut out = BitSet::new();
         out.assign(value);
         out
@@ -322,26 +375,29 @@ macro_rules! binop {
             }
         }
 
-        impl<A, B> $BinOp<BitSetStream<B>> for BitSetStream<A>
+        impl<A, B, K> $BinOp<BitSetStream<B, K>> for BitSetStream<A, K>
         where
             A: BitSetStreamTrait,
             B: BitSetStreamTrait,
         {
-            type Output = BitSetStream<$Struct<A, B>>;
+            type Output = BitSetStream<$Struct<A, B>, K>;
 
-            fn $bin_op(self, rhs: BitSetStream<B>) -> Self::Output {
-                BitSetStream($Struct {
-                    a: self.0,
-                    b: rhs.0,
-                })
+            fn $bin_op(self, rhs: BitSetStream<B, K>) -> Self::Output {
+                BitSetStream(
+                    $Struct {
+                        a: self.0,
+                        b: rhs.0,
+                    },
+                    PhantomData,
+                )
             }
         }
 
-        impl<B> $AssignBinOp<BitSetStream<B>> for BitSet
+        impl<B, K> $AssignBinOp<BitSetStream<B, K>> for BitSet<K>
         where
             B: BitSetStreamTrait,
         {
-            fn $assign_bin_op(&mut self, rhs: BitSetStream<B>) {
+            fn $assign_bin_op(&mut self, rhs: BitSetStream<B, K>) {
                 let mut rhs = rhs.0;
 
                 let $a_len = self.words.len();
@@ -518,7 +574,7 @@ mod tests {
     fn test_or() {
         let a: BitSet = vec![9, 23, 18, 72].into_iter().collect();
         let b: BitSet = vec![7, 23, 1337].into_iter().collect();
-        let expected = vec![7, 9, 18, 23, 72, 1337];
+        let expected = [7, 9, 18, 23, 72, 1337];
 
         assert_eq!(to_vec(&(a.s(..) | b.s(..)).into()), &expected[..]);
         assert_eq!(to_vec(&(b.s(..) | a.s(..)).into()), &expected[..]);
@@ -532,13 +588,13 @@ mod tests {
         assert_eq!(to_vec(&actual_2), &expected[..]);
 
         let mut actual_3 = a.clone();
-        assert_eq!(actual_3.union_with(a.s(..)), false);
-        assert_eq!(actual_3.union_with(b.s(..)), true);
+        assert!(!actual_3.union_with(a.s(..)));
+        assert!(actual_3.union_with(b.s(..)));
         assert_eq!(to_vec(&actual_3), &expected[..]);
 
         let mut actual_4 = b.clone();
-        assert_eq!(actual_4.union_with(b.s(..)), false);
-        assert_eq!(actual_4.union_with(a.s(..)), true);
+        assert!(!actual_4.union_with(b.s(..)));
+        assert!(actual_4.union_with(a.s(..)));
         assert_eq!(to_vec(&actual_4), &expected[..]);
     }
 
@@ -546,7 +602,7 @@ mod tests {
     fn test_and() {
         let a: BitSet = vec![1337, 42, 7, 1].into_iter().collect();
         let b: BitSet = vec![42, 783, 2, 7].into_iter().collect();
-        let expected = vec![7, 42];
+        let expected = [7, 42];
 
         assert_eq!(to_vec(&(a.s(..) & b.s(..)).into()), &expected[..]);
         assert_eq!(to_vec(&(b.s(..) & a.s(..)).into()), &expected[..]);
@@ -564,7 +620,7 @@ mod tests {
     fn test_xor() {
         let a: BitSet = vec![1337, 42, 7, 1].into_iter().collect();
         let b: BitSet = vec![42, 127, 2, 7].into_iter().collect();
-        let expected = vec![1, 2, 127, 1337];
+        let expected = [1, 2, 127, 1337];
 
         assert_eq!(to_vec(&(a.s(..) ^ b.s(..)).into()), &expected[..]);
         assert_eq!(to_vec(&(b.s(..) ^ a.s(..)).into()), &expected[..]);
@@ -582,8 +638,8 @@ mod tests {
     fn test_sub() {
         let a: BitSet = vec![1337, 42, 7, 1].into_iter().collect();
         let b: BitSet = vec![42, 127, 2, 7].into_iter().collect();
-        let expected_1 = vec![1, 1337];
-        let expected_2 = vec![2, 127];
+        let expected_1 = [1, 1337];
+        let expected_2 = [2, 127];
 
         assert_eq!(to_vec(&(a.s(..) - b.s(..)).into()), &expected_1[..]);
         assert_eq!(to_vec(&(b.s(..) - a.s(..)).into()), &expected_2[..]);
@@ -605,5 +661,50 @@ mod tests {
 
         c &= a.s(..) | b.s(..);
         assert!(c.is_empty());
+    }
+
+    fn every_nth_bit_naive(n: usize) -> u32 {
+        assert!(n <= 32);
+        assert!(n.is_power_of_two());
+        let mut x = 0;
+        for i in 0..32 {
+            if i % n == 0 {
+                x |= 1 << i;
+            }
+        }
+        x
+    }
+
+    #[test]
+    fn test_every_nth_bit() {
+        for i in 1_usize..=16 {
+            if i.is_power_of_two() {
+                assert_eq!(every_nth_bit(i), every_nth_bit_naive(i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_aligned_unset_range() {
+        let a: BitSet =
+            [0, 4, 5, 6, 7, 61, 128, 129, 130].into_iter().collect();
+
+        /* (start, count, align_mul, align_offset) */
+        assert_eq!(a.find_aligned_unset_range(0, 1, 1, 0), 1);
+        assert_eq!(a.find_aligned_unset_range(4, 1, 1, 0), 8);
+        assert_eq!(a.find_aligned_unset_range(128, 1, 1, 0), 131);
+        assert_eq!(a.find_aligned_unset_range(0, 4, 4, 0), 8);
+        assert_eq!(a.find_aligned_unset_range(128, 4, 4, 0), 132);
+        assert_eq!(a.find_aligned_unset_range(0, 3, 4, 1), 1);
+        assert_eq!(a.find_aligned_unset_range(0, 3, 8, 1), 1);
+        assert_eq!(a.find_aligned_unset_range(0, 4, 8, 1), 9);
+        assert_eq!(a.find_aligned_unset_range(0, 2, 2, 0), 2);
+        assert_eq!(a.find_aligned_unset_range(2, 2, 2, 0), 2);
+        assert_eq!(a.find_aligned_unset_range(3, 2, 2, 0), 8);
+        assert_eq!(a.find_aligned_unset_range(0, 2, 4, 2), 2);
+        assert_eq!(a.find_aligned_unset_range(3, 2, 4, 2), 10);
+        assert_eq!(a.find_aligned_unset_range(40, 16, 16, 0), 64);
+        assert_eq!(a.find_aligned_unset_range(1337, 1, 1, 0), 1337);
+        assert_eq!(a.find_aligned_unset_range(161, 1, 2, 0), 162);
     }
 }

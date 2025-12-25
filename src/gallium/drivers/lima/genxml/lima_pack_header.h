@@ -49,6 +49,18 @@ __gen_unpack_unorm16(CONSTANT_ uint32_t *restrict cl, uint32_t start, uint32_t e
 }
 
 static inline uint64_t
+__gen_pack_unorm8(float f, uint32_t start, uint32_t end)
+{
+   return util_bitpack_uint(float_to_ubyte(f), start, end);
+}
+
+static inline float
+__gen_unpack_unorm8(CONSTANT_ uint32_t *restrict cl, uint32_t start, uint32_t end)
+{
+   return ubyte_to_float(__gen_unpack_uint(cl, start, end));
+}
+
+static inline uint64_t
 __gen_unpack_sint(CONSTANT_ uint32_t *restrict cl, uint32_t start, uint32_t end)
 {
    int size = end - start + 1;
@@ -138,7 +150,7 @@ lima_genxml_validate_bounds(const char *name, uint64_t value, uint64_t bound)
       fprintf(stderr, "%s out-of-bounds, got 0x%" PRIx64 ", max %" PRIx64 "\n",
               name, value, bound);
 
-      unreachable("Out-of-bounds pack");
+      UNREACHABLE("Out-of-bounds pack");
    }
 }
 

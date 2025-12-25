@@ -52,6 +52,7 @@ try_remove_simple_block(branch_ctx& ctx, Block& block)
 
    unsigned succ_idx = block.linear_succs[0];
    Block& succ = ctx.program->blocks[succ_idx];
+   Block::edge_vec new_preds;
    for (unsigned pred_idx : block.linear_preds) {
       Block& pred = ctx.program->blocks[pred_idx];
       assert(pred.index < block.index);
@@ -67,6 +68,8 @@ try_remove_simple_block(branch_ctx& ctx, Block& block)
          pred.linear_succs[1] = pred.linear_succs.back(); /* In case of discard */
          pred.linear_succs.pop_back();
          branch->opcode = aco_opcode::p_branch;
+         branch->branch().never_taken = false;
+         branch->branch().rarely_taken = false;
       } else if (pred.linear_succs[1] == block.index) {
          /* The predecessor jumps to this block. Redirect to successor. */
          pred.linear_succs[1] = succ_idx;
@@ -82,12 +85,16 @@ try_remove_simple_block(branch_ctx& ctx, Block& block)
          }
 
          /* Otherwise, check if there is a fall-through path for the jump target. */
-         if (block.index >= pred.linear_succs[1])
-            return;
-         for (unsigned j = block.index + 1; j < pred.linear_succs[1]; j++) {
+         bool can_fallthrough = block.index < pred.linear_succs[1];
+         for (unsigned j = block.index + 1; can_fallthrough && j < pred.linear_succs[1]; j++) {
             if (!ctx.program->blocks[j].instructions.empty())
-               return;
+               can_fallthrough = false;
          }
+         if (!can_fallthrough) {
+            new_preds.push_back(pred_idx);
+            continue;
+         }
+
          pred.linear_succs[0] = pred.linear_succs[1];
          pred.linear_succs[1] = succ_idx;
          succ.linear_preds.push_back(pred_idx);
@@ -100,6 +107,8 @@ try_remove_simple_block(branch_ctx& ctx, Block& block)
             branch->opcode = aco_opcode::p_cbranch_z;
          else
             branch->opcode = aco_opcode::p_cbranch_nz;
+         branch->branch().never_taken = false;
+         branch->branch().rarely_taken = false;
       }
 
       /* Update the branch target. */
@@ -130,9 +139,11 @@ try_remove_simple_block(branch_ctx& ctx, Block& block)
       block.logical_preds.clear();
    }
 
-   remove_linear_successor(ctx, block, succ_idx);
-   block.linear_preds.clear();
-   block.instructions.clear();
+   block.linear_preds = new_preds;
+   if (block.linear_preds.empty()) {
+      remove_linear_successor(ctx, block, succ_idx);
+      block.instructions.clear();
+   }
 }
 
 bool
@@ -476,7 +487,7 @@ lower_branch_instruction(branch_ctx& ctx, Block& block)
          bld.sopp(aco_opcode::s_cbranch_scc0, target);
       }
       break;
-   default: unreachable("Unknown Pseudo branch instruction!");
+   default: UNREACHABLE("Unknown Pseudo branch instruction!");
    }
 }
 
@@ -553,7 +564,7 @@ lower_branches(Program* program)
       if (block.kind & block_kind_break)
          try_merge_break_with_continue(ctx, block);
 
-      if (block.linear_succs.size() == 1)
+      if (block.linear_succs.size() == 1 && block.logical_succs.size() <= 1)
          try_remove_simple_block(ctx, block);
    }
 

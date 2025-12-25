@@ -34,7 +34,7 @@
 #include "iris_genx_macros.h"
 
 #if GFX_VER >= 9
-#include "intel/compiler/brw_compiler.h"
+#include "intel/compiler/brw/brw_compiler.h"
 #include "intel/common/intel_genX_state_brw.h"
 #else
 #include "intel/compiler/elk/elk_compiler.h"
@@ -116,7 +116,7 @@ upload_state(struct iris_batch *batch,
              unsigned alignment)
 {
    void *p = NULL;
-   u_upload_alloc(uploader, 0, size, alignment, &ref->offset, &ref->res, &p);
+   u_upload_alloc_ref(uploader, 0, size, alignment, &ref->offset, &ref->res, &p);
    iris_use_pinned_bo(batch, iris_resource_bo(ref->res), false, IRIS_DOMAIN_NONE);
    return p;
 }
@@ -131,7 +131,7 @@ stream_state(struct iris_batch *batch,
 {
    void *ptr = NULL;
 
-   u_upload_alloc(uploader, 0, size, alignment, out_offset, out_res, &ptr);
+   u_upload_alloc_ref(uploader, 0, size, alignment, out_offset, out_res, &ptr);
 
    struct iris_bo *bo = iris_resource_bo(*out_res);
    iris_use_pinned_bo(batch, bo, false, IRIS_DOMAIN_NONE);
@@ -248,7 +248,7 @@ emit_indirect_generate_draw(struct iris_batch *batch,
 
    iris_emit_cmd(batch, GENX(3DSTATE_SF), sf) {
 #if GFX_VER >= 12
-      sf.DerefBlockSize = ice->state.urb_deref_block_size;
+      sf.DerefBlockSize = ice->shaders.urb.cfg.deref_block_size;
 #endif
    }
 
@@ -398,7 +398,7 @@ emit_indirect_generate_draw(struct iris_batch *batch,
    float *vertices =
       upload_state(batch, ice->state.dynamic_uploader,
                    &ice->draw.generation.vertices,
-                   ALIGN(9 * sizeof(float), 8), 8);
+                   align(9 * sizeof(float), 8), 8);
 
    vertices[0] = x1; vertices[1] = y1; vertices[2] = z; /* v0 */
    vertices[3] = x0; vertices[4] = y1; vertices[5] = z; /* v1 */
@@ -499,14 +499,8 @@ emit_indirect_generate_draw(struct iris_batch *batch,
                          IRIS_DIRTY_LINE_STIPPLE |
                          IRIS_ALL_DIRTY_FOR_COMPUTE |
                          IRIS_DIRTY_SCISSOR_RECT |
-                         IRIS_DIRTY_VF);
-   /* Wa_14016820455
-    * On Gfx 12.5 platforms, the SF_CL_VIEWPORT pointer can be invalidated
-    * likely by a read cache invalidation when clipping is disabled, so we
-    * don't skip its dirty bit here, in order to reprogram it.
-    */
-   if (GFX_VERx10 != 125)
-      skip_bits |= IRIS_DIRTY_SF_CL_VIEWPORT;
+                         IRIS_DIRTY_VF |
+                         IRIS_DIRTY_SF_CL_VIEWPORT);
 
    uint64_t skip_stage_bits = (IRIS_ALL_STAGE_DIRTY_FOR_COMPUTE |
                                IRIS_STAGE_DIRTY_UNCOMPILED_VS |

@@ -1,3 +1,6 @@
+// Copyright 2020 Red Hat.
+// SPDX-License-Identifier: MIT
+
 use crate::compiler::nir::*;
 use crate::pipe::screen::*;
 use crate::util::disk_cache::*;
@@ -41,7 +44,7 @@ pub struct SPIRVKernelArg {
 }
 
 pub struct CLCHeader<'a> {
-    pub name: CString,
+    pub name: &'a CString,
     pub source: &'a CString,
 }
 
@@ -255,18 +258,16 @@ impl SPIRVBin {
                     .iter()
                     .map(|a| SPIRVKernelArg {
                         // SAFETY: we have a valid C string pointer here
-                        name: a
-                            .name
-                            .is_null()
-                            .not()
-                            .then(|| unsafe { CStr::from_ptr(a.name) }.to_owned())
-                            .unwrap_or_default(),
-                        type_name: a
-                            .type_name
-                            .is_null()
-                            .not()
-                            .then(|| unsafe { CStr::from_ptr(a.type_name) }.to_owned())
-                            .unwrap_or_default(),
+                        name: if !a.name.is_null() {
+                            unsafe { CStr::from_ptr(a.name) }.to_owned()
+                        } else {
+                            Default::default()
+                        },
+                        type_name: if !a.type_name.is_null() {
+                            unsafe { CStr::from_ptr(a.type_name) }.to_owned()
+                        } else {
+                            Default::default()
+                        },
                         access_qualifier: clc_kernel_arg_access_qualifier(a.access_qualifier),
                         address_qualifier: a.address_qualifier,
                         type_qualifier: clc_kernel_arg_type_qualifier(a.type_qualifier),
@@ -274,32 +275,6 @@ impl SPIRVBin {
                     .collect()
             }
             _ => Vec::new(),
-        }
-    }
-
-    fn get_spirv_capabilities() -> spirv_capabilities {
-        spirv_capabilities {
-            Addresses: true,
-            Float16: true,
-            Float16Buffer: true,
-            Float64: true,
-            GenericPointer: true,
-            Groups: true,
-            GroupNonUniformShuffle: true,
-            GroupNonUniformShuffleRelative: true,
-            Int8: true,
-            Int16: true,
-            Int64: true,
-            Kernel: true,
-            ImageBasic: true,
-            ImageReadWrite: true,
-            Linkage: true,
-            LiteralSampler: true,
-            SampledBuffer: true,
-            Sampled1D: true,
-            UniformDecoration: true,
-            Vector16: true,
-            ..Default::default()
         }
     }
 
@@ -326,13 +301,13 @@ impl SPIRVBin {
             private_data: ptr::from_mut(log).cast(),
         });
 
+        let float_controls = float_controls::FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32 as u32
+            | float_controls::FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE as u32;
         spirv_to_nir_options {
             create_library: library,
             environment: nir_spirv_execution_environment::NIR_SPIRV_OPENCL,
             clc_shader: clc_shader,
-            float_controls_execution_mode: float_controls::FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32
-                as u32,
-
+            float_controls_execution_mode: float_controls,
             printf: true,
             capabilities: caps,
             constant_addr_format: global_addr_format,
@@ -349,15 +324,15 @@ impl SPIRVBin {
         &self,
         entry_point: &str,
         nir_options: *const nir_shader_compiler_options,
+        spirv_caps: &spirv_capabilities,
         libclc: &NirShader,
         spec_constants: &mut [nir_spirv_specialization],
         address_bits: u32,
         log: Option<&mut Vec<String>>,
     ) -> Option<NirShader> {
         let c_entry = CString::new(entry_point.as_bytes()).unwrap();
-        let spirv_caps = Self::get_spirv_capabilities();
         let spirv_options =
-            Self::get_spirv_options(false, libclc.get_nir(), address_bits, &spirv_caps, log);
+            Self::get_spirv_options(false, libclc.get_nir(), address_bits, spirv_caps, log);
 
         let nir = unsafe {
             spirv_to_nir(
@@ -365,7 +340,7 @@ impl SPIRVBin {
                 self.spirv.size / 4,
                 spec_constants.as_mut_ptr(),
                 spec_constants.len() as u32,
-                gl_shader_stage::MESA_SHADER_KERNEL,
+                mesa_shader_stage::MESA_SHADER_KERNEL,
                 c_entry.as_ptr(),
                 &spirv_options,
                 nir_options,
@@ -375,12 +350,12 @@ impl SPIRVBin {
         NirShader::new(nir)
     }
 
-    pub fn get_lib_clc(screen: &PipeScreen) -> Option<NirShader> {
-        let nir_options = screen.nir_shader_compiler_options(pipe_shader_type::PIPE_SHADER_COMPUTE);
+    pub fn get_lib_clc(screen: &PipeScreen, spirv_caps: &spirv_capabilities) -> Option<NirShader> {
+        let nir_options =
+            screen.nir_shader_compiler_options(mesa_shader_stage::MESA_SHADER_COMPUTE);
         let address_bits = screen.compute_caps().address_bits;
-        let spirv_caps = Self::get_spirv_capabilities();
         let spirv_options =
-            Self::get_spirv_options(false, ptr::null(), address_bits, &spirv_caps, None);
+            Self::get_spirv_options(false, ptr::null(), address_bits, spirv_caps, None);
         let shader_cache = DiskCacheBorrowed::as_ptr(&screen.shader_cache());
 
         NirShader::new(unsafe {
@@ -517,7 +492,9 @@ impl CLCSpecConstantType for clc_spec_constant_type {
             Self::CLC_SPEC_CONSTANT_INT32
             | Self::CLC_SPEC_CONSTANT_UINT32
             | Self::CLC_SPEC_CONSTANT_FLOAT => 4,
-            Self::CLC_SPEC_CONSTANT_INT16 | Self::CLC_SPEC_CONSTANT_UINT16 => 2,
+            Self::CLC_SPEC_CONSTANT_INT16
+            | Self::CLC_SPEC_CONSTANT_UINT16
+            | Self::CLC_SPEC_CONSTANT_HALF => 2,
             Self::CLC_SPEC_CONSTANT_INT8
             | Self::CLC_SPEC_CONSTANT_UINT8
             | Self::CLC_SPEC_CONSTANT_BOOL => 1,

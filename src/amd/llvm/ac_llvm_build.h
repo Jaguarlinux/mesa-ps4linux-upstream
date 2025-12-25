@@ -97,7 +97,6 @@ struct ac_llvm_context {
    LLVMTypeRef v4f32;
    LLVMTypeRef v8i32;
    LLVMTypeRef iN_wavemask;
-   LLVMTypeRef iN_ballotmask;
 
    LLVMValueRef i8_0;
    LLVMValueRef i8_1;
@@ -135,14 +134,11 @@ struct ac_llvm_context {
    enum amd_gfx_level gfx_level;
 
    unsigned wave_size;
-   unsigned ballot_mask_bits;
 
    unsigned float_mode;
 
    bool exports_color_null;
    bool exports_mrtz;
-
-   struct ac_llvm_pointer lds;
 
    LLVMValueRef ring_offsets;
    int ring_offsets_index;
@@ -150,8 +146,7 @@ struct ac_llvm_context {
 
 void ac_llvm_context_init(struct ac_llvm_context *ctx, struct ac_llvm_compiler *compiler,
                           const struct radeon_info *info, enum ac_float_mode float_mode,
-                          unsigned wave_size, unsigned ballot_mask_bits, bool exports_color_null,
-                          bool exports_mrtz);
+                          unsigned wave_size, bool exports_color_null, bool exports_mrtz);
 
 void ac_llvm_context_dispose(struct ac_llvm_context *ctx);
 
@@ -178,7 +173,7 @@ void ac_build_type_name_for_intr(LLVMTypeRef type, char *buf, unsigned bufsize);
 LLVMValueRef ac_build_phi(struct ac_llvm_context *ctx, LLVMTypeRef type, unsigned count_incoming,
                           LLVMValueRef *values, LLVMBasicBlockRef *blocks);
 
-void ac_build_s_barrier(struct ac_llvm_context *ctx, gl_shader_stage stage);
+void ac_build_s_barrier(struct ac_llvm_context *ctx, mesa_shader_stage stage);
 void ac_build_optimization_barrier(struct ac_llvm_context *ctx, LLVMValueRef *pgpr, bool sgpr);
 
 LLVMValueRef ac_build_shader_clock(struct ac_llvm_context *ctx, mesa_scope scope);
@@ -234,10 +229,10 @@ LLVMValueRef ac_build_load_to_sgpr(struct ac_llvm_context *ctx, struct ac_llvm_p
 
 void ac_build_buffer_store_dword(struct ac_llvm_context *ctx, LLVMValueRef rsrc, LLVMValueRef vdata,
                                  LLVMValueRef vindex, LLVMValueRef voffset, LLVMValueRef soffset,
-                                 enum gl_access_qualifier access);
+                                 enum gl_access_qualifier access, bool may_subdword);
 
 void ac_build_buffer_store_format(struct ac_llvm_context *ctx, LLVMValueRef rsrc, LLVMValueRef data,
-                                  LLVMValueRef vindex, LLVMValueRef voffset, enum gl_access_qualifier access);
+                                  LLVMValueRef vindex, LLVMValueRef voffset, enum gl_access_qualifier access, bool may_subdword);
 
 LLVMValueRef ac_build_buffer_load(struct ac_llvm_context *ctx, LLVMValueRef rsrc, int num_channels,
                                   LLVMValueRef vindex, LLVMValueRef voffset, LLVMValueRef soffset,
@@ -408,12 +403,7 @@ LLVMValueRef ac_build_sudot_4x8(struct ac_llvm_context *ctx, LLVMValueRef s0, LL
 
 void ac_init_exec_full_mask(struct ac_llvm_context *ctx);
 
-void ac_declare_lds_as_pointer(struct ac_llvm_context *ac);
-
 LLVMValueRef ac_find_lsb(struct ac_llvm_context *ctx, LLVMTypeRef dst_type, LLVMValueRef src0);
-
-LLVMTypeRef ac_array_in_const_addr_space(LLVMTypeRef elem_type);
-LLVMTypeRef ac_array_in_const32_addr_space(LLVMTypeRef elem_type);
 
 void ac_build_bgnloop(struct ac_llvm_context *ctx, int lable_id);
 void ac_build_break(struct ac_llvm_context *ctx);
@@ -431,6 +421,9 @@ LLVMValueRef ac_unpack_param(struct ac_llvm_context *ctx, LLVMValueRef param, un
                              unsigned bitwidth);
 
 LLVMValueRef ac_build_ds_swizzle(struct ac_llvm_context *ctx, LLVMValueRef src, unsigned mask);
+
+LLVMValueRef ac_build_readlane_no_opt_barrier(struct ac_llvm_context *ctx, LLVMValueRef src,
+                                              LLVMValueRef lane);
 
 LLVMValueRef ac_build_readlane(struct ac_llvm_context *ctx, LLVMValueRef src, LLVMValueRef lane);
 
@@ -485,25 +478,7 @@ struct ac_ngg_prim {
    LLVMValueRef passthrough;
 };
 
-LLVMTypeRef ac_arg_type_to_pointee_type(struct ac_llvm_context *ctx, enum ac_arg_type type);
-
-static inline LLVMValueRef ac_get_arg(struct ac_llvm_context *ctx, struct ac_arg arg)
-{
-   assert(arg.used);
-   if (arg.arg_index == ctx->ring_offsets_index)
-      return ctx->ring_offsets;
-   int offset = arg.arg_index > ctx->ring_offsets_index ? -1 : 0;
-   return LLVMGetParam(ctx->main_function.value, arg.arg_index + offset);
-}
-
-static inline struct ac_llvm_pointer
-ac_get_ptr_arg(struct ac_llvm_context *ctx, const struct ac_shader_args *args, struct ac_arg arg)
-{
-   struct ac_llvm_pointer ptr;
-   ptr.pointee_type = ac_arg_type_to_pointee_type(ctx, args->args[arg.arg_index].type);
-   ptr.value = ac_get_arg(ctx, arg);
-   return ptr;
-}
+LLVMValueRef ac_get_arg(struct ac_llvm_context *ctx, struct ac_arg arg);
 
 enum ac_llvm_calling_convention
 {

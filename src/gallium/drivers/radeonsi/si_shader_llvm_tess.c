@@ -18,7 +18,7 @@ static LLVMValueRef si_nir_load_tcs_varyings(struct ac_shader_abi *abi, LLVMType
 
    assert(ctx->shader->key.ge.opt.same_patch_vertices);
 
-   uint8_t semantic = info->input[driver_location].semantic;
+   uint8_t semantic = info->input_semantic[driver_location];
    /* Load the TCS input from a VGPR. */
    unsigned func_param = ctx->args->ac.tcs_rel_ids.arg_index + 1 +
       si_shader_io_get_unique_index(semantic) * 4;
@@ -30,13 +30,6 @@ static LLVMValueRef si_nir_load_tcs_varyings(struct ac_shader_abi *abi, LLVMType
    }
 
    return ac_build_varying_gather_values(&ctx->ac, value, num_components, component);
-}
-
-void si_llvm_tcs_build_end(struct si_shader_context *ctx)
-{
-   if (ctx->screen->info.gfx_level >= GFX9) {
-      ac_build_endif(&ctx->ac, SI_MERGED_WRAP_IF_LABEL);
-   }
 }
 
 void si_llvm_ls_build_end(struct si_shader_context *ctx)
@@ -69,7 +62,7 @@ void si_llvm_ls_build_end(struct si_shader_context *ctx)
 
    ret = si_insert_input_ret(ctx, ret, ctx->args->vs_state_bits, 8 + SI_SGPR_VS_STATE_BITS);
 
-   ret = si_insert_input_ret(ctx, ret, ctx->args->tcs_offchip_layout, 8 + GFX9_SGPR_TCS_OFFCHIP_LAYOUT);
+   ret = si_insert_input_ret(ctx, ret, ctx->args->ac.tcs_offchip_layout, 8 + GFX9_SGPR_TCS_OFFCHIP_LAYOUT);
    ret = si_insert_input_ret(ctx, ret, ctx->args->tes_offchip_addr, 8 + GFX9_SGPR_TCS_OFFCHIP_ADDR);
 
    unsigned vgpr = 8 + GFX9_TCS_NUM_USER_SGPR;
@@ -81,7 +74,6 @@ void si_llvm_ls_build_end(struct si_shader_context *ctx)
       assert(shader->is_monolithic);
 
       struct si_shader_info *info = &shader->selector->info;
-      LLVMValueRef *addrs = ctx->abi.outputs;
 
       for (unsigned i = 0; i < info->num_outputs; i++) {
          unsigned semantic = info->output_semantic[i];
@@ -91,11 +83,11 @@ void si_llvm_ls_build_end(struct si_shader_context *ctx)
             continue;
 
          for (unsigned chan = 0; chan < 4; chan++) {
-            if (!(info->output_usagemask[i] & (1 << chan)))
+            if (!ctx->abi.outputs[4 * i + chan])
                continue;
 
-            LLVMValueRef value = LLVMBuildLoad2(ctx->ac.builder, ctx->ac.f32, addrs[4 * i + chan], "");
-
+            LLVMValueRef value = LLVMBuildLoad2(ctx->ac.builder, ctx->ac.f32,
+                                                ctx->abi.outputs[4 * i + chan], "");
             ret = LLVMBuildInsertValue(ctx->ac.builder, ret, value, vgpr + param * 4 + chan, "");
          }
       }

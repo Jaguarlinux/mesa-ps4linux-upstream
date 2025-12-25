@@ -48,6 +48,11 @@
 
 #define VPE_MAX_GEOMETRIC_DOWNSCALE 4.f
 
+struct vpe_scaling_lanczos_info {
+    float scaling_ratios[2];
+    struct vpe_scaling_filter_coeffs filterCoeffs;
+};
+
 /* For Hooking VPE as a decoder instance */
 struct vpe_video_processor {
     struct pipe_video_codec base;
@@ -58,7 +63,7 @@ struct vpe_video_processor {
 
     uint8_t bufs_num;
     uint8_t cur_buf;
-    struct rvid_buffer *emb_buffers;
+    struct si_resource **emb_buffers;
 
     /* VPE HW version */
     uint8_t ver_major;
@@ -71,8 +76,10 @@ struct vpe_video_processor {
 
     uint8_t log_level;
 
-    struct pipe_surface **src_surfaces;
-    struct pipe_surface **dst_surfaces;
+    struct pipe_surface src_surfaces[VL_MAX_SURFACES];
+    struct pipe_surface dst_surfaces[VL_MAX_SURFACES];
+    struct pipe_video_buffer *src_buffer;
+    struct pipe_video_buffer *dst_buffer;
 
     /* For HDR content display */
     void *gm_handle;
@@ -83,6 +90,9 @@ struct vpe_video_processor {
     float *geometric_scaling_ratios;
     uint8_t geometric_passes;
     struct pipe_video_buffer *geometric_buf[2];
+
+    /* For Lanczos Coeff */
+    struct vpe_scaling_lanczos_info *lanczos_info;
 };
 
 struct pipe_video_codec*

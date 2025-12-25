@@ -170,7 +170,7 @@ st_context_validate(struct st_context *st,
                     struct gl_framebuffer *stread)
 {
     if (stdraw && stdraw->stamp != st->draw_stamp) {
-       st->ctx->NewDriverState |= ST_NEW_FRAMEBUFFER;
+       ST_SET_FRAMEBUFFER_STATES(st->ctx->NewDriverState);
        _mesa_resize_framebuffer(st->ctx, stdraw,
                                 stdraw->Width,
                                 stdraw->Height);
@@ -179,7 +179,7 @@ st_context_validate(struct st_context *st,
 
     if (stread && stread->stamp != st->read_stamp) {
        if (stread != stdraw) {
-          st->ctx->NewDriverState |= ST_NEW_FRAMEBUFFER;
+          ST_SET_FRAMEBUFFER_STATES(st->ctx->NewDriverState);
           _mesa_resize_framebuffer(st->ctx, stread,
                                    stread->Width,
                                    stread->Height);
@@ -193,15 +193,13 @@ void
 st_set_ws_renderbuffer_surface(struct gl_renderbuffer *rb,
                                struct pipe_surface *surf)
 {
-   pipe_surface_reference(&rb->surface_srgb, NULL);
-   pipe_surface_reference(&rb->surface_linear, NULL);
+   rb->surface = *surf;
 
    if (util_format_is_srgb(surf->format))
-      pipe_surface_reference(&rb->surface_srgb, surf);
+      rb->format_srgb = surf->format;
    else
-      pipe_surface_reference(&rb->surface_linear, surf);
+      rb->format_linear = surf->format;
 
-   rb->surface = surf; /* just assign, don't ref */
    pipe_resource_reference(&rb->texture, surf->texture);
    rb->Width = pipe_surface_width(surf);
    rb->Height = pipe_surface_height(surf);
@@ -248,7 +246,7 @@ st_framebuffer_validate(struct gl_framebuffer *stfb,
 
    for (i = 0; i < stfb->num_statts; i++) {
       struct gl_renderbuffer *rb;
-      struct pipe_surface *ps, surf_tmpl;
+      struct pipe_surface surf_tmpl;
       gl_buffer_index idx;
 
       if (!textures[i])
@@ -270,16 +268,12 @@ st_framebuffer_validate(struct gl_framebuffer *stfb,
       }
 
       u_surface_default_template(&surf_tmpl, textures[i]);
-      ps = st->pipe->create_surface(st->pipe, textures[i], &surf_tmpl);
-      if (ps) {
-         st_set_ws_renderbuffer_surface(rb, ps);
-         pipe_surface_reference(&ps, NULL);
+      st_set_ws_renderbuffer_surface(rb, &surf_tmpl);
 
-         changed = true;
+      changed = true;
 
-         width = rb->Width;
-         height = rb->Height;
-      }
+      width = rb->Width;
+      height = rb->Height;
 
       pipe_resource_reference(&textures[i], NULL);
    }
@@ -374,6 +368,7 @@ st_new_renderbuffer_fb(enum pipe_format format, unsigned samples, bool sw)
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    case PIPE_FORMAT_X8R8G8B8_UNORM:
    case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_B8G8R8_UNORM:
       rb->InternalFormat = GL_RGB8;
       break;
    case PIPE_FORMAT_R8G8B8A8_SRGB:
@@ -384,6 +379,8 @@ st_new_renderbuffer_fb(enum pipe_format format, unsigned samples, bool sw)
    case PIPE_FORMAT_R8G8B8X8_SRGB:
    case PIPE_FORMAT_B8G8R8X8_SRGB:
    case PIPE_FORMAT_X8R8G8B8_SRGB:
+   case PIPE_FORMAT_R8G8B8_SRGB:
+   case PIPE_FORMAT_B8G8R8_SRGB:
       rb->InternalFormat = GL_SRGB8;
       break;
    case PIPE_FORMAT_B5G5R5A1_UNORM:
@@ -454,8 +451,6 @@ st_new_renderbuffer_fb(enum pipe_format format, unsigned samples, bool sw)
       FREE(rb);
       return NULL;
    }
-
-   rb->surface = NULL;
 
    return rb;
 }
@@ -902,17 +897,17 @@ st_context_invalidate_state(struct st_context *st, unsigned flags)
    struct gl_context *ctx = st->ctx;
 
    if (flags & ST_INVALIDATE_FS_SAMPLER_VIEWS)
-      ctx->NewDriverState |= ST_NEW_FS_SAMPLER_VIEWS;
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_FS_SAMPLER_VIEWS);
    if (flags & ST_INVALIDATE_FS_CONSTBUF0)
-      ctx->NewDriverState |= ST_NEW_FS_CONSTANTS;
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_FS_CONSTANTS);
    if (flags & ST_INVALIDATE_VS_CONSTBUF0)
-      ctx->NewDriverState |= ST_NEW_VS_CONSTANTS;
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VS_CONSTANTS);
    if (flags & ST_INVALIDATE_VERTEX_BUFFERS) {
       ctx->Array.NewVertexElements = true;
-      ctx->NewDriverState |= ST_NEW_VERTEX_ARRAYS;
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VERTEX_ARRAYS);
    }
    if (flags & ST_INVALIDATE_FB_STATE)
-      ctx->NewDriverState |= ST_NEW_FB_STATE;
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_FB_STATE);
 }
 
 
@@ -1219,7 +1214,7 @@ st_manager_flush_frontbuffer(struct st_context *st)
       rb->defined = GL_FALSE;
 
       /* Trigger an update of rb->defined on next draw */
-      st->ctx->NewDriverState |= ST_NEW_FB_STATE;
+      ST_SET_STATE(st->ctx->NewDriverState, ST_NEW_FB_STATE);
    }
 }
 

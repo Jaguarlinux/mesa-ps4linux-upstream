@@ -378,8 +378,8 @@ vc4_resource_get_param(struct pipe_screen *pscreen,
 }
 
 static void
-vc4_setup_slices(struct vc4_resource *rsc, const char *caller,
-                 bool force_format_t)
+vc4_setup_slices(struct vc4_screen *screen, struct vc4_resource *rsc,
+                 const char *caller, bool force_format_t)
 {
         struct pipe_resource *prsc = &rsc->base;
         uint32_t width = prsc->width0;
@@ -435,6 +435,19 @@ vc4_setup_slices(struct vc4_resource *rsc, const char *caller,
                 slice->offset = offset;
                 slice->stride = (level_width * rsc->cpp *
                                  MAX2(prsc->nr_samples, 1));
+
+#ifdef USE_VC4_SIMULATOR
+                /* Ensure stride alignment matches the one required by the GPU
+                 * that drives the display.
+                 */
+                if (slice->tiling == VC4_TILING_FORMAT_LINEAR &&
+                    prsc->target == PIPE_TEXTURE_2D) {
+                       slice->stride =
+                              align(slice->stride,
+                                    vc4_simulator_get_raster_stride_align(screen->fd));
+                }
+#endif
+
                 slice->size = level_height * slice->stride;
 
                 offset += slice->size;
@@ -583,7 +596,7 @@ vc4_resource_create_with_modifiers(struct pipe_screen *pscreen,
         if (tmpl->target != PIPE_BUFFER)
                 rsc->vc4_format = get_resource_texture_format(prsc);
 
-        vc4_setup_slices(rsc, "create", tmpl->bind & PIPE_BIND_SHARED);
+        vc4_setup_slices(screen, rsc, "create", tmpl->bind & PIPE_BIND_SHARED);
         if (!vc4_resource_bo_alloc(rsc))
                 goto fail;
 
@@ -698,7 +711,7 @@ vc4_resource_from_handle(struct pipe_screen *pscreen,
         }
 
         rsc->vc4_format = get_resource_texture_format(prsc);
-        vc4_setup_slices(rsc, "import", true);
+        vc4_setup_slices(screen, rsc, "import", true);
 
         if (whandle->offset != 0) {
                 if (rsc->tiled) {
@@ -757,44 +770,6 @@ fail:
         return NULL;
 }
 
-static struct pipe_surface *
-vc4_create_surface(struct pipe_context *pctx,
-                   struct pipe_resource *ptex,
-                   const struct pipe_surface *surf_tmpl)
-{
-        struct vc4_surface *surface = CALLOC_STRUCT(vc4_surface);
-        struct vc4_resource *rsc = vc4_resource(ptex);
-
-        if (!surface)
-                return NULL;
-
-        assert(surf_tmpl->u.tex.first_layer == surf_tmpl->u.tex.last_layer);
-
-        struct pipe_surface *psurf = &surface->base;
-        unsigned level = surf_tmpl->u.tex.level;
-
-        pipe_reference_init(&psurf->reference, 1);
-        pipe_resource_reference(&psurf->texture, ptex);
-
-        psurf->context = pctx;
-        psurf->format = surf_tmpl->format;
-        psurf->u.tex.level = level;
-        psurf->u.tex.first_layer = surf_tmpl->u.tex.first_layer;
-        psurf->u.tex.last_layer = surf_tmpl->u.tex.last_layer;
-        surface->offset = (rsc->slices[level].offset +
-                           psurf->u.tex.first_layer * rsc->cube_map_stride);
-        surface->tiling = rsc->slices[level].tiling;
-
-        return &surface->base;
-}
-
-static void
-vc4_surface_destroy(struct pipe_context *pctx, struct pipe_surface *psurf)
-{
-        pipe_resource_reference(&psurf->texture, NULL);
-        FREE(psurf);
-}
-
 static void
 vc4_dump_surface_non_msaa(struct pipe_surface *psurf)
 {
@@ -802,7 +777,7 @@ vc4_dump_surface_non_msaa(struct pipe_surface *psurf)
         struct vc4_resource *rsc = vc4_resource(prsc);
         uint32_t *map = vc4_bo_map(rsc->bo);
         uint32_t stride = rsc->slices[0].stride / 4;
-        uint16_t width, height;
+        unsigned width, height;
         pipe_surface_size(psurf, &width, &height);
         uint32_t chunk_w = width / 79;
         uint32_t chunk_h = height / 40;
@@ -897,7 +872,7 @@ vc4_surface_msaa_get_sample(struct pipe_surface *psurf,
 {
         struct pipe_resource *prsc = psurf->texture;
         struct vc4_resource *rsc = vc4_resource(prsc);
-        uint16_t width, height;
+        unsigned width, height;
         pipe_surface_size(psurf, &width, &height);
         uint32_t tile_w = 32, tile_h = 32;
         uint32_t tiles_w = DIV_ROUND_UP(width, 32);
@@ -971,7 +946,7 @@ static void
 vc4_dump_surface_msaa(struct pipe_surface *psurf)
 {
         uint32_t tile_w = 32, tile_h = 32;
-        uint16_t width, height;
+        unsigned width, height;
         pipe_surface_size(psurf, &width, &height);
         uint32_t tiles_w = DIV_ROUND_UP(width, tile_w);
         uint32_t tiles_h = DIV_ROUND_UP(height, tile_h);
@@ -1168,7 +1143,7 @@ vc4_get_shadow_index_buffer(struct pipe_context *pctx,
 
         void *data;
         struct pipe_resource *shadow_rsc = NULL;
-        u_upload_alloc(vc4->uploader, 0, count * 2, 4,
+        u_upload_alloc_ref(vc4->uploader, 0, count * 2, 4,
                        shadow_offset, &shadow_rsc, &data);
         uint16_t *dst = data;
 
@@ -1240,8 +1215,6 @@ vc4_resource_context_init(struct pipe_context *pctx)
         pctx->texture_unmap = u_transfer_helper_transfer_unmap;
         pctx->buffer_subdata = u_default_buffer_subdata;
         pctx->texture_subdata = vc4_texture_subdata;
-        pctx->create_surface = vc4_create_surface;
-        pctx->surface_destroy = vc4_surface_destroy;
         pctx->resource_copy_region = util_resource_copy_region;
         pctx->blit = vc4_blit;
         pctx->flush_resource = vc4_flush_resource;

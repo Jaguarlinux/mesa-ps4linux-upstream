@@ -13,7 +13,6 @@
 #include "agx_device.h"
 #include "agx_helpers.h"
 #include "agx_linker.h"
-#include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_ppp.h"
 #include "agx_tilebuffer.h"
@@ -31,10 +30,10 @@
 
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/libagx/compression.h"
-#include "asahi/libagx/geometry.h"
 #include "asahi/libagx/libagx.h"
 #include "asahi/libagx/query.h"
 #include "asahi/libagx/tessellator.h"
+#include "poly/geometry.h"
 #include "util/blend.h"
 #include "util/format/format_utils.h"
 #include "util/format/u_formats.h"
@@ -47,6 +46,7 @@
 #include "libagx_shaders.h"
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_intrinsics.h"
 #include "nir_lower_blend.h"
 #include "nir_xfb_info.h"
 #include "pool.h"
@@ -57,6 +57,7 @@
 #include "vk_graphics_state.h"
 #include "vk_pipeline.h"
 #include "vk_render_pass.h"
+#include "vk_shader.h"
 #include "vk_standard_sample_locations.h"
 #include "vk_util.h"
 
@@ -101,40 +102,20 @@ print_draw(struct agx_draw d, FILE *fp)
    fprintf(fp, "\n");
 }
 
-/* XXX: deduplicate */
-static inline enum mesa_prim
-vk_conv_topology(VkPrimitiveTopology topology)
+static bool
+hk_rast_discard(struct hk_cmd_buffer *cmd)
 {
-   switch (topology) {
-   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
-      return MESA_PRIM_POINTS;
-   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
-      return MESA_PRIM_LINES;
-   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
-      return MESA_PRIM_LINE_STRIP;
-   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wswitch"
-   case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
-#pragma GCC diagnostic pop
-      return MESA_PRIM_TRIANGLES;
-   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
-      return MESA_PRIM_TRIANGLE_STRIP;
-   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
-      return MESA_PRIM_TRIANGLE_FAN;
-   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
-      return MESA_PRIM_LINES_ADJACENCY;
-   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
-      return MESA_PRIM_LINE_STRIP_ADJACENCY;
-   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
-      return MESA_PRIM_TRIANGLES_ADJACENCY;
-   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
-      return MESA_PRIM_TRIANGLE_STRIP_ADJACENCY;
-   case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST:
-      return MESA_PRIM_PATCHES;
-   default:
-      unreachable("invalid");
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   /* A non-zero rasterization stream acts as a rasterizer discard unless
+    * there's a multistream geometry shader bound.
+    */
+   if (dyn->rs.rasterization_stream != 0) {
+      struct hk_api_shader *gs = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
+      return !gs || !gs->variants[HK_GS_VARIANT_COUNT].info.gs.multistream;
    }
+
+   return dyn->rs.rasterizer_discard_enable;
 }
 
 static void
@@ -392,15 +373,15 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       if (key.op[rt] == AGX_BG_LOAD) {
          uses_txf = true;
 
-         uint32_t index = key.tib.layered
-                             ? iview->planes[0].layered_background_desc_index
-                             : iview->planes[0].background_desc_index;
+         const struct agx_texture_packed *desc =
+            key.tib.layered ? &iview->planes[0].layered_background
+                            : &iview->planes[0].background;
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             /* Shifted to match eMRT indexing, could be optimized */
             cfg.start = rt * 2;
             cfg.count = 1;
-            cfg.buffer = dev->images.bo->va->addr + index * AGX_TEXTURE_LENGTH;
+            cfg.buffer = hk_pool_upload(cmd, desc, sizeof(*desc), 8);
          }
 
          nr_tex = (rt * 2) + 1;
@@ -412,14 +393,14 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          agx_usc_uniform(&b, 4 + (8 * rt), 8, colour);
          uniforms = MAX2(uniforms, 4 + (8 * rt) + 8);
       } else if (key.op[rt] == AGX_EOT_STORE) {
-         uint32_t index = key.tib.layered
-                             ? iview->planes[0].layered_eot_pbe_desc_index
-                             : iview->planes[0].eot_pbe_desc_index;
+         const struct agx_pbe_packed *desc = key.tib.layered
+                                                ? &iview->planes[0].layered_eot
+                                                : &iview->planes[0].eot;
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             cfg.start = rt;
             cfg.count = 1;
-            cfg.buffer = dev->images.bo->va->addr + index * AGX_TEXTURE_LENGTH;
+            cfg.buffer = hk_pool_upload(cmd, desc, sizeof(*desc), 8);
          }
 
          nr_tex = rt + 1;
@@ -481,13 +462,6 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    }
 
    return ret;
-}
-
-static bool
-is_aligned(unsigned x, unsigned pot_alignment)
-{
-   assert(util_is_power_of_two_nonzero(pot_alignment));
-   return (x & (pot_alignment - 1)) == 0;
 }
 
 static void
@@ -687,7 +661,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
       /* Main stride in pages */
       assert((z_layout->depth_px == 1 ||
-              is_aligned(z_layout->layer_stride_B, AIL_PAGESIZE)) &&
+              util_is_aligned(z_layout->layer_stride_B, AIL_PAGESIZE)) &&
              "Page aligned Z layers");
 
       unsigned stride_pages = z_layout->layer_stride_B / AIL_PAGESIZE;
@@ -702,9 +676,9 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
             z_layout->level_offsets_compressed_B[level];
 
          /* Meta stride in cache lines */
-         assert(
-            is_aligned(z_layout->compression_layer_stride_B, AIL_CACHELINE) &&
-            "Cacheline aligned Z meta layers");
+         assert(util_is_aligned(z_layout->compression_layer_stride_B,
+                                AIL_CACHELINE) &&
+                "Cacheline aligned Z meta layers");
 
          unsigned stride_lines =
             z_layout->compression_layer_stride_B / AIL_CACHELINE;
@@ -739,7 +713,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
       /* Main stride in pages */
       assert((s_layout->depth_px == 1 ||
-              is_aligned(s_layout->layer_stride_B, AIL_PAGESIZE)) &&
+              util_is_aligned(s_layout->layer_stride_B, AIL_PAGESIZE)) &&
              "Page aligned S layers");
       unsigned stride_pages = s_layout->layer_stride_B / AIL_PAGESIZE;
       render->cr.stencil.stride = ((stride_pages - 1) << 14) | 1;
@@ -751,9 +725,9 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
             s_layout->level_offsets_compressed_B[level];
 
          /* Meta stride in cache lines */
-         assert(
-            is_aligned(s_layout->compression_layer_stride_B, AIL_CACHELINE) &&
-            "Cacheline aligned S meta layers");
+         assert(util_is_aligned(s_layout->compression_layer_stride_B,
+                                AIL_CACHELINE) &&
+                "Cacheline aligned S meta layers");
 
          unsigned stride_lines =
             s_layout->compression_layer_stride_B / AIL_CACHELINE;
@@ -819,7 +793,9 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
             uint8_t image_plane = view->planes[plane].image_plane;
             struct ail_layout *layout = &image->planes[image_plane].layout;
 
-            if (ail_is_level_compressed(layout, view->vk.base_mip_level)) {
+            if (ail_is_level_logically_compressed(layout,
+                                                  view->vk.base_mip_level)) {
+
                perf_debug(cmd, "Decompressing in-place");
 
                unsigned level = view->vk.base_mip_level;
@@ -860,6 +836,13 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          .clearValue = att_info->clearValue,
       };
 
+      render->color_att[i].clear = true;
+
+      static_assert(sizeof(render->color_att[i].clear_colour) ==
+                    sizeof(att_info->clearValue));
+      memcpy(render->color_att[i].clear_colour, &att_info->clearValue,
+             sizeof(att_info->clearValue));
+
       resolved_clear |= is_attachment_stored(att_info);
    }
 
@@ -873,6 +856,10 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       clear_att[clear_count].clearValue.depthStencil.depth =
          attach_z->clearValue.depthStencil.depth;
 
+      render->depth_att.clear = true;
+      render->depth_att.clear_colour[0] =
+         fui(attach_z->clearValue.depthStencil.depth);
+
       resolved_clear |= is_attachment_stored(attach_z);
    }
 
@@ -880,6 +867,10 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
        attach_s->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
       clear_att[clear_count].aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
       clear_att[clear_count].clearValue.depthStencil.stencil =
+         attach_s->clearValue.depthStencil.stencil;
+
+      render->stencil_att.clear = true;
+      render->stencil_att.clear_colour[1] =
          attach_s->clearValue.depthStencil.stencil;
 
       resolved_clear |= is_attachment_stored(attach_s);
@@ -993,28 +984,35 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
    }
 }
 
+static void
+hk_init_heap(const void *data)
+{
+   struct hk_cmd_buffer *cmd = (struct hk_cmd_buffer *)data;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   perf_debug(cmd, "Allocating heap");
+
+   size_t size = 128 * 1024 * 1024;
+   dev->heap = agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
+
+   /* The geometry state buffer is initialized here and then is treated by
+    * the CPU as rodata, even though the GPU uses it for scratch internally.
+    */
+   off_t off = dev->rodata.heap - dev->rodata.bo->va->addr;
+   struct poly_heap *map = agx_bo_map(dev->rodata.bo) + off;
+
+   *map = (struct poly_heap){
+      .base = dev->heap->va->addr,
+      .size = size,
+   };
+}
+
 static uint64_t
 hk_heap(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (unlikely(!dev->heap)) {
-      perf_debug(cmd, "Allocating heap");
-
-      size_t size = 128 * 1024 * 1024;
-      dev->heap = agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
-
-      /* The geometry state buffer is initialized here and then is treated by
-       * the CPU as rodata, even though the GPU uses it for scratch internally.
-       */
-      off_t off = dev->rodata.heap - dev->rodata.bo->va->addr;
-      struct agx_heap *map = agx_bo_map(dev->rodata.bo) + off;
-
-      *map = (struct agx_heap){
-         .base = dev->heap->va->addr,
-         .size = size,
-      };
-   }
+   util_call_once_data(&dev->heap_init_once, hk_init_heap, cmd);
 
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
@@ -1022,7 +1020,7 @@ hk_heap(struct hk_cmd_buffer *cmd)
       uint64_t addr = dev->rodata.heap;
 
       /* Zeroing the allocated index frees everything */
-      hk_queue_write(cmd, addr + offsetof(struct agx_heap, bottom), 0,
+      hk_queue_write(cmd, addr + offsetof(struct poly_heap, bottom), 0,
                      true /* after gfx */);
 
       cmd->uses_heap = true;
@@ -1032,23 +1030,67 @@ hk_heap(struct hk_cmd_buffer *cmd)
 }
 
 static uint64_t
-hk_upload_ia_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+hk_index_buffer(uint64_t index_buffer, uint size_el, uint offset_el,
+                uint elsize_B)
 {
-   assert(!agx_is_indirect(draw.b) && "indirect params written by GPU");
+   if (offset_el < size_el)
+      return index_buffer + (offset_el * elsize_B);
+   else
+      return AGX_ZERO_PAGE_ADDRESS;
+}
 
-   struct agx_ia_state ia = {.verts_per_instance = draw.b.count[0]};
+static uint64_t
+hk_upload_vertex_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+
+   const uint32_t wg_size[3] = {64, 1, 1};
+
+   struct poly_vertex_params params;
+   poly_vertex_params_init(&params, 0, wg_size);
+
+   /* XXX: We should deduplicate this logic */
+   bool indirect = agx_is_indirect(draw.b) || draw.restart;
+
+   if (!indirect)
+      poly_vertex_params_set_draw(&params, draw.b.count[0], draw.b.count[1]);
 
    if (draw.indexed) {
       unsigned index_size_B = agx_index_size_to_B(draw.index_size);
       unsigned range_el = agx_draw_index_range_el(draw);
 
-      ia.index_buffer = libagx_index_buffer(agx_draw_index_buffer(draw),
+      params.index_buffer = hk_index_buffer(agx_draw_index_buffer(draw),
                                             range_el, 0, index_size_B);
 
-      ia.index_buffer_range_el = range_el;
+      params.index_buffer_range_el = range_el;
    }
 
-   return hk_pool_upload(cmd, &ia, sizeof(ia), 8);
+   if (gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY]) {
+
+      struct hk_shader *vs = hk_bound_sw_vs(gfx);
+      params.outputs = vs->b.info.outputs;
+
+      if (!indirect) {
+         uint32_t verts = draw.b.count[0], instances = draw.b.count[1];
+         unsigned vb_size =
+            poly_tcs_in_size(verts * instances, vs->b.info.outputs);
+
+         /* Allocate if there are any outputs, or use the null sink to trap
+          * reads if there aren't. Those reads are undefined but should not
+          * fault. Affects:
+          *
+          *    dEQP-VK.pipeline.monolithic.no_position.explicit_declarations.basic.single_view.v0_g1
+          */
+         params.output_buffer = vb_size ? hk_pool_alloc(cmd, vb_size, 4).gpu
+                                        : AGX_SCRATCH_PAGE_ADDRESS;
+      }
+   }
+
+   desc->root.draw.vertex_outputs = params.outputs;
+
+   return hk_pool_upload(cmd, &params, sizeof(params), 8);
 }
 
 static enum mesa_prim
@@ -1061,7 +1103,7 @@ hk_gs_in_prim(struct hk_cmd_buffer *cmd)
    if (tes != NULL)
       return gfx->tess.prim;
    else
-      return vk_conv_topology(dyn->ia.primitive_topology);
+      return vk_topology_to_mesa(dyn->ia.primitive_topology);
 }
 
 static enum mesa_prim
@@ -1092,13 +1134,10 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
-   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
    struct hk_shader *fs = hk_only_variant(gfx->shaders[MESA_SHADER_FRAGMENT]);
-
-   bool rast_disc = dyn->rs.rasterizer_discard_enable;
-   struct hk_shader *count = hk_count_gs_variant(gs, rast_disc);
+   struct hk_shader *count = hk_count_gs_variant(gs);
 
    /* XXX: We should deduplicate this logic */
    bool indirect = agx_is_indirect(draw.b) ||
@@ -1109,22 +1148,24 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       mode = u_decomposed_prim(mode);
    }
 
-   struct agx_geometry_params params = {
-      .flat_outputs = fs->info.fs.interp.flat,
-      .input_topology = mode,
+   const uint32_t wg_size[3] = {64, 1, 1};
 
-      /* Overriden by the indirect setup kernel. As tess->GS is always indirect,
-       * we can assume here that we're VS->GS.
-       */
-      .input_buffer = desc->root.draw.vertex_output_buffer,
-      .input_mask = desc->root.draw.vertex_outputs,
-   };
+   struct poly_geometry_params params;
+   poly_geometry_params_init(&params, mode, wg_size);
+
+   params.flat_outputs = fs->info.fs.interp.flat;
 
    if (gfx->xfb_enabled) {
       for (unsigned i = 0; i < ARRAY_SIZE(gfx->xfb); ++i) {
          params.xfb_base_original[i] = gfx->xfb[i].addr;
          params.xfb_size[i] = gfx->xfb[i].range;
          params.xfb_offs_ptrs[i] = gfx->xfb_offsets + i * sizeof(uint32_t);
+      }
+   } else {
+      for (unsigned i = 0; i < ARRAY_SIZE(gfx->xfb); ++i) {
+         params.xfb_offs_ptrs[i] = AGX_ZERO_PAGE_ADDRESS;
+         params.xfb_base_original[i] = AGX_ZERO_PAGE_ADDRESS;
+         params.xfb_size[i] = 0;
       }
    }
 
@@ -1134,8 +1175,17 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       if (q) {
          params.xfb_prims_generated_counter[i] = q;
          params.prims_generated_counter[i] = q + sizeof(uint64_t);
+      } else {
+         params.xfb_prims_generated_counter[i] = AGX_SCRATCH_PAGE_ADDRESS;
+         params.prims_generated_counter[i] = AGX_SCRATCH_PAGE_ADDRESS;
       }
+
+      /* TODO: Optimize out? */
+      params.xfb_overflow[i] = AGX_SCRATCH_PAGE_ADDRESS;
    }
+
+   /* TODO: Optimize out? */
+   params.xfb_any_overflow = AGX_SCRATCH_PAGE_ADDRESS;
 
    /* Calculate input primitive count for direct draws, and allocate the vertex
     * & count buffers. GPU calculates and allocates for indirect draws.
@@ -1148,45 +1198,32 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       params.count_buffer = T.gpu;
    }
 
-   /* Workgroup size */
-   params.vs_grid[3] = params.gs_grid[3] = 64;
-   params.vs_grid[4] = params.gs_grid[4] = 1;
-   params.vs_grid[5] = params.gs_grid[5] = 1;
-
-   struct agx_gs_info *gsi = &count->info.gs;
+   struct poly_gs_info *gsi = &count->info.gs;
 
    if (indirect) {
-      /* TODO: size */
-      cmd->geom_indirect = hk_pool_alloc(cmd, 64, 4).gpu;
+      if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+         /* Need to allocate heap if we haven't yet */
+         hk_heap(cmd);
 
-      params.indirect_desc = cmd->geom_indirect;
-      params.vs_grid[2] = params.gs_grid[2] = 1;
-
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
          cmd->geom_index_buffer = dev->heap->va->addr;
          cmd->geom_index_count = dev->heap->size;
+      } else {
+         cmd->geom_index_count =
+            poly_gs_rast_vertices(gsi->shape, gsi->max_indices, 1, 0);
       }
    } else {
-      uint32_t verts = draw.b.count[0], instances = draw.b.count[1];
-
-      params.vs_grid[0] = verts;
-      params.gs_grid[0] = u_decomposed_prims_for_vertices(mode, verts);
-
-      params.primitives_log2 = util_logbase2_ceil(params.gs_grid[0]);
-      params.input_primitives = params.gs_grid[0] * instances;
+      poly_geometry_params_set_draw(&params, mode, gsi->shape, gsi->max_indices,
+                                    draw.b.count[0], draw.b.count[1]);
 
       unsigned size = params.input_primitives * params.count_buffer_stride;
       if (count->info.gs.prefix_sum && size) {
          params.count_buffer = hk_pool_alloc(cmd, size, 4).gpu;
       }
 
-      cmd->geom_index_count = agx_gs_rast_vertices(
-         gsi->shape, gsi->max_indices, params.gs_grid[0], instances);
+      cmd->geom_index_count = params.draw.index_count;
+      cmd->geom_instance_count = params.draw.instance_count;
 
-      cmd->geom_instance_count = agx_gs_rast_instances(
-         gsi->shape, gsi->max_indices, params.gs_grid[0], instances);
-
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+      if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          params.output_index_buffer =
             hk_pool_alloc(cmd, cmd->geom_index_count * 4, 4).gpu;
 
@@ -1194,7 +1231,7 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       }
    }
 
-   if (gsi->shape == AGX_GS_SHAPE_STATIC_INDEXED) {
+   if (gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
       cmd->geom_index_buffer =
          hk_pool_upload(cmd, count->info.gs.topology, gsi->max_indices * 4, 4);
    }
@@ -1204,7 +1241,7 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 }
 
 static void
-hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct libagx_tess_args *out,
+hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out,
                       struct agx_draw draw)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1212,14 +1249,14 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct libagx_tess_args *out,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *tcs = hk_only_variant(gfx->shaders[MESA_SHADER_TESS_CTRL]);
 
-   enum libagx_tess_partitioning partitioning =
+   enum poly_tess_partitioning partitioning =
       gfx->tess.info.spacing == TESS_SPACING_EQUAL
-         ? LIBAGX_TESS_PARTITIONING_INTEGER
+         ? POLY_TESS_PARTITIONING_INTEGER
       : gfx->tess.info.spacing == TESS_SPACING_FRACTIONAL_ODD
-         ? LIBAGX_TESS_PARTITIONING_FRACTIONAL_ODD
-         : LIBAGX_TESS_PARTITIONING_FRACTIONAL_EVEN;
+         ? POLY_TESS_PARTITIONING_FRACTIONAL_ODD
+         : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
 
-   struct libagx_tess_args args = {
+   struct poly_tess_params args = {
       .heap = hk_heap(cmd),
       .tcs_stride_el = tcs->info.tess.tcs_output_stride / 4,
       .statistic = hk_pipeline_stat_addr(
@@ -1253,13 +1290,13 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct libagx_tess_args *out,
 
       uint32_t alloc = 0;
       uint32_t tcs_out_offs = alloc;
-      alloc += unrolled_patches * args.tcs_stride_el * 4 * 32;
+      alloc += unrolled_patches * args.tcs_stride_el * sizeof(uint32_t);
 
       uint32_t patch_coord_offs = alloc;
-      alloc += unrolled_patches * 4 * 32;
+      alloc += unrolled_patches * sizeof(uint32_t);
 
       uint32_t count_offs = alloc;
-      alloc += unrolled_patches * sizeof(uint32_t) * 32;
+      alloc += unrolled_patches * sizeof(uint32_t);
 
       /* Single API draw */
       uint32_t draw_offs = alloc;
@@ -1313,7 +1350,7 @@ hk_build_meta_shader_locked(struct hk_device *dev, struct hk_internal_key *key,
    hk_preprocess_nir_internal(dev->vk.physical, b.shader);
 
    struct hk_api_shader *s;
-   if (hk_compile_shader(dev, &info, NULL, NULL, &s) != VK_SUCCESS)
+   if (hk_compile_shader(dev, &info, NULL, NULL, NULL, &s) != VK_SUCCESS)
       return NULL;
 
    /* ..and cache it before we return. The key is on the stack right now, so
@@ -1382,7 +1419,7 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
    draw = hk_draw_as_indexed_indirect(cmd, draw);
 
    /* Next, we unroll the index buffer used by the indirect draw */
-   enum mesa_prim prim = vk_conv_topology(dyn->ia.primitive_topology);
+   enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
 
    assert(draw_count == 1 && "TODO: multidraw");
 
@@ -1401,7 +1438,7 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
 
    libagx_unroll_restart_struct(cmd, agx_1d(1024 * draw_count),
                                 AGX_BARRIER_ALL | AGX_PREGFX, ia,
-                                libagx_compact_prim(prim));
+                                poly_compact_prim(prim));
 
    return agx_draw_indexed_indirect(ia.out_draw, dev->heap->va->addr,
                                     dev->heap->size, draw.index_size,
@@ -1418,14 +1455,12 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
    struct agx_grid grid_vs, grid_gs;
 
-   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   bool rast_disc = dyn->rs.rasterizer_discard_enable;
-
    struct hk_shader *vs = hk_bound_sw_vs_before_gs(gfx);
-   struct hk_shader *main = hk_main_gs_variant(gs, rast_disc);
-   struct hk_shader *count = hk_count_gs_variant(gs, rast_disc);
-   struct hk_shader *pre_gs = hk_pre_gs_variant(gs, rast_disc);
+   struct hk_shader *main = hk_main_gs_variant(gs);
+   struct hk_shader *count = hk_count_gs_variant(gs);
+   struct hk_shader *pre_gs = hk_pre_gs_variant(gs);
 
+   uint64_t vertex_params = desc->root.draw.vertex_params;
    uint64_t geometry_params = desc->root.draw.geometry_params;
    unsigned count_words = count->info.gs.count_words;
    struct agx_workgroup wg = agx_workgroup(64, 1, 1);
@@ -1450,7 +1485,7 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          .heap = hk_heap(cmd),
          .index_buffer = draw.index_buffer,
          .draw = draw.b.ptr,
-         .ia = desc->root.draw.input_assembly,
+         .vp = desc->root.draw.vertex_params,
          .p = desc->root.draw.geometry_params,
          .vs_outputs = vs->b.info.outputs,
          .prim = mode,
@@ -1458,15 +1493,6 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          .max_indices = count->info.gs.max_indices,
          .shape = count->info.gs.shape,
       };
-
-      if (cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL]) {
-         gsi.vertex_buffer = desc->root.draw.tess_params +
-                             offsetof(struct libagx_tess_args, tes_buffer);
-      } else {
-         gsi.vertex_buffer = desc->root.root_desc_addr +
-                             offsetof(struct hk_root_descriptor_table,
-                                      draw.vertex_output_buffer);
-      }
 
       if (draw.indexed) {
          gsi.index_size_B = agx_index_size_to_B(draw.index_size);
@@ -1477,10 +1503,10 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                       AGX_BARRIER_ALL | AGX_PREGFX, gsi);
 
       grid_vs = agx_grid_indirect_local(
-         geometry_params + offsetof(struct agx_geometry_params, vs_grid));
+         vertex_params + offsetof(struct poly_vertex_params, grid));
 
       grid_gs = agx_grid_indirect_local(
-         geometry_params + offsetof(struct agx_geometry_params, gs_grid));
+         geometry_params + offsetof(struct poly_geometry_params, grid));
    } else {
       grid_vs = grid_gs = draw.b;
       grid_gs.count[0] = u_decomposed_prims_for_vertices(mode, draw.b.count[0]);
@@ -1530,14 +1556,14 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* Pre-rast geometry shader */
    hk_dispatch_with_local_size(cmd, cs, main, grid_gs, wg);
 
-   if (agx_gs_indexed(count->info.gs.shape)) {
+   if (poly_gs_indexed(count->info.gs.shape)) {
       enum agx_index_size index_size =
-         agx_translate_index_size(agx_gs_index_size(count->info.gs.shape));
+         agx_translate_index_size(poly_gs_index_size(count->info.gs.shape));
 
       if (agx_is_indirect(draw.b)) {
          return agx_draw_indexed_indirect(
-            cmd->geom_indirect, cmd->geom_index_buffer, cmd->geom_index_count,
-            index_size, true);
+            geometry_params + offsetof(struct poly_geometry_params, draw),
+            cmd->geom_index_buffer, cmd->geom_index_count, index_size, true);
       } else {
          return agx_draw_indexed(cmd->geom_index_count,
                                  cmd->geom_instance_count, 0, 0, 0,
@@ -1546,7 +1572,8 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    } else {
       if (agx_is_indirect(draw.b)) {
-         return agx_draw_indirect(cmd->geom_indirect);
+         return agx_draw_indirect(geometry_params +
+                                  offsetof(struct poly_geometry_params, draw));
       } else {
          return (struct agx_draw){
             .b = agx_3d(cmd->geom_index_count, cmd->geom_instance_count, 1),
@@ -1584,11 +1611,8 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          .p = state,
          .grids = gfx->tess.grids,
          .indirect = draw.b.ptr,
-         .ia = gfx->descriptors.root.draw.input_assembly,
+         .vp = gfx->descriptors.root.draw.vertex_params,
          .vertex_outputs = vs->b.info.outputs,
-         .vertex_output_buffer_ptr =
-            gfx->root + offsetof(struct hk_root_descriptor_table,
-                                 draw.vertex_output_buffer),
          .tcs_statistic = hk_pipeline_stat_addr(
             cmd,
             VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_CONTROL_SHADER_PATCHES_BIT),
@@ -1615,7 +1639,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       grid_tess = agx_1d(patches * draw.b.count[1]);
 
       /* TCS invocation counter increments once per-patch */
-      if (tcs_stat) {
+      if (hk_stat_enabled(tcs_stat)) {
          perf_debug(cmd, "Direct TCS statistic");
          libagx_increment_statistic(
             cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX, tcs_stat, patches);
@@ -1637,13 +1661,13 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* First generate counts, then prefix sum them, and then tessellate. */
    libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX, info.mode,
-                     LIBAGX_TESS_MODE_COUNT, state);
+                     POLY_TESS_MODE_COUNT, state);
 
    libagx_prefix_sum_tess(cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX,
                           state, c_prims, c_inv, c_prims || c_inv);
 
    libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX, info.mode,
-                     LIBAGX_TESS_MODE_WITH_COUNTS, state);
+                     POLY_TESS_MODE_WITH_COUNTS, state);
 
    return agx_draw_indexed_indirect(gfx->tess.out_draws, dev->heap->va->addr,
                                     dev->heap->size, AGX_INDEX_SIZE_U32, false);
@@ -1651,7 +1675,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 void
 hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
-                            const gl_shader_stage stage,
+                            const mesa_shader_stage stage,
                             struct hk_api_shader *shader)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1690,9 +1714,11 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
 
    /* Geometry shading overrides the restart index, reemit on rebind */
    if (IS_SHADER_DIRTY(GEOMETRY)) {
+      struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
       struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
       desc->root.draw.api_gs = gs && !gs->is_passthrough;
+      BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE);
    }
 
    struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
@@ -1805,13 +1831,27 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
    return linked;
 }
 
+static bool
+lower_fs_root(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_root_agx)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_load_preamble(b, 1, 64, .base = AGX_ABI_FUNI_ROOT));
+   return true;
+}
+
 static void
 build_fs_prolog(nir_builder *b, const void *key)
 {
    agx_nir_fs_prolog(b, key);
 
    /* Lower load_stat_query_address_agx, needed for FS statistics */
-   NIR_PASS(_, b->shader, hk_lower_uvs_index, 0);
+   NIR_PASS(_, b->shader, hk_lower_uvs_index, MESA_SHADER_FRAGMENT, 0);
+   NIR_PASS(_, b->shader, nir_shader_intrinsics_pass, lower_fs_root,
+            nir_metadata_control_flow, NULL);
 }
 
 static struct hk_linked_shader *
@@ -1868,7 +1908,7 @@ hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
    else if (shader->info.stage == MESA_SHADER_FRAGMENT)
       linked = hk_get_fast_linked_locked_fs(dev, shader, key);
    else
-      unreachable("invalid stage");
+      UNREACHABLE("invalid stage");
 
    simple_mtx_unlock(&shader->linked.lock);
    return linked;
@@ -1880,7 +1920,7 @@ hk_update_fast_linked(struct hk_cmd_buffer *cmd, struct hk_shader *shader,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_linked_shader *new = hk_get_fast_linked(dev, shader, key);
-   gl_shader_stage stage = shader->info.stage;
+   mesa_shader_stage stage = shader->info.stage;
 
    if (cmd->state.gfx.linked[stage] != new) {
       cmd->state.gfx.linked[stage] = new;
@@ -2070,7 +2110,7 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    };
 
    size_t size = agx_ppp_update_size(&present);
-   struct agx_ptr T = hk_pool_alloc(cmd, size, 64);
+   struct agx_ptr T = hk_pool_alloc(cmd, size, AGX_PPP_HEADER_ALIGN);
    if (!T.cpu)
       return;
 
@@ -2146,7 +2186,7 @@ translate_hw_primitive_topology(enum mesa_prim prim)
    case MESA_PRIM_TRIANGLE_FAN:
       return AGX_PRIMITIVE_TRIANGLE_FAN;
    default:
-      unreachable("Invalid hardware primitive topology");
+      UNREACHABLE("Invalid hardware primitive topology");
    }
 }
 
@@ -2179,8 +2219,9 @@ hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    uint32_t index = cmd->state.gfx.index.restart;
 
    if (gs) {
-      enum agx_gs_shape shape = gs->variants[HK_GS_VARIANT_COUNT].info.gs.shape;
-      index = BITFIELD_MASK(8 * agx_gs_index_size(shape));
+      enum poly_gs_shape shape =
+         gs->variants[HK_GS_VARIANT_COUNT].info.gs.shape;
+      index = BITFIELD_MASK(8 * poly_gs_index_size(shape));
    }
 
    /* VDM State updates are relatively expensive, so only emit them when the
@@ -2242,7 +2283,7 @@ hk_default_sample_positions(unsigned nr_samples)
    case 4:
       return 0xeaa26e26;
    default:
-      unreachable("Invalid sample count");
+      UNREACHABLE("Invalid sample count");
    }
 }
 
@@ -2308,6 +2349,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       .viewport_count = 1, /* irrelevant */
    };
 
+   dirty.fragment_shader &= !linked_fs->b.no_op;
+
    /* Calculate the update size. If it equals the header, there is nothing to
     * update so early-exit.
     */
@@ -2318,7 +2361,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    /* Otherwise, allocate enough space for the update and push it. */
    assert(size > AGX_PPP_HEADER_LENGTH);
 
-   struct agx_ptr T = hk_pool_alloc(cmd, size, 64);
+   struct agx_ptr T = hk_pool_alloc(cmd, size, AGX_PPP_HEADER_ALIGN);
    if (!T.cpu)
       return;
 
@@ -2354,7 +2397,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       agx_ppp_push_merged(&ppp, FRAGMENT_CONTROL, cfg,
                           linked_fs->b.fragment_control) {
 
-         cfg.tag_write_disable = dyn->rs.rasterizer_discard_enable;
+         cfg.tag_write_disable = hk_rast_discard(cmd);
       }
    }
 
@@ -2445,7 +2488,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          }
 
          cfg.flat_shading_vertex = translate_ppp_vertex(gfx->provoking);
-         cfg.rasterizer_discard = dyn->rs.rasterizer_discard_enable;
+         cfg.rasterizer_discard = hk_rast_discard(cmd);
 
          /* We do not support unrestricted depth, so clamping is inverted from
           * clipping. This implementation seems to pass CTS without unrestricted
@@ -2518,6 +2561,60 @@ hk_depth_bias_factor(VkFormat format, bool exact, bool force_unorm)
    }
 }
 
+static bool
+uses_blend_constant(const struct vk_color_blend_state *cb)
+{
+   static_assert(VK_BLEND_FACTOR_CONSTANT_COLOR + 1 ==
+                 VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR);
+
+   static_assert(VK_BLEND_FACTOR_CONSTANT_COLOR + 2 ==
+                 VK_BLEND_FACTOR_CONSTANT_ALPHA);
+
+   static_assert(VK_BLEND_FACTOR_CONSTANT_COLOR + 3 ==
+                 VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA);
+
+   for (unsigned i = 0; i < cb->attachment_count; ++i) {
+      unsigned factors[] = {
+         cb->attachments[i].src_color_blend_factor,
+         cb->attachments[i].src_alpha_blend_factor,
+         cb->attachments[i].dst_color_blend_factor,
+         cb->attachments[i].dst_alpha_blend_factor,
+      };
+
+      for (unsigned j = 0; j < ARRAY_SIZE(factors); ++j) {
+         if (factors[j] >= VK_BLEND_FACTOR_CONSTANT_COLOR &&
+             factors[j] <= VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+void
+agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
+                    uint64_t attribs_read, struct agx_velem_key *keys)
+{
+   u_foreach_bit(a, vi->attributes_valid) {
+      struct vk_vertex_attribute_state attr = vi->attributes[a];
+
+      assert(vi->bindings_valid & BITFIELD_BIT(attr.binding));
+      struct vk_vertex_binding_state binding = vi->bindings[attr.binding];
+
+      /* nir_assign_io_var_locations compacts vertex inputs, eliminating
+       * unused inputs. We need to do the same here to match the locations.
+       */
+      unsigned slot = util_bitcount64(attribs_read & BITFIELD_MASK(a));
+
+      keys[slot] = (struct agx_velem_key){
+         .format = hk_format_to_pipe_format(attr.format),
+         .stride = binding.stride,
+         .divisor = binding.divisor,
+         .instanced = binding.input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
+      };
+   }
+}
+
 static void
 hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        uint32_t draw_id, struct agx_draw draw)
@@ -2552,7 +2649,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (IS_DIRTY(CB_BLEND_CONSTANTS)) {
       static_assert(sizeof(desc->root.draw.blend_constant) ==
-                       sizeof(dyn->cb.blend_constants) &&
+                       sizeof(dyn->cb.blend_constants),
                     "common size");
 
       memcpy(desc->root.draw.blend_constant, dyn->cb.blend_constants,
@@ -2560,9 +2657,20 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       desc->root_dirty = true;
    }
 
+   if (IS_DIRTY(CB_BLEND_EQUATIONS) || IS_DIRTY(CB_BLEND_ENABLES)) {
+      gfx->uses_blend_constant = uses_blend_constant(&dyn->cb);
+   }
+
    if (IS_DIRTY(MS_SAMPLE_MASK)) {
       desc->root.draw.api_sample_mask = dyn->ms.sample_mask;
       desc->root_dirty = true;
+   }
+
+   if (IS_DIRTY(RS_RASTERIZATION_STREAM)) {
+      desc->root.draw.rasterization_stream = dyn->rs.rasterization_stream;
+      desc->root_dirty = true;
+
+      BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE);
    }
 
    if (fs_dirty || IS_DIRTY(DS_DEPTH_TEST_ENABLE) ||
@@ -2610,9 +2718,10 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                : AGX_ROBUSTNESS_DISABLED,
 
          .prolog.robustness.soft_fault = agx_has_soft_fault(&dev->dev),
+         .prolog.static_vi = !sw_vs->info.vs.use_prolog,
       };
 
-      enum mesa_prim prim = vk_conv_topology(dyn->ia.primitive_topology);
+      enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
 
       if (mesa_prim_has_adjacency(prim)) {
          if (draw.restart) {
@@ -2632,31 +2741,24 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       BITSET_COPY(key.prolog.component_mask,
                   sw_vs->info.vs.attrib_components_read);
 
-      u_foreach_bit(a, dyn->vi->attributes_valid) {
-         struct vk_vertex_attribute_state attr = dyn->vi->attributes[a];
+      if (sw_vs->info.vs.use_prolog) {
+         agx_fill_velem_keys(dyn->vi, sw_vs->info.vs.attribs_read,
+                             key.prolog.attribs);
 
-         assert(dyn->vi->bindings_valid & BITFIELD_BIT(attr.binding));
-         struct vk_vertex_binding_state binding =
-            dyn->vi->bindings[attr.binding];
+         u_foreach_bit(a, dyn->vi->attributes_valid) {
+            unsigned slot =
+               util_bitcount64(sw_vs->info.vs.attribs_read & BITFIELD_MASK(a));
 
-         /* nir_assign_io_var_locations compacts vertex inputs, eliminating
-          * unused inputs. We need to do the same here to match the locations.
-          */
-         unsigned slot =
-            util_bitcount64(sw_vs->info.vs.attribs_read & BITFIELD_MASK(a));
-
-         key.prolog.attribs[slot] = (struct agx_velem_key){
-            .format = hk_format_to_pipe_format(attr.format),
-            .stride = dyn->vi_binding_strides[attr.binding],
-            .divisor = binding.divisor,
-            .instanced = binding.input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
-         };
+            key.prolog.attribs[slot].stride =
+               dyn->vi_binding_strides[dyn->vi->attributes[a].binding];
+         }
       }
 
       hk_update_fast_linked(cmd, sw_vs, &key);
    }
 
-   if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) || vgt_dirty ||
+   if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+       IS_DIRTY(VI_BINDING_STRIDES) || vgt_dirty ||
        (gfx->dirty & HK_DIRTY_VB)) {
 
       unsigned slot = 0;
@@ -2664,14 +2766,21 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          if (dyn->vi->attributes_valid & BITFIELD_BIT(a)) {
             struct vk_vertex_attribute_state attr = dyn->vi->attributes[a];
             struct hk_addr_range vb = gfx->vb[attr.binding];
+            enum pipe_format fmt = hk_format_to_pipe_format(attr.format);
+            enum pipe_format interchange_format = agx_vbo_internal_format(fmt);
+            unsigned interchange_align =
+               util_format_get_blocksize(interchange_format);
 
             desc->root.draw.attrib_clamps[slot] = agx_calculate_vbo_clamp(
-               vb.addr, hk_format_to_pipe_format(attr.format), vb.range,
-               dyn->vi_binding_strides[attr.binding], attr.offset,
-               &desc->root.draw.attrib_base[slot]);
+               vb.addr, fmt, vb.range, dyn->vi_binding_strides[attr.binding],
+               attr.offset, &desc->root.draw.attrib_base[slot]);
+
+            desc->root.draw.attrib_strides[slot] =
+               dyn->vi_binding_strides[attr.binding] / interchange_align;
          } else {
             desc->root.draw.attrib_base[slot] = AGX_ZERO_PAGE_ADDRESS;
             desc->root.draw.attrib_clamps[slot] = 0;
+            desc->root.draw.attrib_strides[slot] = 0;
          }
 
          ++slot;
@@ -2708,8 +2817,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          samples_shaded = dyn->ms.rasterization_samples;
 
       struct hk_fast_link_key_fs key = {
-         .prolog.statistics = hk_pipeline_stat_addr(
-            cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT),
+         .prolog.statistics = hk_stat_enabled(hk_pipeline_stat_addr(
+            cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)),
 
          .prolog.cull_distance_size = hw_vs->info.cull_distance_array_size,
          .prolog.api_sample_mask = has_sample_mask ? api_sample_mask : 0xff,
@@ -2949,44 +3058,13 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || linked_vs->sw_indexing) {
-      /* XXX: We should deduplicate this logic */
-      bool indirect = agx_is_indirect(draw.b) || draw.restart;
-
-      desc->root.draw.input_assembly =
-         indirect ? hk_pool_alloc(cmd, sizeof(struct agx_ia_state), 4).gpu
-                  : hk_upload_ia_params(cmd, draw);
+      desc->root.draw.vertex_params = hk_upload_vertex_params(cmd, draw);
       desc->root_dirty = true;
-   }
-
-   if (gfx->shaders[MESA_SHADER_TESS_EVAL] ||
-       gfx->shaders[MESA_SHADER_GEOMETRY]) {
-
-      struct hk_shader *vs = hk_bound_sw_vs(gfx);
-      desc->root.draw.vertex_outputs = vs->b.info.outputs;
-
-      /* XXX: We should deduplicate this logic */
-      bool indirect = agx_is_indirect(draw.b) || draw.restart;
-
-      if (!indirect) {
-         uint32_t verts = draw.b.count[0], instances = draw.b.count[1];
-         unsigned vb_size =
-            libagx_tcs_in_size(verts * instances, vs->b.info.outputs);
-
-         /* Allocate if there are any outputs, or use the null sink to trap
-          * reads if there aren't. Those reads are undefined but should not
-          * fault. Affects:
-          *
-          *    dEQP-VK.pipeline.monolithic.no_position.explicit_declarations.basic.single_view.v0_g1
-          */
-         desc->root.draw.vertex_output_buffer =
-            vb_size ? hk_pool_alloc(cmd, vb_size, 4).gpu
-                    : dev->rodata.null_sink;
-      }
    }
 
    struct agx_ptr tess_args = {0};
    if (gfx->shaders[MESA_SHADER_TESS_EVAL]) {
-      tess_args = hk_pool_alloc(cmd, sizeof(struct libagx_tess_args), 4);
+      tess_args = hk_pool_alloc(cmd, sizeof(struct poly_tess_params), 4);
       gfx->descriptors.root.draw.tess_params = tess_args.gpu;
       gfx->descriptors.root_dirty = true;
    }
@@ -3046,7 +3124,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       agx_push(out, VDM_STATE_VERTEX_UNKNOWN, cfg) {
          cfg.flat_shading_control = translate_vdm_vertex(gfx->provoking);
-         cfg.unknown_4 = cfg.unknown_5 = dyn->rs.rasterizer_discard_enable;
+         cfg.unknown_4 = cfg.unknown_5 = hk_rast_discard(cmd);
          cfg.generate_primitive_id = gfx->generate_primitive_id;
       }
 
@@ -3365,7 +3443,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
    }
 
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   enum mesa_prim prim = vk_conv_topology(dyn->ia.primitive_topology);
+   enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
 
    bool geom = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
    bool tess = cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
@@ -3425,8 +3503,10 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    uint64_t stat_c_prims = hk_pipeline_stat_addr(
       cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT);
 
-   bool ia_stats = stat_ia_verts || stat_ia_prims || stat_vs_inv ||
-                   stat_c_inv || stat_c_prims;
+   bool ia_stats = hk_stat_enabled(stat_ia_verts) ||
+                   hk_stat_enabled(stat_ia_prims) ||
+                   hk_stat_enabled(stat_vs_inv) ||
+                   hk_stat_enabled(stat_c_inv) || hk_stat_enabled(stat_c_prims);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    hk_foreach_view(cmd) {
@@ -3442,8 +3522,8 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       bool geom = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
       bool tess = cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
       bool needs_idx_robust = hk_needs_index_robustness(cmd, &draw);
-      bool adj =
-         mesa_prim_has_adjacency(vk_conv_topology(dyn->ia.primitive_topology));
+      bool adj = mesa_prim_has_adjacency(
+         vk_topology_to_mesa(dyn->ia.primitive_topology));
       adj &= !geom;
       needs_idx_robust &= !adj;
 
@@ -3475,19 +3555,11 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 
       if (geom) {
          draw = hk_launch_gs_prerast(cmd, ccs, draw);
-
-         /* We must not draw if the app specified rasterizer discard. This is
-          * required for both performance (it is pointless to rasterize and
-          * there are no side effects), but also correctness (no indirect draw
-          * descriptor will be filled out).
-          */
-         if (dyn->rs.rasterizer_discard_enable)
-            continue;
       }
 
       if (adj) {
          assert(!geom && "geometry shaders handle adj directly");
-         enum mesa_prim prim = vk_conv_topology(dyn->ia.primitive_topology);
+         enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
 
          if (draw.restart) {
             draw = hk_draw_without_restart(cmd, draw, 1);
@@ -3505,7 +3577,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 
             libagx_draw_without_adj(
                cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX, out_draw,
-               draw.b.ptr, desc->root.draw.input_assembly, draw.index_buffer,
+               draw.b.ptr, desc->root.draw.vertex_params, draw.index_buffer,
                draw.indexed ? agx_draw_index_range_el(draw) : 0,
                draw.indexed ? agx_index_size_to_B(draw.index_size) : 0, prim);
 
@@ -3787,7 +3859,7 @@ hk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
                                VkDeviceSize counterBufferOffset,
                                uint32_t counterOffset, uint32_t vertexStride)
 {
-   unreachable("TODO");
+   UNREACHABLE("TODO");
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3894,11 +3966,11 @@ hk_CmdBeginConditionalRenderingEXT(
    VkCommandBuffer commandBuffer,
    const VkConditionalRenderingBeginInfoEXT *pConditionalRenderingBegin)
 {
-   unreachable("stub");
+   UNREACHABLE("stub");
 }
 
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
 {
-   unreachable("stub");
+   UNREACHABLE("stub");
 }

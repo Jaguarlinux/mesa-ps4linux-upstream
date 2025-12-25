@@ -2,16 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ir::*;
-use crate::sm70::ShaderModel70;
 use compiler::cfg::CFGBuilder;
 use rustc_hash::FxBuildHasher;
 
 use std::io::Write;
-use std::mem;
 use std::process;
 use std::process::Command;
 use std::slice;
 use std::sync::atomic::AtomicUsize;
+use std::sync::OnceLock;
 
 static FILE_NUM: AtomicUsize = AtomicUsize::new(0);
 
@@ -22,7 +21,7 @@ fn run_nvdisasm(s: &Shader) -> String {
     let slice_u8: &[u8] = unsafe {
         slice::from_raw_parts(
             code.as_ptr() as *const u8,
-            code.len() * mem::size_of::<u32>(),
+            code.len() * size_of::<u32>(),
         )
     };
 
@@ -48,7 +47,7 @@ fn run_nvdisasm(s: &Shader) -> String {
     stdout.into()
 }
 
-fn disassemble_instrs(instrs: Vec<Box<Instr>>, sm: u8) -> Vec<String> {
+fn disassemble_instrs(instrs: Vec<Instr>, sm: u8) -> Vec<String> {
     let mut label_alloc = LabelAllocator::new();
     let block = BasicBlock {
         label: label_alloc.alloc(),
@@ -88,9 +87,9 @@ fn disassemble_instrs(instrs: Vec<Box<Instr>>, sm: u8) -> Vec<String> {
         io: ShaderIoInfo::None,
     };
 
-    let sm: Box<dyn ShaderModel> = Box::new(ShaderModel70::new(sm));
+    let sm = ShaderModelInfo::new(sm, 0);
     let s = Shader {
-        sm: &*sm,
+        sm: &sm,
         info: info,
         functions: vec![f],
     };
@@ -117,7 +116,7 @@ fn disassemble_instrs(instrs: Vec<Box<Instr>>, sm: u8) -> Vec<String> {
 }
 
 struct DisasmCheck {
-    instrs: Vec<Box<Instr>>,
+    instrs: Vec<Instr>,
     expected: Vec<String>,
 }
 
@@ -130,7 +129,7 @@ impl DisasmCheck {
     }
 
     fn push(&mut self, instr: impl Into<Instr>, expected: impl Into<String>) {
-        self.instrs.push(Box::new(instr.into()));
+        self.instrs.push(instr.into());
         self.expected.push(expected.into());
     }
 
@@ -159,11 +158,32 @@ impl DisasmCheck {
     }
 }
 
-const SM_LIST: [u8; 8] = [70, 75, 80, 86, 89, 90, 100, 120];
+static SM_LIST_CELL: OnceLock<&'static [u8]> = OnceLock::new();
+
+fn sm_list() -> &'static [u8] {
+    SM_LIST_CELL.get_or_init(|| {
+        let out = Command::new("nvdisasm")
+            .arg("--version")
+            .output()
+            .expect("failed to execute process");
+
+        std::io::stderr().write_all(&out.stderr).expect("IO error");
+        assert!(out.status.success());
+        let stdout = std::str::from_utf8(&out.stdout).unwrap();
+
+        if stdout.contains("cuda_12") {
+            &[70, 75, 80, 86, 89, 90, 100, 120]
+        } else if stdout.contains("cuda_13") {
+            &[75, 80, 86, 89, 90, 100, 120]
+        } else {
+            panic!("Unknown nvdisasm version. stdout: {stdout}");
+        }
+    })
+}
 
 #[test]
 pub fn test_nop() {
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
         c.push(OpNop { label: None }, "nop;");
         c.check(sm);
@@ -190,7 +210,7 @@ pub fn test_ldc() {
         (MemType::B128, ".128"),
     ];
 
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
         for reg_file in reg_files {
             if reg_file == RegFile::UGPR && sm < 73 {
@@ -290,7 +310,7 @@ pub fn test_ld_st_atom() {
         MemSpace::Local,
     ];
 
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
         for space in spaces {
             for (addr_offset, addr_offset_str) in [(0x12, "0x12"), (-1, "-0x1")]
@@ -431,14 +451,9 @@ pub fn test_texture() {
         TexQuery::SamplerPos,
     ];
 
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
         for lod_mode in lod_modes {
-            let lod_mode_str = if lod_mode == TexLodMode::Auto {
-                String::new()
-            } else {
-                format!(".{lod_mode}")
-            };
             if lod_mode == TexLodMode::BiasClamp && sm >= 100 {
                 continue;
             }
@@ -453,6 +468,7 @@ pub fn test_texture() {
 
                 dim: TexDim::_2D,
                 lod_mode,
+                deriv_mode: TexDerivMode::Auto,
                 z_cmpr: false,
                 offset_mode: TexOffsetMode::None,
                 mem_eviction_priority: MemEvictionPriority::First,
@@ -462,7 +478,7 @@ pub fn test_texture() {
             c.push(
                 instr,
                 format!(
-                    "tex.b{lod_mode_str}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"
+                    "tex.b{lod_mode}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"
                 ),
             );
 
@@ -485,7 +501,9 @@ pub fn test_texture() {
                 };
                 c.push(
                     instr,
-                    format!("tld.b{lod_mode_str}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+                    format!(
+                        "tld.b{lod_mode}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"
+                    ),
                 );
             }
         }
@@ -527,10 +545,14 @@ pub fn test_texture() {
             srcs: [SrcRef::Reg(r1).into(), SrcRef::Reg(r3).into()],
 
             dim: TexDim::_2D,
+            deriv_mode: TexDerivMode::Auto,
             nodep: true,
             channel_mask: ChannelMask::for_comps(3),
         };
-        c.push(instr, format!("tmml.b.lod.nodep r2, r0, r1, r3, 2d, 0x7;"));
+        c.push(
+            instr,
+            "tmml.b.lod.nodep r2, r0, r1, r3, 2d, 0x7;".to_string(),
+        );
 
         let instr = OpTxd {
             dsts: [Dst::Reg(r0), Dst::Reg(r2)],
@@ -548,7 +570,7 @@ pub fn test_texture() {
         };
         c.push(
             instr,
-            format!("txd.b.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+            "txd.b.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;".to_string(),
         );
 
         for tex_query in tex_queries {
@@ -587,7 +609,7 @@ pub fn test_lea() {
         (SrcMod::None, SrcMod::INeg),
     ];
 
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
 
         for (intermediate_mod, b_mod) in src_mods {
@@ -653,7 +675,7 @@ pub fn test_hfma2() {
 
     let src_mods = [SrcMod::None, SrcMod::FAbs, SrcMod::FNeg, SrcMod::FNegAbs];
 
-    for sm in SM_LIST {
+    for &sm in sm_list() {
         let mut c = DisasmCheck::new();
 
         for a_mod in src_mods {
@@ -685,6 +707,146 @@ pub fn test_hfma2() {
             }
         }
 
+        c.check(sm);
+    }
+}
+
+#[test]
+pub fn test_redux() {
+    let ur0 = RegRef::new(RegFile::UGPR, 0, 1);
+    let r1 = RegRef::new(RegFile::GPR, 1, 1);
+
+    for &sm in sm_list() {
+        if sm < 80 {
+            continue;
+        }
+
+        let mut c = DisasmCheck::new();
+        for (op, op_str) in [
+            (ReduxOp::And, ""),
+            (ReduxOp::Or, ".or"),
+            (ReduxOp::Xor, ".xor"),
+            (ReduxOp::Sum, ".sum"),
+            (ReduxOp::Min(IntCmpType::U32), ".min"),
+            (ReduxOp::Max(IntCmpType::U32), ".max"),
+            (ReduxOp::Min(IntCmpType::I32), ".min.s32"),
+            (ReduxOp::Max(IntCmpType::I32), ".max.s32"),
+        ] {
+            let instr = OpRedux {
+                dst: Dst::Reg(ur0),
+                src: SrcRef::Reg(r1).into(),
+                op,
+            };
+            let disasm = format!("redux{op_str} ur0, r1;");
+            c.push(instr, disasm);
+        }
+        c.check(sm);
+    }
+}
+
+#[test]
+pub fn test_match() {
+    let r3 = RegRef::new(RegFile::GPR, 3, 1);
+    let p1 = RegRef::new(RegFile::Pred, 1, 1);
+
+    for &sm in sm_list() {
+        let mut c = DisasmCheck::new();
+
+        for (op, pred, pred_str) in [
+            (MatchOp::All, Dst::Reg(p1), "p1, "),
+            (MatchOp::Any, Dst::None, ""),
+        ] {
+            for (src_comps, u64_str) in [(1, ""), (2, ".u64")] {
+                let src = RegRef::new(RegFile::GPR, 4, src_comps);
+                let instr = OpMatch {
+                    pred: pred.clone(),
+                    mask: Dst::Reg(r3),
+
+                    src: SrcRef::Reg(src).into(),
+                    op,
+                    u64: src_comps == 2,
+                };
+                let disasm = format!("match{op}{u64_str} {pred_str}r3, r4;");
+                c.push(instr, disasm);
+            }
+        }
+
+        c.check(sm);
+    }
+}
+
+#[test]
+pub fn test_sgxt() {
+    let r0 = RegRef::new(RegFile::GPR, 0, 1);
+    let r1 = RegRef::new(RegFile::GPR, 1, 1);
+    let r2 = RegRef::new(RegFile::GPR, 2, 1);
+
+    for &sm in sm_list() {
+        let mut c = DisasmCheck::new();
+        for signed in [false, true] {
+            let instr = OpSgxt {
+                dst: Dst::Reg(r0),
+                a: SrcRef::Reg(r1).into(),
+                bits: SrcRef::Reg(r2).into(),
+                signed,
+            };
+
+            let disasm = if signed {
+                "sgxt r0, r1, r2;"
+            } else {
+                "sgxt.u32 r0, r1, r2;"
+            };
+            c.push(instr, disasm);
+        }
+        c.check(sm);
+    }
+}
+
+#[test]
+pub fn test_plop3() {
+    let p0 = RegRef::new(RegFile::Pred, 0, 1);
+    let p1 = RegRef::new(RegFile::Pred, 1, 1);
+    let p2 = RegRef::new(RegFile::Pred, 2, 1);
+    let p3 = RegRef::new(RegFile::Pred, 3, 1);
+    let p4 = RegRef::new(RegFile::Pred, 4, 1);
+
+    let src_mods = [SrcMod::None, SrcMod::BNot];
+
+    for &sm in sm_list() {
+        let mut c = DisasmCheck::new();
+        for a_mod in src_mods {
+            for b_mod in src_mods {
+                for c_mod in src_mods {
+                    for lut_bit in 0..16 {
+                        let lut = 1 << lut_bit;
+                        let lut0 = (lut >> 0) as u8;
+                        let lut1 = (lut >> 8) as u8;
+
+                        let mut instr = OpPLop3 {
+                            dsts: [p0.into(), p1.into()],
+                            ops: [
+                                LogicOp3 { lut: lut0 },
+                                LogicOp3 { lut: lut1 },
+                            ],
+                            srcs: [p2.into(), p3.into(), p4.into()],
+                        };
+                        instr.srcs[0].src_mod = a_mod;
+                        instr.srcs[1].src_mod = b_mod;
+                        instr.srcs[2].src_mod = c_mod;
+
+                        let disasm = format!(
+                            "plop3.lut p0, p1, {}, {}, {}, {:#x}, {:#x};",
+                            instr.srcs[0],
+                            instr.srcs[1],
+                            instr.srcs[2],
+                            lut0,
+                            lut1,
+                        );
+                        c.push(instr, disasm);
+                    }
+                }
+            }
+        }
         c.check(sm);
     }
 }

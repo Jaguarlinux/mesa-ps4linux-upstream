@@ -21,18 +21,6 @@
  * IN THE SOFTWARE.
  */
 
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_scalar_block_layout : require
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_buffer_reference2 : require
-#extension GL_KHR_shader_subgroup_vote : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_ballot : require
-
 #include "vk_build_interface.h"
 
 layout(local_size_x_id = SUBGROUP_SIZE_ID, local_size_y = 1, local_size_z = 1) in;
@@ -85,7 +73,6 @@ build_triangle(inout vk_aabb bounds, VOID_REF dst_ptr, vk_bvh_geometry_data geom
    DEREF(node).base.aabb = bounds;
    DEREF(node).triangle_id = global_id;
    DEREF(node).geometry_id_and_flags = geom_data.geometry_id;
-   DEREF(node).id = 9;
 
    return is_valid;
 }
@@ -160,6 +147,9 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
 
    vk_aabb blas_aabb = DEREF(REF(vk_aabb)(instance.accelerationStructureReference + BVH_BOUNDS_OFFSET));
 
+   if (any(isnan(blas_aabb.min)) || any(isnan(blas_aabb.max)))
+      return false;
+
    bounds = calculate_instance_node_bounds(blas_aabb, mat3x4(transform));
 
 #ifdef CALCULATE_FINE_INSTANCE_NODE_BOUNDS
@@ -183,6 +173,18 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
    DEREF(node).custom_instance_and_mask = instance.custom_instance_and_mask;
    DEREF(node).sbt_offset_and_flags = instance.sbt_offset_and_flags;
    DEREF(node).instance_id = global_id;
+
+   if (!VK_BUILD_FLAG(VK_BUILD_FLAG_PROPAGATE_CULL_FLAGS))
+      return true;
+
+   uint32_t root_flags = 0;
+   if ((instance.sbt_offset_and_flags & (VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR << 24)) != 0)
+      root_flags = VK_BVH_BOX_FLAG_ONLY_OPAQUE;
+   else if ((instance.sbt_offset_and_flags & (VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR << 24)) != 0)
+      root_flags = VK_BVH_BOX_FLAG_NO_OPAQUE;
+   else
+      root_flags = DEREF(REF(uint32_t)(instance.accelerationStructureReference + ROOT_FLAGS_OFFSET));
+   DEREF(node).root_flags = root_flags;
 
    return true;
 }

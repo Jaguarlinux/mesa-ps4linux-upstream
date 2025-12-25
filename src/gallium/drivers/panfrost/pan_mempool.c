@@ -57,8 +57,9 @@ panfrost_pool_alloc_backing(struct panfrost_pool *pool, size_t bo_sz)
    if (!bo)
       return NULL;
 
-   if (pool->owned)
-      util_dynarray_append(&pool->bos, struct panfrost_bo *, bo);
+   if (pool->owned) {
+      util_dynarray_append(&pool->bos, bo);
+   }
    else
       panfrost_bo_unreference(pool->transient_bo);
 
@@ -129,7 +130,7 @@ panfrost_pool_get_bo_handles(struct panfrost_pool *pool, uint32_t *handles)
 
 #define PAN_GUARD_SIZE 4096
 
-static struct panfrost_ptr
+static struct pan_ptr
 panfrost_pool_alloc_aligned(struct panfrost_pool *pool, size_t sz,
                             unsigned alignment)
 {
@@ -142,14 +143,17 @@ panfrost_pool_alloc_aligned(struct panfrost_pool *pool, size_t sz,
 #ifdef PAN_DBG_OVERFLOW
    if (unlikely(pool->dev->debug & PAN_DBG_OVERFLOW) &&
        !(pool->create_flags & PAN_BO_INVISIBLE)) {
-      long page_size = sysconf(_SC_PAGESIZE);
-      assert(page_size > 0 && util_is_power_of_two_nonzero(page_size));
+      uint64_t page_size = 0;
+      if (!os_get_page_size(&page_size))
+         return (struct pan_ptr){0};
+
+      assert(util_is_power_of_two_nonzero(page_size));
       size_t aligned = ALIGN_POT(sz, page_size);
       size_t bo_size = aligned + PAN_GUARD_SIZE;
 
       bo = panfrost_pool_alloc_backing(pool, bo_size);
       if (!bo)
-         return (struct panfrost_ptr){0};
+         return (struct pan_ptr){0};
 
       memset(bo->ptr.cpu, 0xbb, bo_size);
 
@@ -169,17 +173,26 @@ panfrost_pool_alloc_aligned(struct panfrost_pool *pool, size_t sz,
       bo = panfrost_pool_alloc_backing(
          pool, ALIGN_POT(MAX2(pool->base.slab_size, sz), 4096));
       if (!bo)
-         return (struct panfrost_ptr){0};
+         return (struct pan_ptr){0};
 
       offset = 0;
    }
 
    pool->transient_offset = offset + sz;
 
-   struct panfrost_ptr ret = {
+   struct pan_ptr ret = {
       .cpu = bo->ptr.cpu + offset,
       .gpu = bo->ptr.gpu + offset,
    };
+
+   struct panfrost_device *dev = bo->dev;
+
+   /* The first 32MB are reserved, so pick a dumb address from there. */
+   if (dev->fault_injection_rate &&
+       !(random() % dev->fault_injection_rate)) {
+      ret.gpu =
+         0x1a7af00ull & ~((uint64_t)util_next_power_of_two(alignment) - 1);
+   }
 
    return ret;
 }

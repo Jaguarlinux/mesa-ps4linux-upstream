@@ -29,7 +29,7 @@ static bool
 accum_src_deps(nir_src *src, void *opaque)
 {
    foreach_src_data *data = (foreach_src_data *)opaque;
-   nir_instr *src_instr = src->ssa->parent_instr;
+   nir_instr *src_instr = nir_def_instr(src->ssa);
 
    if (src_instr->type == nir_instr_type_load_const ||
        src_instr->type == nir_instr_type_undef)
@@ -128,12 +128,12 @@ nir_gather_output_dependencies(nir_shader *nir, nir_output_deps *deps)
             .start_block = block,
             .exit_block = nir_cf_node_cf_tree_next(parent_cf),
          };
-         util_dynarray_append(&loop_stack, loop_entry, loop);
+         util_dynarray_append(&loop_stack, loop);
       }
 
       if (parent_cf->type == nir_cf_node_if &&
           block == nir_if_first_then_block(nir_cf_node_as_if(parent_cf))) {
-         util_dynarray_append(&if_cond_stack, nir_def *,
+         util_dynarray_append(&if_cond_stack,
                               nir_cf_node_as_if(parent_cf)->condition.ssa);
       }
 
@@ -154,7 +154,7 @@ nir_gather_output_dependencies(nir_shader *nir, nir_output_deps *deps)
           */
          util_dynarray_foreach(&if_cond_stack, nir_def *, cond) {
             accum_deps(this_instr_deps,
-                       instr_deps[(*cond)->parent_instr->index],
+                       instr_deps[nir_def_instr(*cond)->index],
                        num_bitset_words);
          }
 
@@ -195,7 +195,7 @@ nir_gather_output_dependencies(nir_shader *nir, nir_output_deps *deps)
                    */
                   util_dynarray_foreach(&if_cond_stack, nir_def *, cond) {
                      accum_deps(instr_deps[phi->instr.index],
-                                instr_deps[(*cond)->parent_instr->index],
+                                instr_deps[nir_def_instr(*cond)->index],
                                 num_bitset_words);
                   }
 
@@ -207,7 +207,7 @@ nir_gather_output_dependencies(nir_shader *nir, nir_output_deps *deps)
                break;
             }
             default:
-               unreachable("unexpected jump type");
+               UNREACHABLE("unexpected jump type");
             }
             break;
 
@@ -265,7 +265,7 @@ nir_gather_output_dependencies(nir_shader *nir, nir_output_deps *deps)
          nir_foreach_phi(phi, nir_cf_node_cf_tree_next(parent_cf)) {
             util_dynarray_foreach(&if_cond_stack, nir_def *, cond) {
                accum_deps(instr_deps[phi->instr.index],
-                          instr_deps[(*cond)->parent_instr->index],
+                          instr_deps[nir_def_instr(*cond)->index],
                           num_bitset_words);
             }
          }
@@ -338,8 +338,7 @@ nir_free_output_dependencies(nir_output_deps *deps)
 {
    for (unsigned i = 0; i < ARRAY_SIZE(deps->output); i++) {
       assert(!!deps->output[i].instr_list == !!deps->output[i].num_instr);
-      if (deps->output[i].instr_list)
-         free(deps->output[i].instr_list);
+      free(deps->output[i].instr_list);
    }
 }
 
@@ -376,6 +375,10 @@ nir_gather_input_to_output_dependencies(nir_shader *nir,
 
       for (unsigned i = 0; i < num_instr; i++) {
          nir_instr *instr = deps.output[out].instr_list[i];
+         if (instr->type == nir_instr_type_tex) {
+            if (!nir_tex_instr_is_query(nir_instr_as_tex(instr)))
+               out_deps->output[out].uses_image_reads = true;
+         }
          if (instr->type != nir_instr_type_intrinsic)
             continue;
 
@@ -396,10 +399,6 @@ nir_gather_input_to_output_dependencies(nir_shader *nir,
             }
             break;
          }
-         case nir_instr_type_tex:
-            if (!nir_tex_instr_is_query(nir_instr_as_tex(instr)))
-               out_deps->output[out].uses_image_reads = true;
-            break;
          default: {
             const char *name = nir_intrinsic_infos[intr->intrinsic].name;
 

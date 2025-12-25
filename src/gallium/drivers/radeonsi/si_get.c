@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <ctype.h>
 #include "compiler/nir/nir.h"
 #include "ac_nir.h"
 #include "ac_shader_util.h"
@@ -16,6 +17,8 @@
 #include "util/u_video.h"
 #include "vl/vl_video_buffer.h"
 #include <sys/utsname.h>
+#include "drm-uapi/drm.h"
+#include "aco_interface.h"
 
 /* The capabilities reported by the kernel has priority
    over the existing logic in si_get_video_param */
@@ -51,17 +54,8 @@ si_is_compute_copy_faster(struct pipe_screen *pscreen,
 {
    if (cpu)
       /* very basic for now */
-      return width * height * depth > 64 * 64;
+      return (uint64_t)width * height * depth > 64 * 64;
    return false;
-}
-
-static const void *si_get_compiler_options(struct pipe_screen *screen, enum pipe_shader_ir ir,
-                                           enum pipe_shader_type shader)
-{
-   struct si_screen *sscreen = (struct si_screen *)screen;
-
-   assert(ir == PIPE_SHADER_IR_NIR);
-   return sscreen->nir_options;
 }
 
 static void si_get_driver_uuid(struct pipe_screen *pscreen, char *uuid)
@@ -127,7 +121,7 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          /* VPE 1st generation does not support orientation
           * Have to determine the version and features of VPE in future.
           */
-         return PIPE_VIDEO_VPP_ORIENTATION_DEFAULT;
+         return PIPE_VIDEO_VPP_FLIP_HORIZONTAL;
       case PIPE_VIDEO_CAP_VPP_BLEND_MODES:
          /* VPE 1st generation does not support blending.
           * Have to determine the version and features of VPE in future.
@@ -135,20 +129,11 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          return PIPE_VIDEO_VPP_BLEND_MODE_NONE;
       case PIPE_VIDEO_CAP_PREFERRED_FORMAT:
          return PIPE_FORMAT_NV12;
-      case PIPE_VIDEO_CAP_PREFERS_INTERLACED:
-         return false;
       case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
          return true;
       case PIPE_VIDEO_CAP_REQUIRES_FLUSH_ON_END_FRAME:
          /* true: VPP flush function will be called within vaEndPicture() */
          /* false: VPP flush function will be skipped */
-         return false;
-      case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED:
-         /* for VPE we prefer non-interlaced buffer */
-         return false;
-      case PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_INPUT:
-         if (debug_get_bool_option("AMDGPU_SIVPE_SUPPORT_HDR_INPUT", false))
-            return true;
          return false;
       default:
          return 0;
@@ -208,10 +193,6 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
             return PIPE_FORMAT_P010;
          else
             return PIPE_FORMAT_NV12;
-      case PIPE_VIDEO_CAP_PREFERS_INTERLACED:
-         return false;
-      case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED:
-         return false;
       case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
          return true;
       case PIPE_VIDEO_CAP_STACKED_FRAMES:
@@ -478,7 +459,9 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
       return 1;
    case PIPE_VIDEO_CAP_MIN_WIDTH:
    case PIPE_VIDEO_CAP_MIN_HEIGHT:
-      return (codec == PIPE_VIDEO_FORMAT_AV1) ? 16 : 64;
+      if (codec == PIPE_VIDEO_FORMAT_VP9 || codec == PIPE_VIDEO_FORMAT_AV1)
+         return 16;
+      return 64;
    case PIPE_VIDEO_CAP_MAX_WIDTH:
       if (codec != PIPE_VIDEO_FORMAT_UNKNOWN && QUERYABLE_KERNEL)
             return KERNEL_DEC_CAP(codec, max_width);
@@ -515,16 +498,6 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
       else
          return PIPE_FORMAT_NV12;
 
-   case PIPE_VIDEO_CAP_PREFERS_INTERLACED:
-      return false;
-   case PIPE_VIDEO_CAP_SUPPORTS_INTERLACED: {
-      enum pipe_video_format format = u_reduce_video_profile(profile);
-
-      if (format >= PIPE_VIDEO_FORMAT_HEVC)
-         return false;
-
-      return true;
-   }
    case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
       return true;
    case PIPE_VIDEO_CAP_MAX_LEVEL:
@@ -660,61 +633,6 @@ static bool si_vid_is_format_supported(struct pipe_screen *screen, enum pipe_for
    return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
 }
 
-static bool si_vid_is_target_buffer_supported(struct pipe_screen *screen,
-                                              enum pipe_format format,
-                                              struct pipe_video_buffer *target,
-                                              enum pipe_video_profile profile,
-                                              enum pipe_video_entrypoint entrypoint)
-{
-   struct si_screen *sscreen = (struct si_screen *)screen;
-   struct si_texture *tex = (struct si_texture *)((struct vl_video_buffer *)target)->resources[0];
-   const bool is_dcc = tex->surface.meta_offset;
-   const bool is_format_conversion = format != target->buffer_format;
-
-   switch (entrypoint) {
-   case PIPE_VIDEO_ENTRYPOINT_BITSTREAM:
-      if (is_dcc || is_format_conversion)
-         return false;
-      break;
-
-   case PIPE_VIDEO_ENTRYPOINT_ENCODE:
-      if (is_dcc)
-         return false;
-
-      /* EFC */
-      if (is_format_conversion) {
-         const bool input_8bit =
-            target->buffer_format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-            target->buffer_format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-            target->buffer_format == PIPE_FORMAT_R8G8B8A8_UNORM ||
-            target->buffer_format == PIPE_FORMAT_R8G8B8X8_UNORM;
-         const bool input_10bit =
-            target->buffer_format == PIPE_FORMAT_B10G10R10A2_UNORM ||
-            target->buffer_format == PIPE_FORMAT_B10G10R10X2_UNORM ||
-            target->buffer_format == PIPE_FORMAT_R10G10B10A2_UNORM ||
-            target->buffer_format == PIPE_FORMAT_R10G10B10X2_UNORM;
-
-         if (sscreen->info.vcn_ip_version < VCN_2_0_0 ||
-             sscreen->info.vcn_ip_version == VCN_2_2_0 ||
-             sscreen->debug_flags & DBG(NO_EFC))
-            return false;
-
-         if (input_8bit && format != PIPE_FORMAT_NV12)
-            return false;
-         if (input_10bit && format != PIPE_FORMAT_NV12 && format != PIPE_FORMAT_P010)
-            return false;
-      }
-      break;
-
-   default:
-      if (is_format_conversion)
-         return false;
-      break;
-   }
-
-   return si_vid_is_format_supported(screen, format, profile, entrypoint);
-}
-
 static uint64_t si_get_timestamp(struct pipe_screen *screen)
 {
    struct si_screen *sscreen = (struct si_screen *)screen;
@@ -770,10 +688,12 @@ static void si_init_renderer_string(struct si_screen *sscreen)
 {
    char first_name[256], second_name[32] = {}, kernel_version[128] = {};
    struct utsname uname_data;
+   const char *name = ac_get_family_name(sscreen->info.family);
 
-   snprintf(first_name, sizeof(first_name), "%s",
-            sscreen->info.marketing_name ? sscreen->info.marketing_name : sscreen->info.name);
-   snprintf(second_name, sizeof(second_name), "%s, ", sscreen->info.lowercase_name);
+   snprintf(first_name, sizeof(first_name), "%s", sscreen->info.marketing_name);
+   memset(second_name, 0, sizeof(second_name));
+   for (unsigned i = 0; name[i] && i < ARRAY_SIZE(second_name) - 1; i++)
+      second_name[i] = tolower(name[i]);
 
    if (uname(&uname_data) == 0)
       snprintf(kernel_version, sizeof(kernel_version), ", %s", uname_data.release);
@@ -785,7 +705,7 @@ static void si_init_renderer_string(struct si_screen *sscreen)
       "ACO";
 
    snprintf(sscreen->renderer_string, sizeof(sscreen->renderer_string),
-            "%s (radeonsi, %s%s, DRM %i.%i%s)", first_name, second_name, compiler_name,
+            "%s (radeonsi, %s, %s, DRM %i.%i%s)", first_name, second_name, compiler_name,
             sscreen->info.drm_major, sscreen->info.drm_minor, kernel_version);
 }
 
@@ -824,6 +744,17 @@ si_driver_thread_add_job(struct pipe_screen *screen, void *data,
    util_queue_add_job(&sscreen->shader_compiler_queue, data, fence, execute, cleanup, job_size);
 }
 
+static bool enable_mesh_shader(struct si_screen *sscreen)
+{
+   return sscreen->use_ngg &&
+      sscreen->info.gfx_level >= GFX10_3 &&
+      sscreen->info.has_gang_submit &&
+      /* TODO: not support user queue for now */
+      !(sscreen->info.userq_ip_mask & BITFIELD_BIT(AMD_IP_GFX)) &&
+      /* don't support LLVM */
+      aco_is_gpu_supported(&sscreen->info) &&
+      !(sscreen->debug_flags & DBG(USE_LLVM));
+}
 
 void si_init_screen_get_functions(struct si_screen *sscreen)
 {
@@ -834,7 +765,6 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
    sscreen->b.is_compute_copy_faster = si_is_compute_copy_faster;
    sscreen->b.driver_thread_add_job = si_driver_thread_add_job;
    sscreen->b.get_timestamp = si_get_timestamp;
-   sscreen->b.get_compiler_options = si_get_compiler_options;
    sscreen->b.get_device_uuid = si_get_device_uuid;
    sscreen->b.get_driver_uuid = si_get_driver_uuid;
    sscreen->b.query_memory_info = si_query_memory_info;
@@ -848,7 +778,6 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
        sscreen->info.ip[AMD_IP_VPE].num_queues) {
       sscreen->b.get_video_param = si_get_video_param;
       sscreen->b.is_video_format_supported = si_vid_is_format_supported;
-      sscreen->b.is_video_target_buffer_supported = si_vid_is_target_buffer_supported;
    }
 
    si_init_renderer_string(sscreen);
@@ -877,7 +806,8 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
       (sscreen->info.family >= CHIP_GFX940 && !sscreen->info.has_graphics) ||
       /* fma32 is too slow for gpu < gfx9, so apply the option only for gpu >= gfx9 */
       (sscreen->info.gfx_level >= GFX9 && sscreen->options.force_use_fma32);
-   bool has_mediump = sscreen->info.gfx_level >= GFX9 && sscreen->options.mediump;
+   /* GFX8 has precision issues with 16-bit PS outputs. */
+   bool has_16bit_io = sscreen->info.gfx_level >= GFX9;
 
    nir_shader_compiler_options *options = sscreen->nir_options;
    ac_nir_set_options(&sscreen->info, !sscreen->use_aco, options);
@@ -891,7 +821,7 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
    options->lower_uniforms_to_ubo = true;
    options->lower_to_scalar = true;
    options->lower_to_scalar_filter =
-      sscreen->info.has_packed_math_16bit ? si_alu_to_scalar_packed_math_filter : NULL;
+      sscreen->info.cu_info.has_packed_math_16bit ? si_alu_to_scalar_packed_math_filter : NULL;
    options->max_unroll_iterations = 128;
    options->max_unroll_iterations_aggressive = 128;
    /* For OpenGL, rounding mode is undefined. We want fast packing with v_cvt_pkrtz_f16,
@@ -900,12 +830,18 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
     *
     * For OpenCL, rounding mode is explicit. This will only lower f2f16 to f2f16_rtz
     * when execution mode is rtz instead of rtne.
+    *
+    * GFX8 has precision issues with this option.
     */
-   options->force_f2f16_rtz = true;
-   options->io_options |= (!has_mediump ? nir_io_mediump_is_32bit : 0) | nir_io_has_intrinsics |
+   options->force_f2f16_rtz = sscreen->info.gfx_level >= GFX9;
+   options->io_options |= (!has_16bit_io ? nir_io_mediump_is_32bit : 0) | nir_io_has_intrinsics |
                           (sscreen->use_ngg_culling ?
                               nir_io_compaction_groups_tes_inputs_into_pos_and_var_groups : 0);
-   options->lower_mediump_io = has_mediump ? si_lower_mediump_io : NULL;
+   if (has_16bit_io) {
+      options->lower_mediump_io = sscreen->options.mediump ? si_lower_mediump_io_option
+                                                           : si_lower_mediump_io_default;
+   }
+
    /* HW supports indirect indexing for: | Enabled in driver
     * -------------------------------------------------------
     * TCS inputs                         | Yes
@@ -916,15 +852,20 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
     * TCS outputs                        | Yes
     * VS/TES outputs before GS           | No
     */
-   options->support_indirect_inputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |
-                                      BITFIELD_BIT(MESA_SHADER_TESS_EVAL);
-   options->support_indirect_outputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL);
    options->varying_expression_max_cost = si_varying_expression_max_cost;
+
+   unsigned max_support_shader = enable_mesh_shader(sscreen) ?
+      MESA_SHADER_MESH : MESA_SHADER_COMPUTE;
+   for (unsigned i = 0; i <= max_support_shader; i++)
+      sscreen->b.nir_options[i] = options;
 }
 
 void si_init_shader_caps(struct si_screen *sscreen)
 {
-   for (unsigned i = 0; i <= PIPE_SHADER_COMPUTE; i++) {
+   for (unsigned i = 0; i <= MESA_SHADER_MESH; i++) {
+      if (!sscreen->b.nir_options[i])
+         continue;
+
       struct pipe_shader_caps *caps =
          (struct pipe_shader_caps *)&sscreen->b.shader_caps[i];
 
@@ -934,8 +875,8 @@ void si_init_shader_caps(struct si_screen *sscreen)
       caps->max_tex_instructions =
       caps->max_tex_indirections =
       caps->max_control_flow_depth = 16384;
-      caps->max_inputs = i == PIPE_SHADER_VERTEX ? SI_MAX_ATTRIBS : 32;
-      caps->max_outputs = i == PIPE_SHADER_FRAGMENT ? 8 : 32;
+      caps->max_inputs = i == MESA_SHADER_VERTEX ? SI_MAX_ATTRIBS : 32;
+      caps->max_outputs = i == MESA_SHADER_FRAGMENT ? 8 : 32;
       caps->max_temps = 256; /* Max native temporaries. */
       caps->max_const_buffer0_size = 1 << 26; /* 64 MB */
       caps->max_const_buffers = SI_NUM_CONST_BUFFERS;
@@ -958,13 +899,14 @@ void si_init_shader_caps(struct si_screen *sscreen)
       /* We need F16C for fast FP16 conversions in glUniform.
        * It's supported since Intel Ivy Bridge and AMD Bulldozer.
        */
-      bool has_16bit_alu = sscreen->info.gfx_level >= GFX9 && util_get_cpu_caps()->has_f16c;
+      bool has_16bit_alu = sscreen->info.gfx_level >= GFX8 && util_get_cpu_caps()->has_f16c;
 
       caps->fp16 = has_16bit_alu;
       caps->fp16_derivatives = has_16bit_alu;
       caps->fp16_const_buffers = has_16bit_alu;
       caps->int16 = has_16bit_alu;
       caps->glsl_16bit_consts = has_16bit_alu;
+      caps->glsl_16bit_load_dst = sscreen->info.gfx_level >= GFX9;
    }
 }
 
@@ -1009,17 +951,68 @@ void si_init_compute_caps(struct si_screen *sscreen)
 
    unsigned threads = 1024;
    unsigned subgroup_size =
-      sscreen->debug_flags & DBG(W64_CS) || sscreen->info.gfx_level < GFX10 ? 64 : 32;
+      sscreen->shader_debug_flags & DBG(W64_CS) || sscreen->info.gfx_level < GFX10 ? 64 : 32;
    caps->max_subgroups = threads / subgroup_size;
 
-   if (sscreen->debug_flags & DBG(W32_CS))
+   if (sscreen->shader_debug_flags & DBG(W32_CS))
       caps->subgroup_sizes = 32;
-   else if (sscreen->debug_flags & DBG(W64_CS))
+   else if (sscreen->shader_debug_flags & DBG(W64_CS))
       caps->subgroup_sizes = 64;
    else
       caps->subgroup_sizes = sscreen->info.gfx_level < GFX10 ? 64 : 64 | 32;
 
    caps->max_variable_threads_per_block = SI_MAX_VARIABLE_THREADS_PER_BLOCK;
+}
+
+static void si_init_mesh_caps(struct si_screen *sscreen)
+{
+   struct pipe_mesh_caps *caps = (struct pipe_mesh_caps *)&sscreen->b.caps.mesh;
+
+   caps->max_task_work_group_total_count = 1 << 22;
+   caps->max_mesh_work_group_total_count = 1 << 22;
+   caps->max_mesh_work_group_invocations = 256;
+   caps->max_task_work_group_invocations = 1024;
+   caps->max_task_payload_size = 16384;
+   caps->max_task_shared_memory_size = 65536;
+   caps->max_mesh_shared_memory_size = 28672;
+   caps->max_task_payload_and_shared_memory_size = 65536;
+   caps->max_mesh_payload_and_shared_memory_size =
+      caps->max_task_payload_size + caps->max_mesh_shared_memory_size;
+   caps->max_mesh_output_memory_size = 32 * 1024;
+   caps->max_mesh_payload_and_output_memory_size =
+      caps->max_task_payload_size + caps->max_mesh_output_memory_size;
+   caps->max_mesh_output_vertices = 256;
+   caps->max_mesh_output_primitives = 256;
+   caps->max_mesh_output_components = 128;
+   caps->max_mesh_output_layers = 8;
+   caps->max_mesh_multiview_view_count = 1;
+   caps->mesh_output_per_vertex_granularity = 1;
+   caps->mesh_output_per_primitive_granularity = 1;
+
+   caps->max_preferred_task_work_group_invocations = 64;
+   caps->max_preferred_mesh_work_group_invocations = 128;
+   caps->mesh_prefers_local_invocation_vertex_output = true;
+   caps->mesh_prefers_local_invocation_primitive_output = true;
+   caps->mesh_prefers_compact_vertex_output = true;
+   caps->mesh_prefers_compact_primitive_output = false;
+
+   caps->max_task_work_group_count[0] =
+   caps->max_task_work_group_count[1] =
+   caps->max_task_work_group_count[2] = 65535;
+
+   caps->max_mesh_work_group_count[0] =
+   caps->max_mesh_work_group_count[1] =
+   caps->max_mesh_work_group_count[2] = 65535;
+
+   caps->max_task_work_group_size[0] =
+   caps->max_task_work_group_size[1] =
+   caps->max_task_work_group_size[2] = 1024;
+
+   caps->max_mesh_work_group_size[0] =
+   caps->max_mesh_work_group_size[1] =
+   caps->max_mesh_work_group_size[2] = 256;
+
+   caps->pipeline_statistic_queries = sscreen->info.gfx_level >= GFX11;
 }
 
 void si_init_screen_caps(struct si_screen *sscreen)
@@ -1030,8 +1023,7 @@ void si_init_screen_caps(struct si_screen *sscreen)
 
    /* Gfx8 (Polaris11) hangs, so don't enable this on Gfx8 and older chips. */
    bool enable_sparse =
-      sscreen->info.gfx_level >= GFX9 && sscreen->info.gfx_level < GFX12 &&
-      sscreen->info.has_sparse_vm_mappings;
+      sscreen->info.gfx_level >= GFX9 && sscreen->info.has_sparse;
 
    /* Supported features (boolean caps). */
    caps->max_dual_source_render_targets = true;
@@ -1092,12 +1084,12 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->fs_face_is_integer_sysval = true;
    caps->invalidate_buffer = true;
    caps->surface_reinterpret_blocks = true;
+   caps->compressed_surface_reinterpret_blocks_layered = true;
    caps->query_buffer_object = true;
    caps->query_memory_info = true;
    caps->shader_pack_half_float = true;
    caps->framebuffer_no_attachment = true;
    caps->robust_buffer_access_behavior = true;
-   caps->polygon_offset_units_unscaled = true;
    caps->string_marker = true;
    caps->cull_distance = true;
    caps->shader_array_components = true;
@@ -1122,7 +1114,6 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->compute_grid_info_last_block = true;
    caps->image_load_formatted = true;
    caps->prefer_compute_for_multimedia = true;
-   caps->tgsi_div = true;
    caps->packed_uniforms = true;
    caps->gl_spirv = true;
    caps->alpha_to_coverage_dither_control = true;
@@ -1145,6 +1136,11 @@ void si_init_screen_caps(struct si_screen *sscreen)
    caps->has_const_bw = true;
    caps->cl_gl_sharing = true;
    caps->call_finalize_nir_in_linker = true;
+
+   /* Fixup dmabuf caps for the virtio + vpipe case (when fd=-1, u_init_pipe_screen_caps
+    * fails to set this capability). */
+   if (sscreen->info.is_virtio)
+         caps->dmabuf |= DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
 
    caps->fbfetch = 1;
 
@@ -1272,10 +1268,9 @@ void si_init_screen_caps(struct si_screen *sscreen)
 
    caps->max_vertex_attrib_stride = 2048;
 
-   /* TODO: Gfx12 supports 64K textures, but Gallium can't represent them at the moment. */
-   caps->max_texture_2d_size = sscreen->info.gfx_level >= GFX12 ? 32768 : 16384;
+   caps->max_texture_2d_size = sscreen->info.gfx_level >= GFX12 ? 65536 : 16384;
    caps->max_texture_cube_levels = sscreen->info.has_3d_cube_border_color_mipmap ?
-      (sscreen->info.gfx_level >= GFX12 ? 16 : 15) /* 32K : 16K */ : 0;
+      (sscreen->info.gfx_level >= GFX12 ? 17 : 15) /* 64K : 16K */ : 0;
    caps->max_texture_3d_levels = sscreen->info.has_3d_cube_border_color_mipmap ?
       /* This is limited by maximums that both the texture unit and layered rendering support. */
       (sscreen->info.gfx_level >= GFX12 ? 15 : /* 16K */
@@ -1317,8 +1312,13 @@ void si_init_screen_caps(struct si_screen *sscreen)
    /* Conversion to nanos from cycles per millisecond */
    caps->timer_resolution = DIV_ROUND_UP(1000000, sscreen->info.clock_crystal_freq);
 
+   caps->mesh_shader = enable_mesh_shader(sscreen);
+   if (caps->mesh_shader)
+      si_init_mesh_caps(sscreen);
+
    caps->shader_subgroup_size = 64;
-   caps->shader_subgroup_supported_stages = BITFIELD_MASK(PIPE_SHADER_TYPES);
+   caps->shader_subgroup_supported_stages =
+      BITFIELD_MASK(caps->mesh_shader ? MESA_SHADER_MESH_STAGES : MESA_SHADER_STAGES);
    caps->shader_subgroup_supported_features = BITFIELD_MASK(PIPE_SHADER_SUBGROUP_NUM_FEATURES);
    caps->shader_subgroup_quad_all_stages = true;
 
@@ -1343,4 +1343,7 @@ void si_init_screen_caps(struct si_screen *sscreen)
     *    KHR-GL46.texture_lod_bias.texture_lod_bias_all
     */
    caps->max_texture_lod_bias = 16;
+
+   if (sscreen->ws->va_range)
+      sscreen->ws->va_range(sscreen->ws, &caps->min_vma, &caps->max_vma);
 }

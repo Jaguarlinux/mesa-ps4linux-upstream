@@ -43,6 +43,7 @@ issues:
         'intel/executor': 'intel-executor'
         'iris': 'iris'
         'isl': 'ISL'
+        'kk': 'KosmicKrisp'
         'lima': 'lima'
         'lima/ppir': 'lima'
         'llvmpipe': 'llvmpipe'
@@ -62,6 +63,7 @@ issues:
         'panfrost': 'panfrost'
         'panvk': 'panvk'
         'pan/midgard': 'panfrost'
+        'poly': 'poly'
         'pvr': 'powervr'
         'r100': 'r100'
         'r200': 'r200'
@@ -88,6 +90,7 @@ issues:
         'virgl': 'virgl'
         'vmwgfx': 'vmwgfx'
         'zink': 'zink'
+        'mediafoundation': 'mediafoundation'
 
     titles: &titles
         'android': 'android'
@@ -213,19 +216,19 @@ merge_requests:
         '^src/gallium/frontends/lavapipe/': ['lavapipe']
         '^src/gallium/frontends/nine/': ['nine']
         '^src/gallium/frontends/omx/': ['omx']
-        '^src/gallium/frontends/osmesa/': ['osmesa']
         '^src/gallium/frontends/rusticl/': ['Rusticl']
         '^src/gallium/frontends/teflon/': ['teflon']
         '^src/gallium/frontends/va/': ['VA-API']
         '^src/gallium/frontends/vdpau/': ['VDPAU']
         '^src/gallium/frontends/wgl/': ['wgl']
+        '^src/gallium/frontends/mediafoundation/': ['mediafoundation']
         # '^src/gallium/frontends/xa/': ['']
         '^src/gallium/include/': ['gallium']
         '^src/gallium/targets/': ['gallium']
         '^src/gallium/targets/d3d10umd': ['d3d10umd']
         '^src/gallium/targets/opencl/': ['clover']
-        '^src/gallium/targets/osmesa/': ['osmesa']
         '^src/gallium/targets/rusticl/': ['Rusticl']
+        '^src/gallium/targets/mediafoundation/': ['mediafoundation']
         '^src/gallium/tests/': ['gallium']
         '^src/gallium/tools/': ['gallium']
         # '^src/gallium/winsys/amdgpu/': ['']
@@ -267,15 +270,14 @@ merge_requests:
         '^src/intel/tools/': ['intel-tools']
         '^src/intel/vulkan/': ['ANV']
         '^src/intel/vulkan_hasvk/': ['hasvk']
+        '^src/kosmickrisp/': ['KosmicKrisp']
         '^src/loader/': ['loader']
-        '^src/mapi/': ['mapi']
         '^src/mesa/drivers/dri/i915/': ['i915']
         '^src/mesa/drivers/dri/i965/': ['i965']
         '^src/mesa/drivers/dri/nouveau/': ['vieux']
         '^src/mesa/drivers/dri/r200/': ['r200']
         '^src/mesa/drivers/dri/radeon/': ['radeon']
         '^src/mesa/drivers/dri/swrast/': ['swrast']
-        '^src/mesa/drivers/osmesa': ['osmesa']
         '^src/mesa/main/': ['mesa']
         '^src/mesa/state_tracker/.*glsl.*': ['GLSL']
         '^src/mesa/state_tracker/.*tgsi.*': ['TGSI']
@@ -295,6 +297,7 @@ merge_requests:
         '^src/nouveau/winsys/': ['NVK']
         '^src/panfrost/': ['panfrost']
         '^src/panfrost/vulkan/': ['panvk']
+        '^src/poly/': ['poly']
         '^src/virtio/vulkan/': ['venus']
         '^src/virtio/venus-protocol/': ['venus']
         '^src/virtio/ci/': ['venus']
@@ -302,7 +305,7 @@ merge_requests:
         '^src/util/00-mesa-defaults.conf': ['drirc']
         '^src/vulkan/': ['vulkan']
         '^src/vulkan/wsi/': ['wsi']
-        '^VERSION$': ['maintainer-scripts']
+        '^VERSION$': ['mesa-release']
 
         'Android': ['android']
         'EGL': ['EGL']

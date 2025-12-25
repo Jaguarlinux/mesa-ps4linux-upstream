@@ -7,10 +7,14 @@
 #include "aco_ir.h"
 
 #include "aco_builder.h"
+#include "aco_shader_info.h"
 
 #include "util/u_debug.h"
 
 #include "c11/threads.h"
+
+#include "ac_descriptors.h"
+#include "amdgfxregs.h"
 
 namespace aco {
 
@@ -40,7 +44,7 @@ static once_flag init_once_flag = ONCE_FLAG_INIT;
 static void
 init_once()
 {
-   debug_flags = parse_debug_string(getenv("ACO_DEBUG"), aco_debug_options);
+   debug_flags = parse_debug_string(os_get_option("ACO_DEBUG"), aco_debug_options);
 
 #ifndef NDEBUG
    /* enable some flags by default on debug builds */
@@ -58,118 +62,58 @@ init()
 
 void
 init_program(Program* program, Stage stage, const struct aco_shader_info* info,
-             enum amd_gfx_level gfx_level, enum radeon_family family, bool wgp_mode,
-             ac_shader_config* config)
+             const aco_compiler_options* options, ac_shader_config* config)
 {
+   assert(options->family != CHIP_UNKNOWN);
    instruction_buffer = &program->m;
    program->stage = stage;
    program->config = config;
    program->info = *info;
-   program->gfx_level = gfx_level;
-   if (family == CHIP_UNKNOWN) {
-      switch (gfx_level) {
-      case GFX6: program->family = CHIP_TAHITI; break;
-      case GFX7: program->family = CHIP_BONAIRE; break;
-      case GFX8: program->family = CHIP_POLARIS10; break;
-      case GFX9: program->family = CHIP_VEGA10; break;
-      case GFX10: program->family = CHIP_NAVI10; break;
-      case GFX10_3: program->family = CHIP_NAVI21; break;
-      case GFX11: program->family = CHIP_NAVI31; break;
-      case GFX11_5: program->family = CHIP_GFX1150; break;
-      case GFX12: program->family = CHIP_GFX1200; break;
-      default: program->family = CHIP_UNKNOWN; break;
-      }
-   } else {
-      program->family = family;
-   }
+   program->gfx_level = options->gfx_level;
    program->wave_size = info->wave_size;
    program->lane_mask = program->wave_size == 32 ? s1 : s2;
 
-   program->dev.lds_encoding_granule = gfx_level >= GFX11 && stage == fragment_fs ? 1024
-                                       : gfx_level >= GFX7                        ? 512
-                                                                                  : 256;
-   program->dev.lds_alloc_granule = gfx_level >= GFX10_3 ? 1024 : program->dev.lds_encoding_granule;
-
    /* GFX6: There is 64KB LDS per CU, but a single workgroup can only use 32KB. */
-   program->dev.lds_limit = gfx_level >= GFX7 ? 65536 : 32768;
+   program->dev.lds_limit = program->gfx_level >= GFX7 ? 65536 : 32768;
+   program->dev.has_16bank_lds = options->cu_info->has_lds_bank_count_16;
 
-   /* apparently gfx702 also has 16-bank LDS but I can't find a family for that */
-   program->dev.has_16bank_lds = family == CHIP_KABINI || family == CHIP_STONEY;
+   program->dev.max_waves_per_simd = options->cu_info->max_waves_per_simd;
+   program->dev.simd_per_cu = options->cu_info->num_simd_per_compute_unit;
+   program->dev.physical_sgprs = options->cu_info->num_physical_sgprs_per_simd;
+   program->dev.sgpr_alloc_granule = options->cu_info->sgpr_alloc_granularity;
+   program->dev.sgpr_limit = options->cu_info->max_sgpr_alloc;
+   program->dev.physical_vgprs = options->cu_info->num_physical_wave64_vgprs_per_simd;
+   program->dev.vgpr_alloc_granule = options->cu_info->wave64_vgpr_alloc_granularity;
+   program->dev.vgpr_limit = options->cu_info->max_vgpr_alloc;
 
-   program->dev.vgpr_limit = 256;
-   program->dev.physical_vgprs = 256;
-   program->dev.vgpr_alloc_granule = 4;
-
-   if (gfx_level >= GFX10) {
-      program->dev.physical_sgprs = 128 * 20; /* enough for max waves */
-      program->dev.sgpr_alloc_granule = 128;
-      program->dev.sgpr_limit =
-         108; /* includes VCC, which can be treated as s[106-107] on GFX10+ */
-
-      if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_GFX1151 ||
-          gfx_level >= GFX12) {
-         program->dev.physical_vgprs = program->wave_size == 32 ? 1536 : 768;
-         program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 24 : 12;
-      } else {
-         program->dev.physical_vgprs = program->wave_size == 32 ? 1024 : 512;
-         if (gfx_level >= GFX10_3)
-            program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 16 : 8;
-         else
-            program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 8 : 4;
-      }
-   } else if (program->gfx_level >= GFX8) {
-      program->dev.physical_sgprs = 800;
-      program->dev.sgpr_alloc_granule = 16;
-      program->dev.sgpr_limit = 102;
-      if (family == CHIP_TONGA || family == CHIP_ICELAND)
-         program->dev.sgpr_alloc_granule = 96; /* workaround hardware bug */
-   } else {
-      program->dev.physical_sgprs = 512;
-      program->dev.sgpr_alloc_granule = 8;
-      program->dev.sgpr_limit = 104;
+   if (program->wave_size == 32) {
+      program->dev.physical_vgprs *= 2;
+      program->dev.vgpr_alloc_granule *= 2;
    }
 
-   if (program->stage == raytracing_cs)
-      program->dev.vgpr_limit = util_align_npot(128, program->dev.vgpr_alloc_granule);
-
-   program->dev.scratch_alloc_granule = gfx_level >= GFX11 ? 256 : 1024;
-
-   program->dev.max_waves_per_simd = 10;
-   if (program->gfx_level >= GFX10_3)
-      program->dev.max_waves_per_simd = 16;
-   else if (program->gfx_level == GFX10)
-      program->dev.max_waves_per_simd = 20;
-   else if (program->family >= CHIP_POLARIS10 && program->family <= CHIP_VEGAM)
-      program->dev.max_waves_per_simd = 8;
-
-   program->dev.simd_per_cu = program->gfx_level >= GFX10 ? 2 : 4;
-
-   switch (program->family) {
-   /* GFX8 APUs */
-   case CHIP_CARRIZO:
-   case CHIP_STONEY:
-   /* GFX9 APUS */
-   case CHIP_RAVEN:
-   case CHIP_RAVEN2:
-   case CHIP_RENOIR: program->dev.xnack_enabled = true; break;
-   default: break;
+   if (program->stage == raytracing_cs) {
+      unsigned vgpr_limit = util_align_npot(128, program->dev.vgpr_alloc_granule);
+      unsigned min_waves = program->dev.physical_vgprs / vgpr_limit;
+      vgpr_limit = program->dev.physical_vgprs / min_waves;
+      program->dev.vgpr_limit = util_round_down_npot(vgpr_limit, program->dev.vgpr_alloc_granule);
    }
 
-   program->dev.sram_ecc_enabled = program->family == CHIP_VEGA20 ||
-                                   program->family == CHIP_MI100 || program->family == CHIP_MI200 ||
-                                   program->family == CHIP_GFX940;
-   /* apparently gfx702 also has fast v_fma_f32 but I can't find a family for that */
-   program->dev.has_fast_fma32 = program->gfx_level >= GFX9;
-   if (program->family == CHIP_TAHITI || program->family == CHIP_CARRIZO ||
-       program->family == CHIP_HAWAII)
-      program->dev.has_fast_fma32 = true;
+   program->dev.scratch_alloc_granule = program->gfx_level >= GFX11 ? 256 : 1024;
+
+   /* XNACK replay can be used for demand paging and page migration.
+    * This is only relevant to GPGPU programming with unified shared memory.
+    */
+   program->dev.xnack_enabled = false;
+
+   program->dev.sram_ecc_enabled = options->cu_info->has_sram_ecc_enabled;
+   program->dev.has_point_sample_accel = options->cu_info->has_point_sample_accel;
+   program->dev.has_gfx6_mrt_export_bug = options->cu_info->has_gfx6_mrt_export_bug;
+
+   program->dev.has_fast_fma32 = options->cu_info->has_fast_fma32;
    program->dev.has_mac_legacy32 = program->gfx_level <= GFX7 || program->gfx_level == GFX10;
    program->dev.has_fmac_legacy32 = program->gfx_level >= GFX10_3 && program->gfx_level < GFX12;
-
-   program->dev.fused_mad_mix = program->gfx_level >= GFX10;
-   if (program->family == CHIP_VEGA12 || program->family == CHIP_VEGA20 ||
-       program->family == CHIP_MI100 || program->family == CHIP_MI200)
-      program->dev.fused_mad_mix = true;
+   program->dev.fused_mad_mix = options->cu_info->has_fma_mix;
+   program->dev.has_mad32 = options->cu_info->has_mad32;
 
    if (program->gfx_level >= GFX12) {
       program->dev.scratch_global_offset_min = -8388608;
@@ -218,7 +162,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
       program->dev.max_nsa_vgprs = 0;
    }
 
-   program->wgp_mode = wgp_mode;
+   program->wgp_mode = options->wgp_mode;
 
    program->progress = CompilationProgress::after_isel;
 
@@ -230,6 +174,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    program->next_fp_mode.denorm32 = 0;
    program->next_fp_mode.round16_64 = fp_round_ne;
    program->next_fp_mode.round32 = fp_round_ne;
+   program->needs_fp_mode_insertion = false;
 }
 
 bool
@@ -238,6 +183,72 @@ is_wait_export_ready(amd_gfx_level gfx_level, const Instruction* instr)
    return instr->opcode == aco_opcode::s_wait_event &&
           (gfx_level >= GFX12 ? (instr->salu().imm & wait_event_imm_wait_export_ready_gfx12)
                               : !(instr->salu().imm & wait_event_imm_dont_wait_export_ready_gfx11));
+}
+
+static bool
+is_done_sendmsg(amd_gfx_level gfx_level, const Instruction* instr)
+{
+   if (gfx_level <= GFX10_3 && instr->opcode == aco_opcode::s_sendmsg)
+      return (instr->salu().imm & sendmsg_id_mask) == sendmsg_gs_done;
+   return false;
+}
+
+static bool
+is_pos_prim_export(amd_gfx_level gfx_level, const Instruction* instr)
+{
+   /* Because of NO_PC_EXPORT=1, a done=1 position or primitive export can launch PS waves before
+    * the NGG/VS wave finishes if there are no parameter exports.
+    */
+   return gfx_level >= GFX10 && instr->opcode == aco_opcode::exp &&
+          instr->exp().dest >= V_008DFC_SQ_EXP_POS && instr->exp().dest <= V_008DFC_SQ_EXP_PRIM;
+}
+
+static bool
+is_pops_end_export(Program* program, const Instruction* instr)
+{
+   return program->gfx_level >= GFX11 && instr->opcode == aco_opcode::exp &&
+          instr->exp().dest <= V_008DFC_SQ_EXP_NULL && program->has_pops_overlapped_waves_wait;
+}
+
+static bool
+is_ordered_ps_done_sendmsg(const Instruction* instr)
+{
+   return instr->opcode == aco_opcode::s_sendmsg &&
+          (instr->salu().imm & sendmsg_id_mask) == sendmsg_ordered_ps_done;
+}
+
+uint16_t
+is_atomic_or_control_instr(Program* program, const Instruction* instr, memory_sync_info sync,
+                           unsigned semantic)
+{
+   bool is_acquire = semantic & semantic_acquire;
+   bool is_release = semantic & semantic_release;
+
+   bool is_atomic = sync.semantics & semantic_atomic;
+   // TODO: NIR doesn't have any atomic load/store, so we assume any load/store is atomic
+   is_atomic |= !(sync.semantics & semantic_private) && sync.storage;
+   if (is_atomic) {
+      bool is_load = !instr->definitions.empty() || (sync.semantics & semantic_rmw);
+      bool is_store = instr->definitions.empty() || (sync.semantics & semantic_rmw);
+      return ((is_release && is_store) || (is_acquire && is_load)) ? sync.storage : 0;
+   }
+
+   uint16_t cls = BITFIELD_MASK(storage_count);
+   if (is_acquire) {
+      if (is_wait_export_ready(program->gfx_level, instr) ||
+          instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id)
+         return cls & ~storage_shared;
+   }
+   if (is_release) {
+      if (is_done_sendmsg(program->gfx_level, instr) ||
+          is_pos_prim_export(program->gfx_level, instr))
+         return cls & ~storage_shared;
+
+      if (is_pops_end_export(program, instr) || is_ordered_ps_done_sendmsg(instr) ||
+          instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done)
+         return cls & ~storage_shared;
+   }
+   return (instr->isBarrier() && instr->barrier().exec_scope > scope_invocation) ? cls : 0;
 }
 
 memory_sync_info
@@ -454,8 +465,7 @@ can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp
           instr->opcode != aco_opcode::v_permlanex16_b32 &&
           instr->opcode != aco_opcode::v_permlane64_b32 &&
           instr->opcode != aco_opcode::v_readlane_b32_e64 &&
-          instr->opcode != aco_opcode::v_writelane_b32_e64 &&
-          instr->opcode != aco_opcode::p_v_cvt_pk_u8_f32;
+          instr->opcode != aco_opcode::v_writelane_b32_e64;
 }
 
 aco_ptr<Instruction>
@@ -584,6 +594,9 @@ can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
    case aco_opcode::v_interp_p10_rtz_f16_f32_inreg: return idx == 0 || idx == 2;
    case aco_opcode::v_interp_p2_f16_f32_inreg:
    case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
+   case aco_opcode::v_cvt_pk_fp8_f32:
+   case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
+   case aco_opcode::v_cvt_pk_bf8_f32: return idx == -1;
    default:
       return gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx));
    }
@@ -715,6 +728,8 @@ get_gfx11_true16_mask(aco_opcode op)
    case aco_opcode::v_and_b16:
    case aco_opcode::v_or_b16:
    case aco_opcode::v_xor_b16: return 0x3 | 0x8;
+   case aco_opcode::v_cvt_pk_f32_fp8:
+   case aco_opcode::v_cvt_pk_f32_bf8:
    case aco_opcode::v_cvt_f32_f16:
    case aco_opcode::v_cvt_i32_i16:
    case aco_opcode::v_cvt_u32_u16: return 0x1;
@@ -830,7 +845,7 @@ get_reduction_identity(ReduceOp op, unsigned idx)
    case fmax16: return 0xfc00u;                /* negative infinity */
    case fmax32: return 0xff800000u;            /* negative infinity */
    case fmax64: return idx ? 0xfff00000u : 0u; /* negative infinity */
-   default: unreachable("Invalid reduction operation"); break;
+   default: UNREACHABLE("Invalid reduction operation"); break;
    }
    return 0;
 }
@@ -1423,7 +1438,7 @@ should_form_clause(const Instruction* a, const Instruction* b)
 }
 
 aco::small_vec<uint32_t, 2>
-get_ops_fixed_to_def(Instruction* instr)
+get_tied_defs(Instruction* instr)
 {
    aco::small_vec<uint32_t, 2> ops;
    if (instr->opcode == aco_opcode::v_interp_p2_f32 || instr->opcode == aco_opcode::v_mac_f32 ||
@@ -1436,35 +1451,41 @@ get_ops_fixed_to_def(Instruction* instr)
        instr->opcode == aco_opcode::s_fmac_f16) {
       ops.push_back(2);
    } else if (instr->opcode == aco_opcode::s_addk_i32 || instr->opcode == aco_opcode::s_mulk_i32 ||
-              instr->opcode == aco_opcode::s_cmovk_i32) {
+              instr->opcode == aco_opcode::s_cmovk_i32 ||
+              instr->opcode == aco_opcode::ds_bvh_stack_push4_pop1_rtn_b32 ||
+              instr->opcode == aco_opcode::ds_bvh_stack_push8_pop1_rtn_b32 ||
+              instr->opcode == aco_opcode::ds_bvh_stack_push8_pop2_rtn_b64) {
       ops.push_back(0);
-   } else if (instr->isMUBUF() && instr->definitions.size() == 1 && instr->operands.size() == 4) {
+   } else if (instr->isMUBUF() && instr->definitions.size() == 1 &&
+              (instr_info.is_atomic[(int)instr->opcode] || instr->mubuf().tfe)) {
       ops.push_back(3);
    } else if (instr->isMIMG() && instr->definitions.size() == 1 &&
               !instr->operands[2].isUndefined()) {
       ops.push_back(2);
    } else if (instr->opcode == aco_opcode::image_bvh8_intersect_ray) {
       /* VADDR starts at 3. */
-      ops.push_back(3 + 2);
-      ops.push_back(3 + 3);
+      ops.push_back(3 + 4);
+      ops.push_back(3 + 7);
    }
    return ops;
 }
 
 uint8_t
-get_vmem_type(enum amd_gfx_level gfx_level, Instruction* instr)
+get_vmem_type(Instruction* instr, bool has_point_sample_accel)
 {
-   if (instr->opcode == aco_opcode::image_bvh64_intersect_ray ||
+   if (instr->opcode == aco_opcode::image_bvh_intersect_ray ||
+       instr->opcode == aco_opcode::image_bvh64_intersect_ray ||
+       instr->opcode == aco_opcode::image_bvh_dual_intersect_ray ||
        instr->opcode == aco_opcode::image_bvh8_intersect_ray) {
       return vmem_bvh;
-   } else if (gfx_level >= GFX12 && instr->opcode == aco_opcode::image_msaa_load) {
+   } else if (instr->opcode == aco_opcode::image_msaa_load) {
       return vmem_sampler;
    } else if (instr->isMIMG() && !instr->operands[1].isUndefined() &&
               instr->operands[1].regClass() == s4) {
       bool point_sample_accel =
-         gfx_level == GFX11_5 && (instr->opcode == aco_opcode::image_sample ||
-                                  instr->opcode == aco_opcode::image_sample_l ||
-                                  instr->opcode == aco_opcode::image_sample_lz);
+         has_point_sample_accel && (instr->opcode == aco_opcode::image_sample ||
+                                    instr->opcode == aco_opcode::image_sample_l ||
+                                    instr->opcode == aco_opcode::image_sample_lz);
       return vmem_sampler | (point_sample_accel ? vmem_nosampler : 0);
    } else if (instr->isVMEM() || instr->isScratch() || instr->isGlobal()) {
       return vmem_nosampler;
@@ -1561,30 +1582,19 @@ parse_depctr_wait(const Instruction* instr)
    return res;
 }
 
-bool
-dealloc_vgprs(Program* program)
+uint16_t
+depctr_wait::pack() const
 {
-   if (program->gfx_level < GFX11)
-      return false;
-
-   /* If we insert the sendmsg on GFX11.5, the export priority workaround will require us to insert
-    * a wait after exports. There might still be pending VMEM stores for PS parameter exports,
-    * except NGG lowering usually inserts a memory barrier. This means there is unlikely to be any
-    * pending VMEM stores or exports if we insert the sendmsg for these stages. */
-   if (program->gfx_level == GFX11_5 && (program->stage.hw == AC_HW_NEXT_GEN_GEOMETRY_SHADER ||
-                                         program->stage.hw == AC_HW_PIXEL_SHADER))
-      return false;
-
-   Block& block = program->blocks.back();
-
-   /* don't bother checking if there is a pending VMEM store or export: there almost always is */
-   Builder bld(program);
-   if (!block.instructions.empty() && block.instructions.back()->opcode == aco_opcode::s_endpgm) {
-      bld.reset(&block.instructions, block.instructions.begin() + (block.instructions.size() - 1));
-      bld.sopp(aco_opcode::s_sendmsg, sendmsg_dealloc_vgprs);
-   }
-
-   return true;
+   uint16_t imm = 0;
+   imm |= (va_vdst & 0xf) << 12;
+   imm |= (va_sdst & 0x7) << 9;
+   imm |= (va_ssrc & 0x1) << 8;
+   imm |= (hold_cnt & 0x1) << 7;
+   imm |= 0x3 << 5; /* don't know what this is, if anything */
+   imm |= (vm_vsrc & 0x7) << 2;
+   imm |= (va_vcc & 0x1) << 1;
+   imm |= (sa_sdst & 0x1);
+   return imm;
 }
 
 bool
@@ -1609,6 +1619,7 @@ get_instr_data_size(Format format)
    case Format::PSEUDO_BARRIER: return sizeof(Pseudo_barrier_instruction);
    case Format::PSEUDO_REDUCTION: return sizeof(Pseudo_reduction_instruction);
    case Format::PSEUDO_BRANCH: return sizeof(Pseudo_branch_instruction);
+   case Format::PSEUDO_CALL: return sizeof(Pseudo_call_instruction);
    case Format::DS: return sizeof(DS_instruction);
    case Format::FLAT:
    case Format::GLOBAL:
@@ -1653,6 +1664,66 @@ create_instruction(aco_opcode opcode, Format format, uint32_t num_operands,
    inst->definitions = aco::span<Definition>(definitions_offset, num_definitions);
 
    return inst;
+}
+
+Temp
+load_scratch_resource(Program* program, Builder& bld, unsigned resume_idx,
+                      bool apply_scratch_offset)
+{
+   if (program->static_scratch_rsrc != Temp()) {
+      /* We can't apply any offsets when using a static resource. */
+      assert(!apply_scratch_offset || program->scratch_offsets.empty());
+      return program->static_scratch_rsrc;
+   }
+   Temp private_segment_buffer;
+   if (!program->private_segment_buffers.empty())
+      private_segment_buffer = program->private_segment_buffers[resume_idx];
+   if (!private_segment_buffer.bytes()) {
+      Temp addr_lo =
+         bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_lo));
+      Temp addr_hi =
+         bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_hi));
+      private_segment_buffer =
+         bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
+   } else if (program->stage.hw != AC_HW_COMPUTE_SHADER) {
+      private_segment_buffer =
+         bld.smem(aco_opcode::s_load_dwordx2, bld.def(s2), private_segment_buffer, Operand::zero());
+   }
+
+   if (apply_scratch_offset && !program->scratch_offsets.empty()) {
+      Temp addr_lo = bld.tmp(s1);
+      Temp addr_hi = bld.tmp(s1);
+      bld.pseudo(aco_opcode::p_split_vector, Definition(addr_lo), Definition(addr_hi),
+                 private_segment_buffer);
+
+      Temp carry = bld.tmp(s1);
+      Temp scratch_offset = program->scratch_offsets[resume_idx];
+      addr_lo = bld.sop2(aco_opcode::s_add_u32, bld.def(s1), bld.scc(Definition(carry)), addr_lo,
+                         scratch_offset);
+      addr_hi = bld.sop2(aco_opcode::s_addc_u32, bld.def(s1), bld.def(s1, scc), addr_hi,
+                         Operand::c32(0), bld.scc(carry));
+
+      private_segment_buffer =
+         bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
+   }
+
+   struct ac_buffer_state ac_state = {0};
+   uint32_t desc[4];
+
+   ac_state.size = 0xffffffff;
+   ac_state.format = PIPE_FORMAT_R32_FLOAT;
+   for (int i = 0; i < 4; i++)
+      ac_state.swizzle[i] = PIPE_SWIZZLE_0;
+   /* older generations need element size = 4 bytes. element size removed in GFX9 */
+   ac_state.element_size = program->gfx_level <= GFX8 ? 1u : 0u;
+   ac_state.index_stride = program->wave_size == 64 ? 3u : 2u;
+   ac_state.add_tid = true;
+   ac_state.gfx10_oob_select = V_008F0C_OOB_SELECT_RAW;
+
+   ac_build_buffer_descriptor(program->gfx_level, &ac_state, desc);
+
+   return bld.pseudo(aco_opcode::p_create_vector, bld.def(s4), private_segment_buffer,
+                     Operand::c32(desc[2]), Operand::c32(desc[3]));
 }
 
 } // namespace aco

@@ -185,7 +185,7 @@ _mesa_set_program_error(struct gl_context *ctx, GLint pos, const char *string)
  * Initialize a new gl_program object.
  */
 struct gl_program *
-_mesa_init_gl_program(struct gl_program *prog, gl_shader_stage stage,
+_mesa_init_gl_program(struct gl_program *prog, mesa_shader_stage stage,
                       GLuint id, bool is_arb_asm)
 {
    if (!prog)
@@ -193,7 +193,6 @@ _mesa_init_gl_program(struct gl_program *prog, gl_shader_stage stage,
 
    memset(prog, 0, sizeof(*prog));
    prog->Id = id;
-   prog->Target = _mesa_shader_stage_to_program(stage);
    prog->RefCount = 1;
    prog->Format = GL_PROGRAM_FORMAT_ASCII_ARB;
    prog->info.stage = stage;
@@ -220,7 +219,7 @@ _mesa_init_gl_program(struct gl_program *prog, gl_shader_stage stage,
 }
 
 struct gl_program *
-_mesa_new_program(struct gl_context *ctx, gl_shader_stage stage, GLuint id,
+_mesa_new_program(struct gl_context *ctx, mesa_shader_stage stage, GLuint id,
                   bool is_arb_asm)
 {
    struct gl_program *prog;
@@ -260,22 +259,10 @@ _mesa_delete_program(struct gl_context *ctx, struct gl_program *prog)
       _mesa_free_parameter_list(prog->Parameters);
    }
 
-   if (prog->nir) {
-      ralloc_free(prog->nir);
-   }
-
-   if (prog->sh.BindlessSamplers) {
-      ralloc_free(prog->sh.BindlessSamplers);
-   }
-
-   if (prog->sh.BindlessImages) {
-      ralloc_free(prog->sh.BindlessImages);
-   }
-
-   if (prog->driver_cache_blob) {
-      ralloc_free(prog->driver_cache_blob);
-   }
-
+   ralloc_free(prog->nir);
+   ralloc_free(prog->sh.BindlessSamplers);
+   ralloc_free(prog->sh.BindlessImages);
+   ralloc_free(prog->driver_cache_blob);
    ralloc_free(prog);
 }
 
@@ -317,13 +304,7 @@ _mesa_reference_program_(struct gl_context *ctx,
    assert(ptr);
    if (*ptr && prog) {
       /* sanity check */
-      if ((*ptr)->Target == GL_VERTEX_PROGRAM_ARB)
-         assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
-      else if ((*ptr)->Target == GL_FRAGMENT_PROGRAM_ARB)
-         assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB ||
-                prog->Target == GL_FRAGMENT_PROGRAM_NV);
-      else if ((*ptr)->Target == GL_GEOMETRY_PROGRAM_NV)
-         assert(prog->Target == GL_GEOMETRY_PROGRAM_NV);
+      assert((*ptr)->info.stage == prog->info.stage);
    }
 #endif
 

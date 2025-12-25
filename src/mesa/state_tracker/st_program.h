@@ -60,6 +60,8 @@ struct st_external_sampler_key
    GLuint lower_yu_yv;
    GLuint lower_yv_yu;
    GLuint lower_y41x;
+   GLuint lower_sx10;
+   GLuint lower_sx12;
    GLuint bt709;
    GLuint bt2020;
    GLuint yuv_full_range;
@@ -84,6 +86,19 @@ st_get_external_sampler_key(struct st_context *st, struct gl_program *prog)
          continue;
 
       switch (format) {
+      case PIPE_FORMAT_Y8U8V8_420_UNORM_PACKED:
+         /* This format is HW-defined, so we can't lower it to anything but its
+          * YUV-as-RGB variant. */
+         assert(stObj->pt->format == PIPE_FORMAT_R8G8B8_420_UNORM_PACKED);
+         key.lower_yuv |= (1 << unit);
+         break;
+      case PIPE_FORMAT_Y10U10V10_420_UNORM_PACKED:
+         /* This format is HW-defined, so we can't lower it to anything but its
+          * YUV-as-RGB variant. */
+         assert(stObj->pt->format == PIPE_FORMAT_R10G10B10_420_UNORM_PACKED);
+         key.lower_yuv |= (1 << unit);
+         break;
+
       case PIPE_FORMAT_NV16:
          if (stObj->pt->format == PIPE_FORMAT_R8_G8B8_422_UNORM) {
             key.lower_yuv |= (1 << unit);
@@ -102,6 +117,7 @@ st_get_external_sampler_key(struct st_context *st, struct gl_program *prog)
             break;
          }
          FALLTHROUGH;
+      case PIPE_FORMAT_NV24:
       case PIPE_FORMAT_P010:
       case PIPE_FORMAT_P012:
       case PIPE_FORMAT_P016:
@@ -113,6 +129,9 @@ st_get_external_sampler_key(struct st_context *st, struct gl_program *prog)
             key.lower_yuv |= (1 << unit);
             break;
          }
+         FALLTHROUGH;
+      case PIPE_FORMAT_NV61:
+      case PIPE_FORMAT_NV42:
          key.lower_nv21 |= (1 << unit);
          break;
       case PIPE_FORMAT_NV20:
@@ -129,16 +148,41 @@ st_get_external_sampler_key(struct st_context *st, struct gl_program *prog)
          }
          key.lower_iyuv |= (1 << unit);
          break;
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_420_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_422_UNORM:
+      case PIPE_FORMAT_Y10X6_U10X6_V10X6_444_UNORM:
+         key.lower_iyuv |= (1 << unit);
+         key.lower_sx10 |= (1 << unit);
+         break;
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_420_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_422_UNORM:
+      case PIPE_FORMAT_Y12X4_U12X4_V12X4_444_UNORM:
+         key.lower_iyuv |= (1 << unit);
+         key.lower_sx12 |= (1 << unit);
+         break;
+      case PIPE_FORMAT_Y16_U16_V16_420_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_422_UNORM:
+      case PIPE_FORMAT_Y16_U16_V16_444_UNORM:
+         key.lower_iyuv |= (1 << unit);
+         break;
       case PIPE_FORMAT_YUYV:
-         if (stObj->pt->format == PIPE_FORMAT_R8G8_R8B8_UNORM) {
+         if (stObj->pt->format == PIPE_FORMAT_R8G8_R8B8_UNORM)
             key.lower_yu_yv |= (1 << unit);
-            break;
-         }
-         FALLTHROUGH;
+         else
+            key.lower_yx_xuxv |= (1 << unit);
+         break;
       case PIPE_FORMAT_Y210:
+         if (stObj->pt->format == PIPE_FORMAT_X6R10X6G10_X6R10X6B10_422_UNORM)
+            key.lower_yu_yv |= (1 << unit);
+         else
+            key.lower_yx_xuxv |= (1 << unit);
+         break;
       case PIPE_FORMAT_Y212:
       case PIPE_FORMAT_Y216:
-         key.lower_yx_xuxv |= (1 << unit);
+         if (stObj->pt->format == PIPE_FORMAT_R16G16_R16B16_422_UNORM)
+            key.lower_yu_yv |= (1 << unit);
+         else
+            key.lower_yx_xuxv |= (1 << unit);
          break;
       case PIPE_FORMAT_UYVY:
          if (stObj->pt->format == PIPE_FORMAT_G8R8_B8R8_UNORM) {

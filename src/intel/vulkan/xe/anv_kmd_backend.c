@@ -50,8 +50,17 @@ xe_gem_create(struct anv_device *device,
           (alloc_flags & ANV_BO_ALLOC_HOST_CACHED_COHERENT) == ANV_BO_ALLOC_HOST_CACHED_COHERENT);
 
    uint32_t flags = 0;
-   if (alloc_flags & ANV_BO_ALLOC_SCANOUT)
+   if (alloc_flags & ANV_BO_ALLOC_SCANOUT) {
       flags |= DRM_XE_GEM_CREATE_FLAG_SCANOUT;
+      /* Xe2+ discrete platforms like BMG requires continuous physical memory
+       * allocation on CCS compressed images to display. Xe KMD will do so
+       * when the size of bo is aligned to 64kB and the scanout flag is
+       * present.
+       */
+      if (device->info->has_local_mem &&
+          (alloc_flags & ANV_BO_ALLOC_COMPRESSED))
+         size = align64(size, 64 * 1024);
+   }
    if ((alloc_flags & (ANV_BO_ALLOC_MAPPED | ANV_BO_ALLOC_LOCAL_MEM_CPU_VISIBLE)) &&
        !(alloc_flags & ANV_BO_ALLOC_NO_LOCAL_MEM) &&
        device->physical->vram_non_mappable.size > 0)
@@ -79,7 +88,7 @@ xe_gem_create(struct anv_device *device,
       gem_create.cpu_caching = DRM_XE_GEM_CPU_CACHING_WB;
       break;
    default:
-      unreachable("missing");
+      UNREACHABLE("missing");
       gem_create.cpu_caching = DRM_XE_GEM_CPU_CACHING_WC;
    }
 
@@ -125,16 +134,21 @@ xe_gem_mmap(struct anv_device *device, struct anv_bo *bo, uint64_t offset,
       placed_addr -= offset;
    }
 
+   /* The Kernel uAPI doesn't allow us to map with an offset. To work around,
+    * overallocate and then unmap the unneeded region
+    */
    void *ptr = mmap(placed_addr, offset + size, PROT_READ | PROT_WRITE,
                     (placed_addr != NULL ? MAP_FIXED : 0) | MAP_SHARED,
                     device->fd, args.offset);
    if (ptr == MAP_FAILED)
       return ptr;
 
+   void *ret = ptr + offset;
+
    if (offset != 0)
       munmap(ptr, offset);
 
-   return ptr + offset;
+   return ret;
 }
 
 static inline uint32_t

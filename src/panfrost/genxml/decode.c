@@ -34,9 +34,6 @@
 #include <genxml/gen_macros.h>
 #include <sys/mman.h>
 
-#include "compiler/bifrost/disassemble.h"
-#include "compiler/valhall/disassemble.h"
-#include "midgard/disassemble.h"
 #include "util/set.h"
 #include "pan_format.h"
 
@@ -72,24 +69,142 @@ pandecode_midgard_tiler_descriptor(struct pandecode_context *ctx,
 
 #if PAN_ARCH >= 5
 static void
-pandecode_render_target(struct pandecode_context *ctx, uint64_t gpu_va,
-                        unsigned gpu_id,
-                        const struct MALI_FRAMEBUFFER_PARAMETERS *fb)
+pandecode_rt(struct pandecode_context *ctx, unsigned index, uint64_t gpu_va)
+{
+   uint64_t rt_va = gpu_va + index * pan_size(RENDER_TARGET);
+   const struct mali_render_target_packed *PANDECODE_PTR_VAR(ctx, rtp, rt_va);
+
+   pan_unpack(rtp, RENDER_TARGET, rt);
+#if PAN_ARCH >= 10
+   switch (rt.rgb.writeback_mode) {
+   case MALI_WRITEBACK_MODE_COMPAT:
+      break;
+   case MALI_WRITEBACK_MODE_AFRC_RGB:
+      DUMP_UNPACKED(ctx, AFRC_RGB_RENDER_TARGET, rt.afrc_rgb,
+                    "AFRC RGB Color Render Target %d:\n", index);
+      break;
+   case MALI_WRITEBACK_MODE_AFRC_YUV:
+      DUMP_UNPACKED(ctx, AFRC_YUV_RENDER_TARGET, rt.afrc_yuv,
+                    "AFRC YUV Color Render Target %d:\n", index);
+      break;
+   default:
+      UNREACHABLE("Invalid writeback mode");
+   }
+#endif
+
+   switch (rt.rgb.writeback_block_format) {
+#if PAN_ARCH >= 7
+   case MALI_BLOCK_FORMAT_NO_WRITE:
+#else
+   case MALI_BLOCK_FORMAT_TILED_LINEAR:
+#endif
+   case MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED:
+   case MALI_BLOCK_FORMAT_LINEAR:
+      if (rt.rgb.yuv_enable) {
+         DUMP_UNPACKED(ctx, YUV_RENDER_TARGET, rt.yuv,
+                       "%s YUV Color Render Target %d:\n",
+                       rt.rgb.writeback_block_format == MALI_BLOCK_FORMAT_LINEAR
+                          ? "Linear"
+                          : "U-Tiled",
+                       index);
+      } else {
+         DUMP_UNPACKED(ctx, RGB_RENDER_TARGET, rt.rgb,
+                       "%s RGB Color Render Target %d:\n",
+                       rt.rgb.writeback_block_format == MALI_BLOCK_FORMAT_LINEAR
+                          ? "Linear"
+                          : "U-Tiled",
+                       index);
+      }
+      break;
+#if PAN_ARCH >= 7
+   case MALI_BLOCK_FORMAT_AFBC_TILED:
+#endif
+   case MALI_BLOCK_FORMAT_AFBC:
+#if PAN_ARCH >= 6
+      if (rt.rgb.yuv_enable) {
+         DUMP_UNPACKED(ctx, AFBC_YUV_RENDER_TARGET, rt.afbc_yuv,
+                       "AFBC YUV Color Render Target %d:\n", index);
+         break;
+      }
+#else
+      assert(!rt.rgb.yuv_enable);
+#endif
+
+      DUMP_UNPACKED(ctx, AFBC_RGB_RENDER_TARGET, rt.afbc_rgb,
+                    "AFBC RGB Color Render Target %d:\n", index);
+      break;
+   }
+}
+
+static void
+pandecode_rts(struct pandecode_context *ctx, uint64_t gpu_va, unsigned gpu_id,
+              const struct MALI_FRAMEBUFFER_PARAMETERS *fb)
 {
    pandecode_log(ctx, "Color Render Targets @%" PRIx64 ":\n", gpu_va);
    ctx->indent++;
 
-   for (int i = 0; i < (fb->render_target_count); i++) {
-      uint64_t rt_va = gpu_va + i * pan_size(RENDER_TARGET);
-      const struct mali_render_target_packed *PANDECODE_PTR_VAR(
-         ctx, rtp, (uint64_t)rt_va);
-      DUMP_CL(ctx, RENDER_TARGET, rtp, "Color Render Target %d:\n", i);
-   }
+   for (int i = 0; i < (fb->render_target_count); i++)
+      pandecode_rt(ctx, i, gpu_va);
 
    ctx->indent--;
    pandecode_log(ctx, "\n");
 }
+
+static void
+pandecode_zs_crc_ext(struct pandecode_context *ctx, uint64_t gpu_va)
+{
+   const struct mali_zs_crc_extension_packed *PANDECODE_PTR_VAR(
+      ctx, zs_crc_packed, (uint64_t)gpu_va);
+
+   pan_unpack(zs_crc_packed, ZS_CRC_EXTENSION, zs_crc);
+   DUMP_UNPACKED(ctx, CRC, zs_crc.crc, "CRC:\n");
+
+   switch (zs_crc.zs.block_format) {
+#if PAN_ARCH >= 7
+   case MALI_BLOCK_FORMAT_NO_WRITE:
+#else
+   case MALI_BLOCK_FORMAT_TILED_LINEAR:
 #endif
+   case MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED:
+   case MALI_BLOCK_FORMAT_LINEAR:
+      DUMP_UNPACKED(ctx, ZS_TARGET, zs_crc.zs, "ZS:\n");
+      break;
+#if PAN_ARCH >= 7
+   case MALI_BLOCK_FORMAT_AFBC_TILED:
+#endif
+   case MALI_BLOCK_FORMAT_AFBC:
+      DUMP_UNPACKED(ctx, AFBC_ZS_TARGET, zs_crc.afbc_zs, "ZS:\n");
+      break;
+
+   default:
+      UNREACHABLE("Invalid block format");
+   }
+
+   switch (zs_crc.s.block_format) {
+#if PAN_ARCH >= 7
+   case MALI_BLOCK_FORMAT_NO_WRITE:
+#else
+   case MALI_BLOCK_FORMAT_TILED_LINEAR:
+#endif
+   case MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED:
+   case MALI_BLOCK_FORMAT_LINEAR:
+      DUMP_UNPACKED(ctx, S_TARGET, zs_crc.s, "S:\n");
+      break;
+#if PAN_ARCH >= 9
+   case MALI_BLOCK_FORMAT_AFBC_TILED:
+   case MALI_BLOCK_FORMAT_AFBC:
+      DUMP_UNPACKED(ctx, AFBC_S_TARGET, zs_crc.afbc_s, "S:\n");
+      break;
+#endif
+
+   default:
+      UNREACHABLE("Invalid block format");
+   }
+
+   pandecode_log(ctx, "\n");
+}
+#endif
+
 
 #if PAN_ARCH >= 6
 static void
@@ -132,7 +247,9 @@ GENX(pandecode_fbd)(struct pandecode_context *ctx, uint64_t gpu_va,
       pan_unpack(dcd, DRAW, draw);
       pandecode_log(ctx, "Pre frame 0 @%" PRIx64 " (mode=%d):\n",
                     params.frame_shader_dcds, params.pre_frame_0);
+      ctx->indent++;
       GENX(pandecode_dcd)(ctx, &draw, job_type_param, gpu_id);
+      ctx->indent--;
    }
 
    if (params.pre_frame_1 != MALI_PRE_POST_FRAME_SHADER_MODE_NEVER) {
@@ -141,7 +258,9 @@ GENX(pandecode_fbd)(struct pandecode_context *ctx, uint64_t gpu_va,
       pan_unpack(dcd, DRAW, draw);
       pandecode_log(ctx, "Pre frame 1 @%" PRIx64 ":\n",
                     params.frame_shader_dcds + (1 * dcd_size));
+      ctx->indent++;
       GENX(pandecode_dcd)(ctx, &draw, job_type_param, gpu_id);
+      ctx->indent--;
    }
 
    if (params.post_frame != MALI_PRE_POST_FRAME_SHADER_MODE_NEVER) {
@@ -149,7 +268,9 @@ GENX(pandecode_fbd)(struct pandecode_context *ctx, uint64_t gpu_va,
          ctx, dcd, params.frame_shader_dcds + (2 * dcd_size));
       pan_unpack(dcd, DRAW, draw);
       pandecode_log(ctx, "Post frame:\n");
+      ctx->indent++;
       GENX(pandecode_dcd)(ctx, &draw, job_type_param, gpu_id);
+      ctx->indent--;
    }
 #else
    DUMP_SECTION(ctx, FRAMEBUFFER, LOCAL_STORAGE, fb, "Local Storage:\n");
@@ -175,16 +296,13 @@ GENX(pandecode_fbd)(struct pandecode_context *ctx, uint64_t gpu_va,
    gpu_va += pan_size(FRAMEBUFFER);
 
    if (params.has_zs_crc_extension) {
-      const struct mali_zs_crc_extension_packed *PANDECODE_PTR_VAR(
-         ctx, zs_crc, (uint64_t)gpu_va);
-      DUMP_CL(ctx, ZS_CRC_EXTENSION, zs_crc, "ZS CRC Extension:\n");
-      pandecode_log(ctx, "\n");
+      pandecode_zs_crc_ext(ctx, gpu_va);
 
       gpu_va += pan_size(ZS_CRC_EXTENSION);
    }
 
    if (is_fragment)
-      pandecode_render_target(ctx, gpu_va, gpu_id, &params);
+      pandecode_rts(ctx, gpu_va, gpu_id, &params);
 
    return (struct pandecode_fbd){
       .rt_count = params.render_target_count,
@@ -228,9 +346,9 @@ GENX(pandecode_blend)(struct pandecode_context *ctx,
 }
 #endif
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 static bool
-panfrost_is_yuv_format(uint32_t packed)
+pan_is_yuv_format(uint32_t packed)
 {
 #if PAN_ARCH == 7
    enum mali_format mali_fmt = packed >> 12;
@@ -301,7 +419,7 @@ pandecode_texture_payload(struct pandecode_context *ctx, uint64_t payload,
    PANDECODE_EMIT_TEX_PAYLOAD_DESC(SURFACE_WITH_STRIDE, "Surface With Stride");
 #else
    STATIC_ASSERT(PAN_ARCH == 7);
-   if (panfrost_is_yuv_format(tex->format)) {
+   if (pan_is_yuv_format(tex->format)) {
       PANDECODE_EMIT_TEX_PAYLOAD_DESC(MULTIPLANAR_SURFACE, "Surface YUV");
    } else {
       PANDECODE_EMIT_TEX_PAYLOAD_DESC(SURFACE_WITH_STRIDE,
@@ -310,6 +428,48 @@ pandecode_texture_payload(struct pandecode_context *ctx, uint64_t payload,
 #endif
 
 #undef PANDECODE_EMIT_TEX_PAYLOAD_DESC
+}
+#endif
+
+#if PAN_ARCH >= 9
+static void
+pandecode_tex_plane(struct pandecode_context *ctx, uint64_t u, unsigned idx)
+{
+   const struct mali_plane_header_packed *cl =
+      pandecode_fetch_gpu_mem(ctx, u, pan_size(PLANE_HEADER));
+
+   pan_unpack(cl, PLANE_HEADER, temp);
+
+   switch (temp.plane_type) {
+   case MALI_PLANE_TYPE_NULL:
+      DUMP_ADDR(ctx, NULL_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_GENERIC:
+      DUMP_ADDR(ctx, GENERIC_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_CHROMA_2P:
+      DUMP_ADDR(ctx, CHROMA_2P_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_ASTC_2D:
+      DUMP_ADDR(ctx, ASTC_2D_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_ASTC_3D:
+      DUMP_ADDR(ctx, ASTC_3D_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_AFBC:
+      DUMP_ADDR(ctx, AFBC_PLANE, u, "Plane %u:\n", idx);
+      break;
+#if PAN_ARCH >= 10
+   case MALI_PLANE_TYPE_AFRC:
+      DUMP_ADDR(ctx, AFRC_PLANE, u, "Plane %u:\n", idx);
+      break;
+   case MALI_PLANE_TYPE_AFRC_CHROMA_2P:
+      DUMP_ADDR(ctx, AFRC_CHROMA_2P_PLANE, u, "Plane %u:\n", idx);
+      break;
+#endif
+   default:
+      UNREACHABLE("Unknown plane type");
+   }
 }
 #endif
 
@@ -345,8 +505,7 @@ GENX(pandecode_texture)(struct pandecode_context *ctx,
       plane_count *= 6;
 
    for (unsigned i = 0; i < plane_count; ++i)
-      DUMP_ADDR(ctx, PLANE, temp.surfaces + i * pan_size(PLANE), "Plane %u:\n",
-                i);
+      pandecode_tex_plane(ctx, temp.surfaces + i * pan_size(NULL_PLANE), i);
 #else
    pandecode_texture_payload(ctx, temp.surfaces, &temp);
 #endif
@@ -407,6 +566,39 @@ GENX(pandecode_shader)(struct pandecode_context *ctx, uint64_t addr,
    return desc.binary;
 }
 
+static unsigned
+pandecode_buffer(struct pandecode_context *ctx,
+                 const struct mali_buffer_packed *cl, uint64_t addr,
+                 uint64_t end_of_entry_addr)
+{
+   pan_unpack(cl, BUFFER, buffer)
+      ;
+   DUMP_UNPACKED(ctx, BUFFER, buffer, "Buffer @%" PRIx64 ":\n", addr);
+
+   /* If the address is the following descriptor and is within the resource
+    * entry, this descriptor is an IUB. */
+   if (buffer.address == (addr + 0x20) && buffer.address < end_of_entry_addr) {
+      assert((buffer.size % 0x20) == 0);
+
+      const uint8_t *cl_bytes = (uint8_t *)cl;
+      const uint32_t *words = (uint32_t *)(cl_bytes + 0x20);
+      unsigned count = buffer.size / (2 * sizeof(uint32_t));
+
+      ctx->indent++;
+      pandecode_log(ctx, "IUB @%" PRIx64 ":\n", buffer.address);
+      ctx->indent++;
+      for (unsigned i = 0; i < count; ++i)
+         pandecode_log(ctx, "%08X %08X\n", words[2 * i], words[2 * i + 1]);
+      ctx->indent--;
+      ctx->indent--;
+      pandecode_log(ctx, "\n");
+
+      return buffer.size;
+   }
+
+   return 0;
+}
+
 static void
 pandecode_resources(struct pandecode_context *ctx, uint64_t addr, unsigned size)
 {
@@ -414,9 +606,14 @@ pandecode_resources(struct pandecode_context *ctx, uint64_t addr, unsigned size)
    assert((size % 0x20) == 0);
 
    for (unsigned i = 0; i < size; i += 0x20) {
-      unsigned type = (cl[i] & 0xF);
-
-      switch (type) {
+      pan_unpack((const struct mali_descriptor_header_packed *)&cl[i],
+                 DESCRIPTOR_HEADER, header)
+         ;
+      switch (header.type) {
+      case MALI_DESCRIPTOR_TYPE_NULL:
+         DUMP_CL(ctx, NULL_DESCRIPTOR, cl + i, "NullDescriptor @%" PRIx64 "\n",
+                 addr + i);
+         break;
       case MALI_DESCRIPTOR_TYPE_SAMPLER:
          DUMP_CL(ctx, SAMPLER, cl + i, "Sampler @%" PRIx64 ":\n", addr + i);
          break;
@@ -428,10 +625,11 @@ pandecode_resources(struct pandecode_context *ctx, uint64_t addr, unsigned size)
          DUMP_CL(ctx, ATTRIBUTE, cl + i, "Attribute @%" PRIx64 ":\n", addr + i);
          break;
       case MALI_DESCRIPTOR_TYPE_BUFFER:
-         DUMP_CL(ctx, BUFFER, cl + i, "Buffer @%" PRIx64 ":\n", addr + i);
+         i += pandecode_buffer(ctx, (const struct mali_buffer_packed *)&cl[i],
+                               addr + i, addr + size);
          break;
       default:
-         fprintf(ctx->dump_stream, "Unknown descriptor type %X\n", type);
+         fprintf(ctx->dump_stream, "Unknown descriptor type %X\n", header.type);
          break;
       }
    }
@@ -441,6 +639,9 @@ void
 GENX(pandecode_resource_tables)(struct pandecode_context *ctx, uint64_t addr,
                                 const char *label)
 {
+   if (!addr)
+      return;
+
    unsigned count = addr & 0x3F;
    addr = addr & ~0x3F;
 
@@ -479,8 +680,7 @@ GENX(pandecode_shader_environment)(struct pandecode_context *ctx,
    if (p->shader)
       GENX(pandecode_shader)(ctx, p->shader, "Shader", gpu_id);
 
-   if (p->resources)
-      GENX(pandecode_resource_tables)(ctx, p->resources, "Resources");
+   GENX(pandecode_resource_tables)(ctx, p->resources, "Resources");
 
    if (p->thread_storage)
       DUMP_ADDR(ctx, LOCAL_STORAGE, p->thread_storage, "Local Storage:\n");
@@ -521,9 +721,8 @@ GENX(pandecode_dcd)(struct pandecode_context *ctx, const struct MALI_DRAW *p,
    if (p->vertex_shader)
       GENX(pandecode_shader)(ctx, p->vertex_shader, "Vertex Shader", gpu_id);
 
-   if (p->vertex_resources)
-      GENX(pandecode_resource_tables)(ctx, p->vertex_resources,
-                                      "Vertex Resources");
+   GENX(pandecode_resource_tables)(ctx, p->vertex_resources,
+                                   "Vertex Resources");
 
    if (p->vertex_fau.pointer)
       GENX(pandecode_fau)(ctx, p->vertex_fau.pointer, p->vertex_fau.count,
@@ -533,9 +732,8 @@ GENX(pandecode_dcd)(struct pandecode_context *ctx, const struct MALI_DRAW *p,
       GENX(pandecode_shader)(ctx, p->fragment_shader, "Fragment Shader",
                              gpu_id);
 
-   if (p->fragment_resources)
-      GENX(pandecode_resource_tables)(ctx, p->fragment_resources,
-                                      "Fragment Resources");
+   GENX(pandecode_resource_tables)(ctx, p->fragment_resources,
+                                   "Fragment Resources");
 
    if (p->fragment_fau.pointer)
       GENX(pandecode_fau)(ctx, p->fragment_fau.pointer, p->fragment_fau.count,

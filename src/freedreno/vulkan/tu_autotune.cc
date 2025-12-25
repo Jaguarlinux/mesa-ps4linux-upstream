@@ -669,8 +669,8 @@ tu_autotune_begin_renderpass(struct tu_cmd_buffer *cmd,
       (struct tu_renderpass_samples *) tu_suballoc_bo_map(
          &autotune_result->bo);
 
-   tu_cs_emit_regs(cs, A6XX_RB_SAMPLE_COUNT_CONTROL(.copy = true));
-   if (cmd->device->physical_device->info->a7xx.has_event_write_sample_count) {
+   tu_cs_emit_regs(cs, A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
+   if (cmd->device->physical_device->info->props.has_event_write_sample_count) {
       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 3);
       tu_cs_emit(cs, CP_EVENT_WRITE7_0(.event = ZPASS_DONE,
                                        .write_sample_count = true).value);
@@ -692,7 +692,7 @@ tu_autotune_begin_renderpass(struct tu_cmd_buffer *cmd,
       }
    } else {
       tu_cs_emit_regs(cs,
-                        A6XX_RB_SAMPLE_COUNT_ADDR(.qword = result_iova));
+                        A6XX_RB_SAMPLE_COUNTER_BASE(.qword = result_iova));
       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 1);
       tu_cs_emit(cs, ZPASS_DONE);
    }
@@ -712,9 +712,9 @@ void tu_autotune_end_renderpass(struct tu_cmd_buffer *cmd,
 
    uint64_t result_iova = autotune_result->bo.iova;
 
-   tu_cs_emit_regs(cs, A6XX_RB_SAMPLE_COUNT_CONTROL(.copy = true));
+   tu_cs_emit_regs(cs, A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
 
-   if (cmd->device->physical_device->info->a7xx.has_event_write_sample_count) {
+   if (cmd->device->physical_device->info->props.has_event_write_sample_count) {
       /* If the renderpass contains ZPASS_DONE events we emit a fake ZPASS_DONE
        * event here, composing a pair of these events that firmware handles without
        * issue. This first event writes into the samples_end field and the second
@@ -738,7 +738,7 @@ void tu_autotune_end_renderpass(struct tu_cmd_buffer *cmd,
       result_iova += offsetof(struct tu_renderpass_samples, samples_end);
 
       tu_cs_emit_regs(cs,
-                        A6XX_RB_SAMPLE_COUNT_ADDR(.qword = result_iova));
+                        A6XX_RB_SAMPLE_COUNTER_BASE(.qword = result_iova));
       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 1);
       tu_cs_emit(cs, ZPASS_DONE);
    }

@@ -103,10 +103,10 @@ radv_fixup_copy_dst_metadata(struct radv_cmd_buffer *cmd_buffer, const struct ra
           dst_image->planes[0].surface.fmask_offset + dst_image->planes[0].surface.fmask_size ==
              dst_image->planes[0].surface.cmask_offset);
 
-   if (src_image->bindings[0].bo && (src_image->bindings[0].bo->initial_domain & RADEON_DOMAIN_VRAM))
-      src_copy_flags |= RADV_COPY_FLAGS_DEVICE_LOCAL;
-   if (dst_image->bindings[0].bo && (dst_image->bindings[0].bo->initial_domain & RADEON_DOMAIN_VRAM))
-      dst_copy_flags |= RADV_COPY_FLAGS_DEVICE_LOCAL;
+   if (src_image->bindings[0].bo)
+      src_copy_flags |= radv_get_copy_flags_from_bo(src_image->bindings[0].bo);
+   if (dst_image->bindings[0].bo)
+      dst_copy_flags |= radv_get_copy_flags_from_bo(dst_image->bindings[0].bo);
 
    /* Copy CMASK+FMASK. */
    size = src_image->planes[0].surface.cmask_size + src_image->planes[0].surface.fmask_size;
@@ -118,7 +118,8 @@ radv_fixup_copy_dst_metadata(struct radv_cmd_buffer *cmd_buffer, const struct ra
 
 bool
 radv_can_use_fmask_copy(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *src_image,
-                        const struct radv_image *dst_image, const struct radv_meta_blit2d_rect *rect)
+                        const struct radv_image *dst_image, const VkOffset3D *src_offset, const VkOffset3D *dst_offset,
+                        const VkExtent3D *extent)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -140,8 +141,8 @@ radv_can_use_fmask_copy(struct radv_cmd_buffer *cmd_buffer, const struct radv_im
       return false;
 
    /* The region must be a whole image copy. */
-   if (rect->src_x || rect->src_y || rect->dst_x || rect->dst_y || rect->width != src_image->vk.extent.width ||
-       rect->height != src_image->vk.extent.height)
+   if (src_offset->x || src_offset->y || dst_offset->x || dst_offset->y ||
+       extent->width != src_image->vk.extent.width || extent->height != src_image->vk.extent.height)
       return false;
 
    /* Source/destination images must have identical size. */
@@ -178,9 +179,16 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
 
    radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
+   const VkImageViewUsageCreateInfo src_iview_usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+   };
+
    radv_image_view_init(&src_iview, device,
                         &(VkImageViewCreateInfo){
                            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                           .pNext = &src_iview_usage_info,
+                           .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(src->image),
                            .viewType = radv_meta_get_view_type(src->image),
                            .format = vk_format_no_srgb(src->image->vk.format),
@@ -195,9 +203,16 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
                         },
                         NULL);
 
+   const VkImageViewUsageCreateInfo dst_iview_usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+   };
+
    radv_image_view_init(&dst_iview, device,
                         &(VkImageViewCreateInfo){
                            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                           .pNext = &dst_iview_usage_info,
+                           .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(dst->image),
                            .viewType = radv_meta_get_view_type(dst->image),
                            .format = vk_format_no_srgb(dst->image->vk.format),

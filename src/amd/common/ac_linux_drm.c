@@ -5,7 +5,10 @@
 
 #include "util/os_drm.h"
 #include "ac_linux_drm.h"
+#include "util/os_misc.h"
 #include "util/u_math.h"
+#include "util/u_sync_provider.h"
+#include "ac_gpu_info.h"
 
 #include <stdlib.h>
 #include <time.h>
@@ -22,6 +25,7 @@ struct ac_drm_device {
       amdvgpu_device_handle vdev;
 #endif
    };
+   struct util_sync_provider *p;
    int fd;
    bool is_virtio;
 };
@@ -38,12 +42,14 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
 
 #ifdef HAVE_AMDGPU_VIRTIO
    if (is_virtio) {
+      struct util_sync_provider *p;
       amdvgpu_device_handle vdev;
       r = amdvgpu_device_initialize(fd, major_version, minor_version,
-                                    &vdev);
+                                    &vdev, &p);
       if (r == 0) {
          (*dev)->vdev = vdev;
          (*dev)->fd = amdvgpu_device_get_fd(vdev);
+         (*dev)->p = p;
       }
    } else
 #endif
@@ -54,6 +60,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
       if (r == 0) {
          (*dev)->adev = adev;
          (*dev)->fd = amdgpu_device_get_fd(adev);
+         (*dev)->p = util_sync_provider_drm((*dev)->fd);
       }
    }
 
@@ -65,6 +72,11 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
    return r;
 }
 
+struct util_sync_provider *ac_drm_device_get_sync_provider(ac_drm_device *dev)
+{
+   return dev->p;
+}
+
 uintptr_t ac_drm_device_get_cookie(ac_drm_device *dev)
 {
    return (uintptr_t) dev->adev;
@@ -72,6 +84,8 @@ uintptr_t ac_drm_device_get_cookie(ac_drm_device *dev)
 
 void ac_drm_device_deinitialize(ac_drm_device *dev)
 {
+   dev->p->finalize(dev->p);
+
 #ifdef HAVE_AMDGPU_VIRTIO
    if (dev->is_virtio)
       amdvgpu_device_deinitialize(dev->vdev);
@@ -214,7 +228,7 @@ int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_n
 int ac_drm_bo_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size,
                     uint64_t addr, uint64_t flags, uint32_t ops)
 {
-   size = ALIGN(size, getpagesize());
+   size = align64(size, getpagesize());
 
    return ac_drm_bo_va_op_raw(
       dev, bo_handle, offset, size, addr,
@@ -282,9 +296,9 @@ int ac_drm_cs_ctx_create2(ac_drm_device *dev, uint32_t priority, uint32_t *ctx_i
 {
    int r;
    union drm_amdgpu_ctx args;
-   char *override_priority;
+   const char *override_priority;
 
-   override_priority = getenv("AMD_PRIORITY");
+   override_priority = os_get_option("AMD_PRIORITY");
    if (override_priority) {
       /* The priority is a signed integer. The variable type is
        * wrong. If parsing fails, priority is unchanged.
@@ -429,81 +443,76 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
    return r;
 }
 
-int ac_drm_cs_create_syncobj2(int device_fd, uint32_t flags, uint32_t *handle)
+int ac_drm_cs_create_syncobj2(ac_drm_device *dev, uint32_t flags, uint32_t *handle)
 {
-   return drmSyncobjCreate(device_fd, flags, handle);
+   return dev->p->create(dev->p, flags, handle);
 }
 
-int ac_drm_cs_create_syncobj(int device_fd, uint32_t *handle)
+int ac_drm_cs_destroy_syncobj(ac_drm_device *dev, uint32_t handle)
 {
-   return drmSyncobjCreate(device_fd, 0, handle);
+   return dev->p->destroy(dev->p, handle);
 }
 
-int ac_drm_cs_destroy_syncobj(int device_fd, uint32_t handle)
-{
-   return drmSyncobjDestroy(device_fd, handle);
-}
-
-int ac_drm_cs_syncobj_wait(int device_fd, uint32_t *handles, unsigned num_handles,
+int ac_drm_cs_syncobj_wait(ac_drm_device *dev, uint32_t *handles, unsigned num_handles,
                            int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
 {
-   return drmSyncobjWait(device_fd, handles, num_handles, timeout_nsec, flags, first_signaled);
+   return dev->p->wait(dev->p, handles, num_handles, timeout_nsec, flags, first_signaled);
 }
 
-int ac_drm_cs_syncobj_query2(int device_fd, uint32_t *handles, uint64_t *points,
+int ac_drm_cs_syncobj_query2(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
                              unsigned num_handles, uint32_t flags)
 {
-   return drmSyncobjQuery2(device_fd, handles, points, num_handles, flags);
+   return dev->p->query(dev->p, handles, points, num_handles, flags);
 }
 
-int ac_drm_cs_import_syncobj(int device_fd, int shared_fd, uint32_t *handle)
+int ac_drm_cs_import_syncobj(ac_drm_device *dev, int shared_fd, uint32_t *handle)
 {
-   return drmSyncobjFDToHandle(device_fd, shared_fd, handle);
+   return dev->p->fd_to_handle(dev->p, shared_fd, handle);
 }
 
-int ac_drm_cs_syncobj_export_sync_file(int device_fd, uint32_t syncobj, int *sync_file_fd)
+int ac_drm_cs_syncobj_export_sync_file(ac_drm_device *dev, uint32_t syncobj, int *sync_file_fd)
 {
-   return drmSyncobjExportSyncFile(device_fd, syncobj, sync_file_fd);
+   return dev->p->export_sync_file(dev->p, syncobj, sync_file_fd);
 }
 
-int ac_drm_cs_syncobj_import_sync_file(int device_fd, uint32_t syncobj, int sync_file_fd)
+int ac_drm_cs_syncobj_import_sync_file(ac_drm_device *dev, uint32_t syncobj, int sync_file_fd)
 {
-   return drmSyncobjImportSyncFile(device_fd, syncobj, sync_file_fd);
+   return dev->p->import_sync_file(dev->p, syncobj, sync_file_fd);
 }
 
-int ac_drm_cs_syncobj_export_sync_file2(int device_fd, uint32_t syncobj, uint64_t point,
+int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, uint64_t point,
                                         uint32_t flags, int *sync_file_fd)
 {
    uint32_t binary_handle;
    int ret;
 
    if (!point)
-      return drmSyncobjExportSyncFile(device_fd, syncobj, sync_file_fd);
+      return dev->p->export_sync_file(dev->p, syncobj, sync_file_fd);
 
-   ret = drmSyncobjCreate(device_fd, 0, &binary_handle);
+   ret = dev->p->create(dev->p, 0, &binary_handle);
    if (ret)
       return ret;
 
-   ret = drmSyncobjTransfer(device_fd, binary_handle, 0, syncobj, point, flags);
+   ret = dev->p->transfer(dev->p, binary_handle, 0, syncobj, point, flags);
    if (ret)
       goto out;
-   ret = drmSyncobjExportSyncFile(device_fd, binary_handle, sync_file_fd);
+   ret = dev->p->export_sync_file(dev->p, binary_handle, sync_file_fd);
 out:
-   drmSyncobjDestroy(device_fd, binary_handle);
+   dev->p->destroy(dev->p, binary_handle);
    return ret;
 }
 
-int ac_drm_cs_syncobj_transfer(int device_fd, uint32_t dst_handle, uint64_t dst_point,
+int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst_handle, uint64_t dst_point,
                                uint32_t src_handle, uint64_t src_point, uint32_t flags)
 {
-   return drmSyncobjTransfer(device_fd, dst_handle, dst_point, src_handle, src_point, flags);
+   return dev->p->transfer(dev->p, dst_handle, dst_point, src_handle, src_point, flags);
 }
 
-int ac_drm_cs_syncobj_timeline_wait(int device_fd, uint32_t *handles, uint64_t *points,
+int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
                                     unsigned num_handles, int64_t timeout_nsec, unsigned flags,
                                     uint32_t *first_signaled)
 {
-   return drmSyncobjTimelineWait(device_fd, handles, points, num_handles, timeout_nsec, flags,
+   return dev->p->timeline_wait(dev->p, handles, points, num_handles, timeout_nsec, flags,
                                  first_signaled);
 }
 
@@ -643,13 +652,20 @@ int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned
 }
 
 int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
-                                 struct drm_amdgpu_info_uq_fw_areas *info)
+                                 struct drm_amdgpu_info_uq_metadata *info)
 {
    struct drm_amdgpu_info request;
 
    memset(&request, 0, sizeof(request));
    request.return_pointer = (uintptr_t)info;
-   request.return_size = sizeof(*info);
+   if (type == AMDGPU_HW_IP_GFX)
+      request.return_size = sizeof(struct drm_amdgpu_info_uq_metadata_gfx);
+   else if (type == AMDGPU_HW_IP_COMPUTE)
+      request.return_size = sizeof(struct drm_amdgpu_info_uq_metadata_compute);
+   else if (type == AMDGPU_HW_IP_DMA)
+      request.return_size = sizeof(struct drm_amdgpu_info_uq_metadata_sdma);
+   else
+      UNREACHABLE("invalid type");
    request.query = AMDGPU_INFO_UQ_FW_AREAS;
    request.query_hw_ip.type = type;
    request.query_hw_ip.ip_instance = ip_instance;
@@ -994,6 +1010,12 @@ int ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
    return amdgpu_va_range_free(va_range_handle);
 }
 
+int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uint64_t *start,
+                          uint64_t *end)
+{
+   return amdgpu_va_range_query(dev->adev, type, start, end);
+}
+
 int ac_drm_create_userqueue(ac_drm_device *dev, uint32_t ip_type, uint32_t doorbell_handle,
                             uint32_t doorbell_offset, uint64_t queue_va, uint64_t queue_size,
                             uint64_t wptr_va, uint64_t rptr_va, void *mqd_in, uint32_t flags, uint32_t *queue_id)
@@ -1067,4 +1089,43 @@ int ac_drm_userq_wait(ac_drm_device *dev, struct drm_amdgpu_userq_wait *wait_dat
 {
    return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_USERQ_WAIT, wait_data,
                                sizeof(struct drm_amdgpu_userq_wait));
+}
+
+int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
+{
+   if (dev->is_virtio && dev->fd < 0) {
+      info->pci.domain = 0;
+      info->pci.bus = 0;
+      info->pci.dev = 0;
+      info->pci.func = 0;
+   } else {
+      drmDevicePtr devinfo;
+
+      /* Get PCI info. */
+      int r = drmGetDevice2(dev->fd, 0, &devinfo);
+      if (r) {
+         fprintf(stderr, "amdgpu: drmGetDevice2 failed.\n");
+         return -1;
+      }
+      info->pci.domain = devinfo->businfo.pci->domain;
+      info->pci.bus = devinfo->businfo.pci->bus;
+      info->pci.dev = devinfo->businfo.pci->dev;
+      info->pci.func = devinfo->businfo.pci->func;
+
+      drmFreeDevice(&devinfo);
+   }
+   info->pci.valid = true;
+
+   return 0;
+}
+
+void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info)
+{
+#ifdef HAVE_AMDGPU_VIRTIO
+   if (dev->is_virtio) {
+      info->has_vm_always_valid = amdvgpu_has_vm_always_valid(dev->vdev);
+      return;
+   }
+#endif
+   info->has_vm_always_valid = true;
 }

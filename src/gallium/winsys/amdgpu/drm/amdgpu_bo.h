@@ -88,7 +88,11 @@ struct amdgpu_bo_real {
    struct amdgpu_winsys_bo b;
 
    ac_drm_bo bo;
-   amdgpu_va_handle va_handle;
+   union {
+      uint64_t svm; /* used when RADEON_FLAG_NO_VMA is set */
+      amdgpu_va_handle handle;
+   } va;
+
    /* Timeline point of latest VM ioctl completion. Only used in userqueue. */
    uint64_t vm_timeline_point;
 
@@ -202,6 +206,14 @@ static inline struct amdgpu_bo_real_reusable_slab *get_real_bo_reusable_slab(str
    return (struct amdgpu_bo_real_reusable_slab*)bo;
 }
 
+static inline uint64_t amdgpu_bo_real_vm_address(struct amdgpu_bo_real *bo)
+{
+   if (bo->b.base.usage & RADEON_FLAG_NO_VMA)
+      return bo->va.svm;
+   else
+      return amdgpu_va_get_start_addr(bo->va.handle);
+}
+
 /* Given a sequence number "fences->seq_no[queue_index]", return a pointer to a non-NULL fence
  * pointer in the queue ring corresponding to that sequence number if the fence is non-NULL.
  * If the fence is not present in the ring (= is idle), return NULL. If it returns a non-NULL
@@ -210,7 +222,7 @@ static inline struct amdgpu_bo_real_reusable_slab *get_real_bo_reusable_slab(str
  */
 static inline struct pipe_fence_handle **
 get_fence_from_ring(struct amdgpu_winsys *aws, struct amdgpu_seq_no_fences *fences,
-                    unsigned queue_index)
+                    enum amdgpu_queue_index queue_index)
 {
    /* The caller should check if the BO has a fence. */
    assert(queue_index < AMDGPU_MAX_QUEUES);
@@ -235,7 +247,8 @@ get_fence_from_ring(struct amdgpu_winsys *aws, struct amdgpu_seq_no_fences *fenc
    return NULL;
 }
 
-static inline uint_seq_no pick_latest_seq_no(struct amdgpu_winsys *aws, unsigned queue_index,
+static inline uint_seq_no pick_latest_seq_no(struct amdgpu_winsys *aws,
+                                             enum amdgpu_queue_index queue_index,
                                              uint_seq_no n1, uint_seq_no n2)
 {
    uint_seq_no latest = aws->queues[queue_index].latest_seq_no;
@@ -251,7 +264,7 @@ static inline uint_seq_no pick_latest_seq_no(struct amdgpu_winsys *aws, unsigned
 }
 
 static inline void add_seq_no_to_list(struct amdgpu_winsys *aws, struct amdgpu_seq_no_fences *fences,
-                                      unsigned queue_index, uint_seq_no seq_no)
+                                      enum amdgpu_queue_index queue_index, uint_seq_no seq_no)
 {
    if (fences->valid_fence_mask & BITFIELD_BIT(queue_index)) {
       fences->seq_no[queue_index] = pick_latest_seq_no(aws, queue_index, seq_no,

@@ -8,7 +8,7 @@ use crate::tiling::Tiling;
 use crate::Minify;
 
 use nil_rs_bindings::*;
-use nvidia_headers::classes::{cl9097, clc597};
+use nvidia_headers::classes::{cl9097, cla097, clb197, clc597, clcd97};
 
 use std::panic;
 
@@ -19,6 +19,7 @@ pub const IMAGE_USAGE_2D_VIEW_BIT: ImageUsageFlags = 1 << 0;
 pub const IMAGE_USAGE_LINEAR_BIT: ImageUsageFlags = 1 << 1;
 pub const IMAGE_USAGE_SPARSE_RESIDENCY_BIT: ImageUsageFlags = 1 << 2;
 pub const IMAGE_USAGE_VIDEO_BIT: ImageUsageFlags = 1 << 3;
+pub const IMAGE_USAGE_UNCOMPRESSED_BIT: ImageUsageFlags = 1 << 4;
 
 #[derive(Clone, Debug, Copy, PartialEq, Default)]
 #[repr(u8)]
@@ -181,9 +182,9 @@ pub struct Image {
     pub array_stride_B: u64,
     pub align_B: u32,
     pub size_B: u64,
-    pub compressed: bool,
     pub tile_mode: u16,
     pub pte_kind: u8,
+    pub compressed_pte_kind: u8,
 }
 
 impl Image {
@@ -225,7 +226,7 @@ impl Image {
     }
 
     fn new_linear(
-        _dev: &nil_rs_bindings::nv_device_info,
+        dev: &nil_rs_bindings::nv_device_info,
         info: &ImageInitInfo,
     ) -> Self {
         // Linear images need to be 2D
@@ -238,7 +239,7 @@ impl Image {
         assert!(info.samples == 1);
         let sample_layout = SampleLayout::_1x1;
 
-        let align_B = if info.explicit_row_stride_B > 0 {
+        let mut align_B = if info.explicit_row_stride_B > 0 {
             // If we're importing an image, allow smaller stride and offset
             // alignments.  The texture headers can handle as low as 32B-aligned
             // and NVK has workarounds for rendering if needed.
@@ -251,12 +252,19 @@ impl Image {
             128
         };
 
+        // Kepler image storage needs 256B-aligned addresses.
+        if dev.cls_eng3d >= cla097::KEPLER_A
+            && dev.cls_eng3d < clb197::MAXWELL_B
+        {
+            align_B = align_B.max(256);
+        }
+
         let extent_B = info.extent_px.to_B(info.format, sample_layout);
         let row_stride_B = if info.explicit_row_stride_B > 0 {
             debug_assert!(info.explicit_row_stride_B % align_B == 0);
             info.explicit_row_stride_B
         } else {
-            extent_B.width.next_multiple_of(128)
+            extent_B.width.next_multiple_of(align_B)
         };
         let level0 = ImageLevel {
             offset_B: 0,
@@ -275,9 +283,9 @@ impl Image {
             array_stride_B: 0,
             align_B,
             size_B,
-            compressed: false,
             tile_mode: 0,
             pte_kind: 0,
+            compressed_pte_kind: 0,
             mip_tail_first_lod: 0,
         };
         image.levels[0] = level0;
@@ -310,10 +318,11 @@ impl Image {
                 .clamp(info.extent_px.to_B(info.format, sample_layout))
         } else if (info.usage & IMAGE_USAGE_SPARSE_RESIDENCY_BIT) != 0 {
             assert!((info.usage & IMAGE_USAGE_VIDEO_BIT) == 0);
-            Tiling::sparse(info.format, info.dim)
+            Tiling::sparse(dev, info.format, info.dim)
         } else if (info.usage & IMAGE_USAGE_VIDEO_BIT) != 0 {
             assert!((info.usage & IMAGE_USAGE_SPARSE_RESIDENCY_BIT) == 0);
             let mut min_tiling = Tiling::choose(
+                dev,
                 info.extent_px,
                 info.format,
                 sample_layout,
@@ -322,6 +331,7 @@ impl Image {
             );
             for p in 0..infos.len() {
                 let plane_tiling = Tiling::choose(
+                    dev,
                     infos[p].extent_px,
                     infos[p].format,
                     sample_layout,
@@ -338,6 +348,7 @@ impl Image {
             min_tiling
         } else {
             Tiling::choose(
+                dev,
                 info.extent_px,
                 info.format,
                 sample_layout,
@@ -356,9 +367,9 @@ impl Image {
             array_stride_B: 0,
             align_B: 0,
             size_B: 0,
-            compressed: false,
             tile_mode: 0,
             pte_kind: 0,
+            compressed_pte_kind: 0,
             mip_tail_first_lod: 0,
         };
 
@@ -422,12 +433,12 @@ impl Image {
             image.align_B = std::cmp::max(image.align_B, 1 << 16);
         }
 
-        image.pte_kind = Self::choose_pte_kind(
-            dev,
-            info.format,
-            info.samples,
-            image.compressed,
-        );
+        image.pte_kind =
+            Self::choose_pte_kind(dev, info.format, info.samples, false);
+        if (info.usage & IMAGE_USAGE_UNCOMPRESSED_BIT) == 0 {
+            image.compressed_pte_kind =
+                Self::choose_pte_kind(dev, info.format, info.samples, true);
+        }
 
         if info.modifier != DRM_FORMAT_MOD_INVALID {
             let bl_mod = BlockLinearModifier::try_from(info.modifier).unwrap();
@@ -438,10 +449,6 @@ impl Image {
             | (u16::from(image.levels[0].tiling.z_log2) << 8);
 
         image.align_B = std::cmp::max(image.align_B, 4096);
-        if image.pte_kind >= 0xb && image.pte_kind <= 0xe {
-            image.align_B = std::cmp::max(image.align_B, 1 << 16);
-        }
-
         image.size_B = image.size_B.next_multiple_of(image.align_B.into());
 
         image
@@ -732,13 +739,26 @@ impl Image {
         samples: u32,
         compressed: bool,
     ) -> u8 {
-        if dev.cls_eng3d >= clc597::TURING_A {
+        if dev.cls_eng3d >= clcd97::BLACKWELL_A {
+            Self::gb202_choose_pte_kind(format, compressed)
+        } else if dev.cls_eng3d >= clc597::TURING_A {
             Self::tu102_choose_pte_kind(format, compressed)
         } else if dev.cls_eng3d >= cl9097::FERMI_A {
             Self::nvc0_choose_pte_kind(format, samples, compressed)
         } else {
             panic!("Unsupported 3d engine class")
         }
+    }
+
+    fn gb202_choose_pte_kind(_format: Format, compressed: bool) -> u8 {
+        use nvidia_headers::hwref::tu102::mmu::*;
+        if compressed {
+            NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC
+        } else {
+            NV_MMU_PTE_KIND_GENERIC_MEMORY
+        }
+        .try_into()
+        .unwrap()
     }
 
     fn tu102_choose_pte_kind(format: Format, compressed: bool) -> u8 {
@@ -776,7 +796,13 @@ impl Image {
                     NV_MMU_PTE_KIND_ZF32_X24S8
                 }
             }
-            PIPE_FORMAT_Z32_FLOAT => NV_MMU_PTE_KIND_GENERIC_MEMORY,
+            PIPE_FORMAT_Z32_FLOAT => {
+                if compressed {
+                    NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC
+                } else {
+                    NV_MMU_PTE_KIND_GENERIC_MEMORY
+                }
+            }
             PIPE_FORMAT_S8_UINT => {
                 if compressed {
                     NV_MMU_PTE_KIND_S8_COMPRESSIBLE_DISABLE_PLC
@@ -784,7 +810,13 @@ impl Image {
                     NV_MMU_PTE_KIND_S8
                 }
             }
-            _ => NV_MMU_PTE_KIND_GENERIC_MEMORY,
+            _ => {
+                if compressed {
+                    NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC
+                } else {
+                    NV_MMU_PTE_KIND_GENERIC_MEMORY
+                }
+            }
         }
         .try_into()
         .unwrap()
@@ -958,10 +990,39 @@ pub enum ViewType {
     CubeArray,
 }
 
+/// An enum describing how an image view will be accessed by the shader.
+#[derive(Clone, Debug, Copy, PartialEq)]
+#[repr(u8)]
+pub enum ViewAccess {
+    /// This image view will be accessed via texture instructions (tex, etc.)
+    Texture,
+
+    /// This image view will be accessed as a storage image via surface
+    /// instructions (suld/sust)
+    ///
+    /// This primarily affects multisampled images.  With multisampled storage
+    /// image, we generate a descriptor which has the image dimensions in units
+    /// of samples rather than pixels.  The resulting descriptors are safe to
+    /// access via surface instructions (suld/sust) since the surface
+    /// instructions entirely ignore the MULTI_SAMPLE_COUNT field in the image
+    /// descriptor.  They are not, however, safe to access from texture
+    /// instructions as those take the sample count into account and will think
+    /// the image is too big, possibly leading to OOB reads.
+    ///
+    /// In NAK (the compiler component), we have lowering code which takes the
+    /// sample into account and is able compute 2D (x, y) coordidinates in
+    /// sample space which correspond to the logical (x, y, s) coordinate
+    /// provided by the client shader, thus allowing multisampled storage
+    /// access.
+    Storage,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub view_type: ViewType,
+
+    pub access: ViewAccess,
 
     /// The format to use in the view
     ///

@@ -41,7 +41,6 @@
 
 #include "pan_device.h"
 #include "pan_mempool.h"
-#include "pan_texture.h"
 
 #define PAN_QUERY_DRAW_CALLS (PIPE_QUERY_DRIVER_SPECIFIC + 0)
 
@@ -86,7 +85,7 @@ struct panfrost_vtable {
       struct pan_blend_shader_cache *cache, const struct pan_blend_state *,
       nir_alu_type, nir_alu_type, unsigned rt);
 
-   void (*compile_shader)(nir_shader *s, struct panfrost_compile_inputs *inputs,
+   void (*compile_shader)(nir_shader *s, struct pan_compile_inputs *inputs,
                           struct util_dynarray *binary,
                           struct pan_shader_info *info);
 
@@ -111,6 +110,10 @@ struct panfrost_vtable {
 
    /* Run a compute shader to detile an MTK 16L32 image */
    void (*mtk_detile)(struct panfrost_context *ctx, struct pipe_blit_info *info);
+
+   /* construct a render target blend descriptor */
+   uint64_t (*get_conv_desc)(enum pipe_format fmt, unsigned rt,
+                             unsigned force_size, bool dithered);
 };
 
 struct panfrost_screen {
@@ -124,8 +127,22 @@ struct panfrost_screen {
    char renderer_string[100];
    struct panfrost_vtable vtbl;
    struct disk_cache *disk_cache;
-   unsigned max_afbc_packing_ratio;
+
+   /* Use AFBC tiled layout whenever possible */
+   bool afbc_tiled;
+
+   /* Pack AFBC textures progressively in the background */
    bool force_afbc_packing;
+
+   /* Discard packing if the packed size percentage reaches this value */
+   unsigned max_afbc_packing_ratio;
+
+   /* Consecutive reads threshold after which an AFBC texture is packed */
+   uint32_t afbcp_reads_threshold;
+
+   /* Compute AFBC-P payload sizes on GPU */
+   bool afbcp_gpu_payload_sizes;
+
    int force_afrc_rate;
    uint64_t compute_core_mask;
    uint64_t fragment_core_mask;
@@ -166,6 +183,13 @@ void panfrost_cmdstream_screen_init_v13(struct panfrost_screen *screen);
       if (unlikely(pan_device((ctx)->base.screen)->debug & PAN_DBG_PERF))      \
          mesa_logw(__VA_ARGS__);                                               \
       util_debug_message(&ctx->base.debug, PERF_INFO, __VA_ARGS__);            \
+   } while (0)
+
+#define afbcp_debug(ctx, ...)                                                  \
+   do {                                                                        \
+      if (unlikely(pan_device((ctx)->base.screen)->debug & PAN_DBG_FORCE_PACK)) \
+         mesa_logw(__VA_ARGS__);                                               \
+      util_debug_message(&ctx->base.debug, INFO, __VA_ARGS__);                 \
    } while (0)
 
 #endif /* PAN_SCREEN_H */

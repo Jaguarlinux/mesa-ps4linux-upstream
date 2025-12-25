@@ -67,7 +67,7 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
       *offset = 8;
       return PAN_SYSVAL(SSBO, nir_src_as_uint(intr->src[0]));
 
-   case nir_intrinsic_load_sampler_lod_parameters_pan:
+   case nir_intrinsic_load_sampler_lod_parameters:
       /* This is only used for a workaround on Mali-T720, where we don't
        * support dynamic samplers.
        */
@@ -246,7 +246,7 @@ panfrost_nir_lower_sysvals(nir_shader *shader, unsigned arch,
    do {
       progress = false;
 
-      NIR_PASS(progress, shader, nir_copy_prop);
+      NIR_PASS(progress, shader, nir_opt_copy_prop);
       NIR_PASS(progress, shader, nir_opt_constant_folding);
       NIR_PASS(progress, shader, nir_opt_dce);
    } while (progress);

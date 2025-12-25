@@ -33,9 +33,6 @@
 
 #ifdef HAVE_X11_PLATFORM
 #include <X11/Xlib-xcb.h>
-#ifdef HAVE_X11_DRI2
-#include <xcb/dri2.h>
-#endif
 #include <xcb/randr.h>
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
@@ -47,6 +44,8 @@
 #endif
 
 #ifdef HAVE_WAYLAND_PLATFORM
+#include "loader_wayland_helper.h"
+
 /* forward declarations to avoid pulling wayland headers everywhere */
 struct wl_egl_window;
 struct wl_event_queue;
@@ -216,8 +215,6 @@ struct dri2_egl_display {
 
    mtx_t lock;
 
-   int dri2_major;
-   int dri2_minor;
    struct dri_screen *dri_screen_render_gpu;
    /* dri_screen_display_gpu holds display GPU in case of prime gpu offloading
     * else dri_screen_render_gpu and dri_screen_display_gpu is same. In case of
@@ -243,7 +240,6 @@ struct dri2_egl_display {
    bool has_compression_modifiers;
    bool own_device;
    bool kopper;
-   bool kopper_without_modifiers;
    bool swrast;
    bool swrast_not_kms;
    int min_swap_interval;
@@ -274,19 +270,23 @@ struct dri2_egl_display {
    struct wl_display *wl_dpy;
    struct wl_display *wl_dpy_wrapper;
    struct wl_registry *wl_registry;
+#ifdef HAVE_BIND_WL_DISPLAY
    struct wl_drm *wl_server_drm;
    struct wl_drm *wl_drm;
    uint32_t wl_drm_version, wl_drm_name;
+   bool authenticated;
+   uint32_t capabilities;
+#endif
    struct wl_shm *wl_shm;
    struct wl_event_queue *wl_queue;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
+   struct wp_presentation *wp_presentation;
    struct dri2_wl_formats formats;
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct dmabuf_feedback_format_table format_table;
-   bool authenticated;
-   uint32_t capabilities;
    char *device_name;
    bool is_render_node;
+   clockid_t presentation_clock_id;
 #endif
 
 #ifdef HAVE_ANDROID_PLATFORM
@@ -323,12 +323,13 @@ struct dri2_egl_surface {
    int dx;
    int dy;
    struct wl_event_queue *wl_queue;
-   struct wl_surface *wl_surface_wrapper;
+   struct loader_wayland_surface wayland_surface;
    struct wl_display *wl_dpy_wrapper;
    struct wl_drm *wl_drm_wrapper;
    struct wl_callback *throttle_callback;
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct dmabuf_feedback dmabuf_feedback, pending_dmabuf_feedback;
+   struct loader_wayland_presentation wayland_presentation;
    bool compositor_using_another_device;
    int format;
    bool resized;
@@ -337,12 +338,13 @@ struct dri2_egl_surface {
 
 #ifdef HAVE_DRM_PLATFORM
    struct gbm_dri_surface *gbm_surf;
+   unsigned excess_bo_frames;
 #endif
 
 #if defined(HAVE_WAYLAND_PLATFORM) || defined(HAVE_DRM_PLATFORM)
-   struct {
+   struct dri2_egl_buffer {
 #ifdef HAVE_WAYLAND_PLATFORM
-      struct wl_buffer *wl_buffer;
+      struct loader_wayland_buffer wayland_buffer;
       bool wl_release;
       struct dri_image *dri_image;
       /* for is_different_gpu case. NULL else */
@@ -435,11 +437,11 @@ dri2_egl_error_unlock(struct dri2_egl_display *dri2_dpy, EGLint err,
 }
 
 extern const __DRIimageLookupExtension image_lookup_extension;
-extern const __DRIbackgroundCallableExtension background_callable_extension;
 extern const __DRIswrastLoaderExtension swrast_pbuffer_loader_extension;
+extern const __DRIkopperLoaderExtension kopper_pbuffer_loader_extension;
 
 void
-dri2_detect_swrast(_EGLDisplay *disp);
+dri2_detect_swrast_kopper(_EGLDisplay *disp);
 
 /* Helper for platforms not using dri2_create_screen */
 void
@@ -497,21 +499,14 @@ dri2_create_image_from_dri(_EGLDisplay *disp, struct dri_image *dri_image);
 
 #ifdef HAVE_X11_PLATFORM
 EGLBoolean
-dri2_initialize_x11_dri2(_EGLDisplay *disp);
-EGLBoolean
-dri2_initialize_x11(_EGLDisplay *disp, bool *allow_dri2);
+dri2_initialize_x11(_EGLDisplay *disp);
 void
 dri2_teardown_x11(struct dri2_egl_display *dri2_dpy);
 unsigned int
 dri2_x11_get_red_mask_for_depth(struct dri2_egl_display *dri2_dpy, int depth);
 #else
 static inline EGLBoolean
-dri2_initialize_x11_dri2(_EGLDisplay *disp)
-{
-   return _eglError(EGL_NOT_INITIALIZED, "X11 platform not built");
-}
-static inline EGLBoolean
-dri2_initialize_x11(_EGLDisplay *disp, bool *allow_dri2)
+dri2_initialize_x11(_EGLDisplay *disp)
 {
    return _eglError(EGL_NOT_INITIALIZED, "X11 platform not built");
 }
@@ -597,15 +592,11 @@ dri2_get_dri_config(struct dri2_egl_config *conf, EGLint surface_type,
 static inline void
 dri2_set_WL_bind_wayland_display(_EGLDisplay *disp)
 {
-#ifdef HAVE_WAYLAND_PLATFORM
+#ifdef HAVE_BIND_WL_DISPLAY
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
 
-   int capabilities;
-
-   capabilities =
-      dri2_get_capabilities(dri2_dpy->dri_screen_render_gpu);
    disp->Extensions.WL_bind_wayland_display =
-      (capabilities & __DRI_IMAGE_CAP_GLOBAL_NAMES) != 0;
+      dri2_dpy->has_dmabuf_import && dri2_dpy->has_dmabuf_export;
 #endif
 }
 

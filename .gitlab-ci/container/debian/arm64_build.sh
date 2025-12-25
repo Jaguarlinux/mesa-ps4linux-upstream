@@ -35,7 +35,9 @@ DEPS=(
     cmake
     curl
     "clang-${LLVM_VERSION}"
+    dpkg-dev
     fastboot
+    file
     flatbuffers-compiler
     flex
     g++
@@ -71,7 +73,6 @@ DEPS=(
     libwayland-egl-backend-dev
     "llvm-${LLVM_VERSION}-dev"
     ninja-build
-    meson
     openssh-server
     pkgconf
     python3-mako
@@ -98,7 +99,10 @@ pip3 install --break-system-packages "ci-fairy[s3] @ git+https://gitlab.freedesk
 
 pip3 install --break-system-packages -r bin/ci/test/requirements.txt
 
+. .gitlab-ci/container/install-meson.sh
+
 arch=armhf
+
 . .gitlab-ci/container/cross_build.sh
 
 . .gitlab-ci/container/container_pre_build.sh
@@ -111,9 +115,7 @@ arch=armhf
 
 . .gitlab-ci/container/build-libclc.sh
 
-. .gitlab-ci/container/install-meson.sh
-
-. .gitlab-ci/container/build-rust.sh
+. .gitlab-ci/container/build-rust.sh build
 
 . .gitlab-ci/container/build-bindgen.sh
 

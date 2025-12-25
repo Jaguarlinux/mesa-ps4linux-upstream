@@ -135,6 +135,8 @@ Enum("intel_platform",
       "INTEL_PLATFORM_LNL",
       "INTEL_PLATFORM_BMG",
       "INTEL_PLATFORM_PTL",
+      "INTEL_PLATFORM_WCL",
+      "INTEL_PLATFORM_NVL_U",
       ])
 
 Struct("intel_memory_class_instance",
@@ -282,13 +284,11 @@ Struct("intel_device_info",
         Member("bool", "has_64bit_float_via_math_pipe", compiler_field=True),
         Member("bool", "has_64bit_int", compiler_field=True),
         Member("bool", "has_bfloat16", compiler_field=True),
+        Member("bool", "has_fp8", compiler_field=True),
         Member("bool", "has_integer_dword_mul", compiler_field=True),
         Member("bool", "has_systolic", compiler_field=True),
         Member("bool", "supports_simd16_3src", compiler_field=True),
         Member("bool", "disable_ccs_repack"),
-
-        Member("bool", "has_illegal_ccs_values",
-               comment="True if CCS needs to be initialized before use."),
 
         Member("bool", "has_flat_ccs",
                comment=dedent("""\
@@ -309,6 +309,7 @@ Struct("intel_device_info",
         Member("bool", "has_context_isolation"),
         Member("bool", "has_set_pat_uapi"),
         Member("bool", "has_indirect_unroll"),
+        Member("bool", "supports_low_latency_hint"),
 
         Member("bool", "has_coarse_pixel_primitive_and_cb", compiler_field=True,
                comment=dedent("""\
@@ -444,6 +445,10 @@ Struct("intel_device_info",
 
                Thread count * number of EUs per subslice""")),
 
+        Member("unsigned", "num_geom_pipes", comment="Number of geometry pipes"),
+        Member("unsigned", "num_depth_pipes", comment="Number of depth pipes"),
+        Member("unsigned", "num_color_pipes", comment="Number of color pipes"),
+
         Member("unsigned", "max_cs_workgroup_threads", compiler_field=True,
                comment=dedent("""\
                Maximum number of threads per workgroup supported by the GPGPU_WALKER or
@@ -479,5 +484,5 @@ Struct("intel_device_info",
         Member("intel_device_info_mem_desc", "mem"),
         Member("intel_device_info_pat_desc", "pat"),
         Member("intel_cooperative_matrix_configuration",
-               "cooperative_matrix_configurations", array=4)]
+               "cooperative_matrix_configurations", array=16)]
        )

@@ -158,12 +158,11 @@ struct wsi_wayland {
 
 struct wsi_wl_image {
    struct wsi_image base;
-   struct wl_buffer *buffer;
+   struct loader_wayland_buffer wayland_buffer;
    bool busy;
    int shm_fd;
    void *shm_ptr;
    unsigned shm_size;
-   uint64_t flow_id;
 
    struct wp_linux_drm_syncobj_timeline_v1 *wl_syncobj_timeline[WSI_ES_COUNT];
 };
@@ -180,15 +179,8 @@ struct wsi_wl_surface {
    unsigned int chain_count;
 
    struct wsi_wl_swapchain *chain;
-   struct wl_surface *surface;
+   struct loader_wayland_surface wayland_surface;
    struct wsi_wl_display *display;
-
-   /* This has no functional use, and is here only for perfetto */
-   struct {
-      char *latency_str;
-      uint64_t presenting;
-      uint64_t presentation_track_id;
-   } analytics;
 
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct dmabuf_feedback dmabuf_feedback, pending_dmabuf_feedback;
@@ -237,11 +229,12 @@ struct wsi_wl_swapchain {
       uint64_t max_forward_progress_present_id;
       uint64_t max_present_id;
       uint64_t prev_max_present_id;
+      uint64_t outstanding_count;
 
-      struct wl_list outstanding_list;
+      struct wl_list fallback_frame_list;
       struct u_cnd_monotonic list_advanced;
       struct wl_event_queue *queue;
-      struct wp_presentation *wp_presentation;
+      struct loader_wayland_presentation wayland_presentation;
       /* Fallback when wp_presentation is not supported */
       struct wl_surface *surface;
       bool dispatch_in_progress;
@@ -252,6 +245,7 @@ struct wsi_wl_swapchain {
       uint64_t displayed_time;
       bool valid_refresh_nsec;
       unsigned int refresh_nsec;
+      bool frame_fallback;
    } present_ids;
 
    struct {
@@ -287,17 +281,6 @@ find_format(struct u_vector *formats, VkFormat format)
          return f;
 
    return NULL;
-}
-
-static char *
-stringify_wayland_id(uint32_t id)
-{
-   char *out;
-
-   if (asprintf(&out, "wl%d", id) < 0)
-      return NULL;
-
-   return out;
 }
 
 /* Given a time base and a refresh period, find the next
@@ -423,32 +406,44 @@ wsi_wl_display_add_drm_format_modifier(struct wsi_wl_display *display,
                                        struct u_vector *formats,
                                        uint32_t drm_format, uint64_t modifier)
 {
-   switch (drm_format) {
-#if 0
-   /* TODO: These are only available when VK_EXT_4444_formats is enabled, so
-    * we probably need to make their use conditional on this extension. */
-   case DRM_FORMAT_ARGB4444:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_A4R4G4B4_UNORM_PACK16,
-                                            WSI_WL_FMT_ALPHA, modifier);
-      break;
-   case DRM_FORMAT_XRGB4444:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_A4R4G4B4_UNORM_PACK16,
-                                            WSI_WL_FMT_OPAQUE, modifier);
-      break;
-   case DRM_FORMAT_ABGR4444:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_A4B4G4R4_UNORM_PACK16,
-                                            WSI_WL_FMT_ALPHA, modifier);
-      break;
-   case DRM_FORMAT_XBGR4444:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_A4B4G4R4_UNORM_PACK16,
-                                            WSI_WL_FMT_OPAQUE, modifier);
-      break;
-#endif
+   VK_FROM_HANDLE(vk_physical_device, pdevice, display->wsi_wl->physical_device);
+   /* From Vulkan 1.3 onwards, we can always try adding the 4444 formats.
+    * If the format isn't supported or isn't renderable,
+    * wsi_wl_display_add_vk_format() will reject it via
+    * vkGetPhysicalDeviceFormatProperties().
+    */
+   if (pdevice->supported_features.formatA4R4G4B4 ||
+       pdevice->properties.apiVersion >= VK_MAKE_VERSION(1, 3, 0)) {
+      switch (drm_format) {
+      case DRM_FORMAT_ARGB4444:
+         wsi_wl_display_add_vk_format_modifier(display, formats,
+                                               VK_FORMAT_A4R4G4B4_UNORM_PACK16,
+                                               WSI_WL_FMT_ALPHA, modifier);
+         break;
+      case DRM_FORMAT_XRGB4444:
+         wsi_wl_display_add_vk_format_modifier(display, formats,
+                                               VK_FORMAT_A4R4G4B4_UNORM_PACK16,
+                                               WSI_WL_FMT_OPAQUE, modifier);
+         break;
+      }
+   }
+   if (pdevice->supported_features.formatA4B4G4R4 ||
+       pdevice->properties.apiVersion >= VK_MAKE_VERSION(1, 3, 0)) {
+      switch (drm_format) {
+      case DRM_FORMAT_ABGR4444:
+         wsi_wl_display_add_vk_format_modifier(display, formats,
+                                               VK_FORMAT_A4B4G4R4_UNORM_PACK16,
+                                               WSI_WL_FMT_ALPHA, modifier);
+         break;
+      case DRM_FORMAT_XBGR4444:
+         wsi_wl_display_add_vk_format_modifier(display, formats,
+                                               VK_FORMAT_A4B4G4R4_UNORM_PACK16,
+                                               WSI_WL_FMT_OPAQUE, modifier);
+         break;
+      }
+   }
 
+   switch (drm_format) {
    /* Vulkan _PACKN formats have the same component order as DRM formats
     * on little endian systems, on big endian there exists no analog. */
 #if UTIL_ARCH_LITTLE_ENDIAN
@@ -651,12 +646,10 @@ static uint32_t
 wl_drm_format_for_vk_format(VkFormat vk_format, bool alpha)
 {
    switch (vk_format) {
-#if 0
    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
       return alpha ? DRM_FORMAT_ARGB4444 : DRM_FORMAT_XRGB4444;
    case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
       return alpha ? DRM_FORMAT_ABGR4444 : DRM_FORMAT_XBGR4444;
-#endif
 #if UTIL_ARCH_LITTLE_ENDIAN
    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
       return alpha ? DRM_FORMAT_RGBA4444 : DRM_FORMAT_RGBX4444;
@@ -807,7 +800,7 @@ dmabuf_feedback_init(struct dmabuf_feedback *dmabuf_feedback)
    if (dmabuf_feedback_tranche_init(&dmabuf_feedback->pending_tranche) < 0)
       return -1;
 
-   util_dynarray_init(&dmabuf_feedback->tranches, NULL);
+   dmabuf_feedback->tranches = UTIL_DYNARRAY_INIT;
 
    dmabuf_feedback_format_table_init(&dmabuf_feedback->format_table);
 
@@ -932,6 +925,7 @@ struct Colorspace {
    enum wp_color_manager_v1_primaries primaries;
    enum wp_color_manager_v1_transfer_function tf;
    bool should_use_hdr_metadata;
+   bool needs_extended_range;
 };
 struct Colorspace colorspace_mapping[] = {
    {
@@ -939,48 +933,56 @@ struct Colorspace colorspace_mapping[] = {
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_DISPLAY_P3,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
       .should_use_hdr_metadata = true,
+      .needs_extended_range = true,
    },
    {
       .colorspace = VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_DISPLAY_P3,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_BT709_LINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_BT709_NONLINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_BT1886,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_BT2020_LINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_HDR10_ST2084_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ,
       .should_use_hdr_metadata = true,
+      .needs_extended_range = false,
    },
    /* VK_COLOR_SPACE_DOLBYVISION_EXT is left out because it's deprecated */
    {
@@ -988,22 +990,21 @@ struct Colorspace colorspace_mapping[] = {
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG,
       .should_use_hdr_metadata = true,
+      .needs_extended_range = false,
    },
    {
       .colorspace = VK_COLOR_SPACE_ADOBERGB_LINEAR_EXT,
       .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_ADOBE_RGB,
       .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
       .should_use_hdr_metadata = false,
+      .needs_extended_range = false,
    },
    /* VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT is left out because there's no
     * exactly matching transfer function in the Wayland protocol */
    /* VK_COLOR_SPACE_PASS_THROUGH_EXT is handled elsewhere */
-   {
-      .colorspace = VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT,
-      .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
-      .tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_SRGB,
-      .should_use_hdr_metadata = true,
-   },
+   /* VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT is intentionally not added
+    * as it's a bit unclear how exactly it should be used
+    * and whether or not the transfer function should be gamma 2.2 or piece-wise */
    /* VK_COLOR_SPACE_DISPLAY_NATIVE_AMD isn't supported */
    /* VK_COLORSPACE_SRGB_NONLINEAR_KHR is just an alias */
    /* VK_COLOR_SPACE_DCI_P3_LINEAR_EXT is just an alias */
@@ -1039,6 +1040,9 @@ wsi_wl_display_determine_colorspaces(struct wsi_wl_display *display)
       if (!vector_contains(primaries, colorspace_mapping[i].primaries))
          continue;
       if (!vector_contains(tfs, colorspace_mapping[i].tf))
+         continue;
+      if (!display->color_features.extended_target_volume &&
+          colorspace_mapping[i].needs_extended_range)
          continue;
       VkColorSpaceKHR *new_cs = u_vector_add(&display->colorspaces);
       if (!new_cs)
@@ -1158,7 +1162,8 @@ wsi_wl_surface_add_color_refcount(struct wsi_wl_surface *wsi_surface)
    wsi_surface->color.color_surface_refcount++;
    if (wsi_surface->color.color_surface_refcount == 1) {
       wsi_surface->color.color_surface =
-         wp_color_manager_v1_get_surface(wsi_surface->display->color_manager, wsi_surface->surface);
+         wp_color_manager_v1_get_surface(wsi_surface->display->color_manager,
+					 wsi_surface->wayland_surface.wrapper);
    }
 }
 
@@ -1187,18 +1192,26 @@ is_hdr_metadata_legal(struct wayland_hdr_metadata *l)
    if (l->max_cll != 0) {
       if (l->max_cll * MIN_LUM_FACTOR < l->min_luminance)
          return false;
-      if (l->max_cll > l->max_luminance)
+      if (l->max_luminance != 0 && l->max_cll > l->max_luminance)
          return false;
    }
    if (l->max_fall != 0) {
       if (l->max_fall * MIN_LUM_FACTOR < l->min_luminance)
          return false;
-      if (l->max_fall > l->max_luminance)
+      if (l->max_luminance != 0 && l->max_fall > l->max_luminance)
          return false;
       if (l->max_cll != 0 && l->max_fall > l->max_cll) {
          return false;
       }
    }
+
+   /* Be lenient here for a zero (=undefined) max_luminance and handle
+    * this in the calling code instead, by not sending min/max mastering
+    * luminance data to Wayland, thereby avoiding protocol errors.
+    */
+   if (l->max_luminance == 0)
+      return true;
+
    return l->max_luminance * MIN_LUM_FACTOR > l->min_luminance;
 }
 
@@ -1316,9 +1329,15 @@ wsi_wl_swapchain_update_colorspace(struct wsi_wl_swapchain *chain)
                                                                                 green_x, green_y,
                                                                                 blue_x, blue_y,
                                                                                 white_x, white_y);
-         wp_image_description_creator_params_v1_set_mastering_luminance(creator,
-                                                                        wayland_hdr_metadata.min_luminance,
-                                                                        wayland_hdr_metadata.max_luminance);
+
+         /* A max_luminance of 0 is legal by spec and means "undefined", but would cause a
+          * Wayland protocol error, so skip setting mastering luminance for zero value.
+          */
+         if (wayland_hdr_metadata.max_luminance != 0) {
+            wp_image_description_creator_params_v1_set_mastering_luminance(creator,
+                                                                           wayland_hdr_metadata.min_luminance,
+                                                                           wayland_hdr_metadata.max_luminance);
+         }
       }
    }
 
@@ -1685,7 +1704,7 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
 
 static uint32_t
 wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
-                                   const VkSurfacePresentModeEXT *present_mode)
+                                   const VkSurfacePresentModeKHR *present_mode)
 {
    if (present_mode) {
       return present_mode->presentMode == VK_PRESENT_MODE_MAILBOX_KHR ?
@@ -1718,7 +1737,7 @@ wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
 static VkResult
 wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
                                 struct wsi_device *wsi_device,
-                                const VkSurfacePresentModeEXT *present_mode,
+                                const VkSurfacePresentModeKHR *present_mode,
                                 VkSurfaceCapabilitiesKHR* caps)
 {
    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
@@ -1768,6 +1787,27 @@ wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
 }
 
 static VkResult
+wsi_wl_surface_check_presentation(VkIcdSurfaceBase *icd_surface,
+                                  struct wsi_device *wsi_device,
+                                  bool *has_wp_presentation)
+{
+   VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
+   struct wsi_wayland *wsi =
+      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
+   struct wsi_wl_display display;
+
+   if (wsi_wl_display_init(wsi, &display, surface->display, true,
+                           wsi_device->sw, "mesa check wp_presentation"))
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   *has_wp_presentation = !!display.wp_presentation_notwrapped;
+
+   wsi_wl_display_finish(&display);
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
                                  struct wsi_device *wsi_device,
                                  const void *info_next,
@@ -1775,7 +1815,9 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
 {
    assert(caps->sType == VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR);
 
-   const VkSurfacePresentModeEXT *present_mode = vk_find_struct_const(info_next, SURFACE_PRESENT_MODE_EXT);
+   struct wsi_wl_surface *wsi_wl_surface =
+      wl_container_of((VkIcdSurfaceWayland *)surface, wsi_wl_surface, base);
+   const VkSurfacePresentModeKHR *present_mode = vk_find_struct_const(info_next, SURFACE_PRESENT_MODE_KHR);
 
    VkResult result =
       wsi_wl_surface_get_capabilities(surface, wsi_device, present_mode,
@@ -1790,9 +1832,9 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
          break;
       }
 
-      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT: {
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
          /* Unsupported. */
-         VkSurfacePresentScalingCapabilitiesEXT *scaling = (void *)ext;
+         VkSurfacePresentScalingCapabilitiesKHR *scaling = (void *)ext;
          scaling->supportedPresentScaling = 0;
          scaling->supportedPresentGravityX = 0;
          scaling->supportedPresentGravityY = 0;
@@ -1801,9 +1843,9 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
          break;
       }
 
-      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT: {
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR: {
          /* Can easily toggle between FIFO and MAILBOX on Wayland. */
-         VkSurfacePresentModeCompatibilityEXT *compat = (void *)ext;
+         VkSurfacePresentModeCompatibilityKHR *compat = (void *)ext;
          if (compat->pPresentModes) {
             assert(present_mode);
             VK_OUTARRAY_MAKE_TYPED(VkPresentModeKHR, modes, compat->pPresentModes, &compat->presentModeCount);
@@ -1827,8 +1869,8 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
             }
          } else {
             if (!present_mode) {
-               wsi_common_vk_warn_once("Use of VkSurfacePresentModeCompatibilityEXT "
-                                       "without a VkSurfacePresentModeEXT set. This is an "
+               wsi_common_vk_warn_once("Use of VkSurfacePresentModeCompatibilityKHR "
+                                       "without a VkSurfacePresentModeKHR set. This is an "
                                        "application bug.\n");
                compat->presentModeCount = 1;
             } else {
@@ -1843,6 +1885,32 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
                }
             }
          }
+         break;
+      }
+
+      case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR: {
+         VkSurfaceCapabilitiesPresentId2KHR *pid2 = (void *)ext;
+         bool has_feedback;
+
+         result = wsi_wl_surface_check_presentation(surface, wsi_device,
+                                                    &has_feedback);
+         if (result != VK_SUCCESS)
+            return result;
+
+         pid2->presentId2Supported = has_feedback;
+         break;
+      }
+
+      case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR: {
+         VkSurfaceCapabilitiesPresentWait2KHR *pwait2 = (void *)ext;
+         bool has_feedback;
+
+         result = wsi_wl_surface_check_presentation(surface, wsi_device,
+                                                    &has_feedback);
+         if (result != VK_SUCCESS)
+            return result;
+
+         pwait2->presentWait2Supported = has_feedback;
          break;
       }
 
@@ -2005,15 +2073,6 @@ wsi_wl_surface_get_present_rectangles(VkIcdSurfaceBase *surface,
    return vk_outarray_status(&out);
 }
 
-static void
-wsi_wl_surface_analytics_fini(struct wsi_wl_surface *wsi_wl_surface,
-                              const VkAllocationCallbacks *parent_pAllocator,
-                              const VkAllocationCallbacks *pAllocator)
-{
-   vk_free2(parent_pAllocator, pAllocator,
-            wsi_wl_surface->analytics.latency_str);
-}
-
 void
 wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
                        const VkAllocationCallbacks *pAllocator)
@@ -2034,13 +2093,10 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    if (wsi_wl_surface->color.color_surface)
       wp_color_management_surface_v1_destroy(wsi_wl_surface->color.color_surface);
 
-   if (wsi_wl_surface->surface)
-      wl_proxy_wrapper_destroy(wsi_wl_surface->surface);
+   loader_wayland_surface_destroy(&wsi_wl_surface->wayland_surface);
 
    if (wsi_wl_surface->display)
       wsi_wl_display_destroy(wsi_wl_surface->display);
-
-   wsi_wl_surface_analytics_fini(wsi_wl_surface, &instance->alloc, pAllocator);
 
    vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
 }
@@ -2153,8 +2209,7 @@ surface_dmabuf_feedback_tranche_done(void *data,
    struct dmabuf_feedback *feedback = &wsi_wl_surface->pending_dmabuf_feedback;
 
    /* Add tranche to array of tranches. */
-   util_dynarray_append(&feedback->tranches, struct dmabuf_feedback_tranche,
-                        feedback->pending_tranche);
+   util_dynarray_append(&feedback->tranches, feedback->pending_tranche);
 
    dmabuf_feedback_tranche_init(&feedback->pending_tranche);
 }
@@ -2234,7 +2289,7 @@ static VkResult wsi_wl_surface_bind_to_dmabuf_feedback(struct wsi_wl_surface *ws
 {
    wsi_wl_surface->wl_dmabuf_feedback =
       zwp_linux_dmabuf_v1_get_surface_feedback(wsi_wl_surface->display->wl_dmabuf,
-                                               wsi_wl_surface->surface);
+                                               wsi_wl_surface->wayland_surface.wrapper);
 
    zwp_linux_dmabuf_feedback_v1_add_listener(wsi_wl_surface->wl_dmabuf_feedback,
                                              &surface_dmabuf_feedback_listener,
@@ -2255,25 +2310,6 @@ fail:
    return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
-static void
-wsi_wl_surface_analytics_init(struct wsi_wl_surface *wsi_wl_surface,
-                              const VkAllocationCallbacks *pAllocator)
-{
-   uint64_t wl_id;
-   char *track_name;
-
-   wl_id = wl_proxy_get_id((struct wl_proxy *) wsi_wl_surface->surface);
-   track_name = vk_asprintf(pAllocator, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
-                            "wl%" PRIu64 " presentation", wl_id);
-   wsi_wl_surface->analytics.presentation_track_id = util_perfetto_new_track(track_name);
-   vk_free(pAllocator, track_name);
-
-   wsi_wl_surface->analytics.latency_str =
-      vk_asprintf(pAllocator,
-                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
-                  "wl%" PRIu64 " latency", wl_id);
-}
-
 static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
                                     struct wsi_device *wsi_device,
                                     const VkAllocationCallbacks *pAllocator)
@@ -2291,13 +2327,12 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
    if (result != VK_SUCCESS)
       goto fail;
 
-   wsi_wl_surface->surface = wl_proxy_create_wrapper(wsi_wl_surface->base.surface);
-   if (!wsi_wl_surface->surface) {
+   if (!loader_wayland_wrap_surface(&wsi_wl_surface->wayland_surface,
+                                    wsi_wl_surface->base.surface,
+                                    wsi_wl_surface->display->queue)) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail;
    }
-   wl_proxy_set_queue((struct wl_proxy *) wsi_wl_surface->surface,
-                      wsi_wl_surface->display->queue);
 
    /* Bind wsi_wl_surface to dma-buf feedback. */
    if (wsi_wl_surface->display->wl_dmabuf &&
@@ -2314,19 +2349,16 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
    if (wsi_wl_use_explicit_sync(wsi_wl_surface->display, wsi_device)) {
       wsi_wl_surface->wl_syncobj_surface =
          wp_linux_drm_syncobj_manager_v1_get_surface(wsi_wl_surface->display->wl_syncobj,
-                                                     wsi_wl_surface->surface);
+                                                     wsi_wl_surface->wayland_surface.wrapper);
 
       if (!wsi_wl_surface->wl_syncobj_surface)
          goto fail;
    }
 
-   wsi_wl_surface_analytics_init(wsi_wl_surface, pAllocator);
-
    return VK_SUCCESS;
 
 fail:
-   if (wsi_wl_surface->surface)
-      wl_proxy_wrapper_destroy(wsi_wl_surface->surface);
+   loader_wayland_surface_destroy(&wsi_wl_surface->wayland_surface);
 
    if (wsi_wl_surface->display)
       wsi_wl_display_destroy(wsi_wl_surface->display);
@@ -2365,7 +2397,6 @@ wsi_CreateWaylandSurfaceKHR(VkInstance _instance,
 }
 
 struct wsi_wl_present_id {
-   struct wp_presentation_feedback *feedback;
    /* Fallback when wp_presentation is not supported.
     * Using frame callback is not the intended way to achieve
     * this, but it is the best effort alternative when the proper interface is
@@ -2373,11 +2404,10 @@ struct wsi_wl_present_id {
     * which uses frame callback to signal DRI3 COMPLETE. */
    struct wl_callback *frame;
    uint64_t present_id;
-   uint64_t flow_id;
+   struct mesa_trace_flow flow;
    uint64_t submission_time;
    const VkAllocationCallbacks *alloc;
    struct wsi_wl_swapchain *chain;
-   int buffer_id;
    uint64_t target_time;
    uint64_t correction;
    struct wl_list link;
@@ -2532,7 +2562,7 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
     * and is likely only going to happen at swapchain destruction or similar. */
 
    uint64_t assumed_success_at = UINT64_MAX;
-   if (!chain->present_ids.wp_presentation) {
+   if (chain->present_ids.frame_fallback) {
       assumed_success_at = os_time_get_absolute_timeout(100 * 1000 * 1000);
    } else {
       err = mtx_lock(&chain->present_ids.lock);
@@ -2544,7 +2574,7 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
        * Add a timeout post GPU rendering completion to unblock any waiter in reasonable time. */
       if (!wsi_wl_swapchain_present_id_completes_in_finite_time_locked(chain, present_id)) {
          /* The queue depth could be larger, so just make a heuristic decision here to bump the timeout. */
-         uint32_t num_pending_cycles = wl_list_length(&chain->present_ids.outstanding_list) + 1;
+         uint32_t num_pending_cycles = chain->present_ids.outstanding_count + 1;
          assumed_success_at = os_time_get_absolute_timeout(100ull * 1000 * 1000 * num_pending_cycles);
       }
       mtx_unlock(&chain->present_ids.lock);
@@ -2569,7 +2599,7 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
 retry:
       ret = dispatch_present_id_queue(wsi_chain, &end_time);
       if (ret == VK_TIMEOUT) {
-         if (timeout_result == VK_SUCCESS && chain->fifo && chain->present_ids.wp_presentation) {
+         if (timeout_result == VK_SUCCESS && chain->fifo && !chain->present_ids.frame_fallback) {
             /* If there have been subsequent commits since when we made the decision to add a timeout,
              * we can drop that timeout condition and rely on forward progress instead. */
             err = mtx_lock(&chain->present_ids.lock);
@@ -2626,14 +2656,57 @@ already_dispatching:
 }
 
 static VkResult
+wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
+                                   uint64_t present_id,
+                                   uint64_t timeout)
+{
+   struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
+   struct timespec end_time;
+   VkResult ret;
+   int err;
+
+   MESA_TRACE_FUNC();
+
+   uint64_t atimeout;
+   if (timeout == 0 || timeout == UINT64_MAX)
+      atimeout = timeout;
+   else
+      atimeout = os_time_get_absolute_timeout(timeout);
+   timespec_from_nsec(&end_time, atimeout);
+
+   /* Need to observe that the swapchain semaphore has been unsignalled,
+    * as this is guaranteed when a present is complete. */
+   VkResult result = wsi_swapchain_wait_for_present_semaphore(
+         &chain->base, present_id, timeout);
+   if (result != VK_SUCCESS)
+      return result;
+
+   while (1) {
+      err = pthread_mutex_lock(&chain->present_ids.lock);
+      if (err != 0)
+         return VK_ERROR_OUT_OF_DATE_KHR;
+
+      bool completed = chain->present_ids.max_completed >= present_id;
+      pthread_mutex_unlock(&chain->present_ids.lock);
+
+      if (completed)
+         return VK_SUCCESS;
+
+      ret = dispatch_present_id_queue(wsi_chain, &end_time);
+      if (ret != VK_SUCCESS)
+         return ret;
+   }
+}
+
+static VkResult
 wsi_wl_swapchain_acquire_next_image_explicit(struct wsi_swapchain *wsi_chain,
                                              const VkAcquireNextImageInfoKHR *info,
                                              uint32_t *image_index)
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
-   uint64_t id = 0;
+   struct mesa_trace_flow flow = { 0 };
 
-   MESA_TRACE_FUNC_FLOW(&id);
+   MESA_TRACE_FUNC_FLOW(&flow);
 
    /* See comments in queue_present() */
    if (chain->retired)
@@ -2656,7 +2729,7 @@ wsi_wl_swapchain_acquire_next_image_explicit(struct wsi_swapchain *wsi_chain,
    STACK_ARRAY_FINISH(images);
 
    if (result == VK_SUCCESS) {
-      chain->images[*image_index].flow_id = id;
+      loader_wayland_buffer_set_flow(&chain->images[*image_index].wayland_buffer, &flow);
       if (chain->suboptimal)
          result = VK_SUBOPTIMAL_KHR;
    }
@@ -2672,9 +2745,9 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
    struct timespec start_time, end_time;
    struct timespec rel_timeout;
-   uint64_t id = 0;
+   struct mesa_trace_flow flow = { 0 };
 
-   MESA_TRACE_FUNC_FLOW(&id);
+   MESA_TRACE_FUNC_FLOW(&flow);
 
    /* See comments in queue_present() */
    if (chain->retired)
@@ -2702,7 +2775,7 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
             /* We found a non-busy image */
             *image_index = i;
             chain->images[i].busy = true;
-            chain->images[i].flow_id = id;
+            loader_wayland_buffer_set_flow(&chain->images[i].wayland_buffer, &flow);
             return (chain->suboptimal ? VK_SUBOPTIMAL_KHR : VK_SUCCESS);
          }
       }
@@ -2721,79 +2794,26 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
 }
 
 static void
-presentation_handle_sync_output(void *data,
-                                struct wp_presentation_feedback *feedback,
-                                struct wl_output *output)
-{
-}
-
-static void
 wsi_wl_presentation_update_present_id(struct wsi_wl_present_id *id)
 {
    mtx_lock(&id->chain->present_ids.lock);
+   id->chain->present_ids.outstanding_count--;
    if (id->present_id > id->chain->present_ids.max_completed)
       id->chain->present_ids.max_completed = id->present_id;
 
    id->chain->present_ids.display_time_correction -= id->correction;
-   wl_list_remove(&id->link);
    mtx_unlock(&id->chain->present_ids.lock);
    vk_free(id->alloc, id);
 }
 
 static void
-trace_present(const struct wsi_wl_present_id *id,
-              uint64_t presentation_time)
-{
-   struct wsi_wl_swapchain *chain = id->chain;
-   struct wsi_wl_surface *surface = chain->wsi_wl_surface;
-   char *buffer_name;
-
-   MESA_TRACE_SET_COUNTER(surface->analytics.latency_str,
-                          (presentation_time - id->submission_time) / 1000000.0);
-
-   /* Close the previous image display interval first, if there is one. */
-   if (surface->analytics.presenting && util_perfetto_is_tracing_enabled()) {
-      buffer_name = stringify_wayland_id(surface->analytics.presenting);
-      MESA_TRACE_TIMESTAMP_END(buffer_name ? buffer_name : "Wayland buffer",
-                               surface->analytics.presentation_track_id,
-                               chain->wsi_wl_surface->display->presentation_clock_id, presentation_time);
-      free(buffer_name);
-   }
-
-   surface->analytics.presenting = id->buffer_id;
-
-   if (util_perfetto_is_tracing_enabled()) {
-      buffer_name = stringify_wayland_id(id->buffer_id);
-      MESA_TRACE_TIMESTAMP_BEGIN(buffer_name ? buffer_name : "Wayland buffer",
-                                 surface->analytics.presentation_track_id,
-                                 id->flow_id,
-                                 chain->wsi_wl_surface->display->presentation_clock_id, presentation_time);
-      free(buffer_name);
-   }
-}
-
-static void
 presentation_handle_presented(void *data,
-                              struct wp_presentation_feedback *feedback,
-                              uint32_t tv_sec_hi, uint32_t tv_sec_lo,
-                              uint32_t tv_nsec, uint32_t refresh,
-                              uint32_t seq_hi, uint32_t seq_lo,
-                              uint32_t flags)
+                              uint64_t presentation_time,
+                              uint32_t refresh)
 {
    struct wsi_wl_present_id *id = data;
-   struct timespec presentation_ts;
-   uint64_t presentation_time;
-
-   MESA_TRACE_FUNC_FLOW(&id->flow_id);
-
    struct wsi_wl_swapchain *chain = id->chain;
    uint64_t target_time = id->target_time;
-
-
-   presentation_ts.tv_sec = ((uint64_t)tv_sec_hi << 32) + tv_sec_lo;
-   presentation_ts.tv_nsec = tv_nsec;
-   presentation_time = timespec_to_nsec(&presentation_ts);
-   trace_present(id, presentation_time);
 
    mtx_lock(&chain->present_ids.lock);
    chain->present_ids.refresh_nsec = refresh;
@@ -2813,16 +2833,12 @@ presentation_handle_presented(void *data,
    mtx_unlock(&chain->present_ids.lock);
 
    wsi_wl_presentation_update_present_id(id);
-   wp_presentation_feedback_destroy(feedback);
 }
 
 static void
-presentation_handle_discarded(void *data,
-                              struct wp_presentation_feedback *feedback)
+presentation_handle_discarded(void *data)
 {
    struct wsi_wl_present_id *id = data;
-
-   MESA_TRACE_FUNC_FLOW(&id->flow_id);
    struct wsi_wl_swapchain *chain = id->chain;
 
    mtx_lock(&chain->present_ids.lock);
@@ -2836,20 +2852,26 @@ presentation_handle_discarded(void *data,
    mtx_unlock(&chain->present_ids.lock);
 
    wsi_wl_presentation_update_present_id(id);
-   wp_presentation_feedback_destroy(feedback);
 }
 
-static const struct wp_presentation_feedback_listener
-      pres_feedback_listener = {
-   presentation_handle_sync_output,
-   presentation_handle_presented,
-   presentation_handle_discarded,
-};
+static void
+presentation_handle_teardown(void *data)
+{
+   struct wsi_wl_present_id *id = data;
+
+   vk_free(id->alloc, id);
+}
 
 static void
 presentation_frame_handle_done(void *data, struct wl_callback *callback, uint32_t serial)
 {
    struct wsi_wl_present_id *id = data;
+   struct wsi_wl_swapchain *chain = id->chain;
+
+   mtx_lock(&chain->present_ids.lock);
+   wl_list_remove(&id->link);
+   mtx_unlock(&chain->present_ids.lock);
+
    wsi_wl_presentation_update_present_id(id);
    wl_callback_destroy(callback);
 }
@@ -2948,9 +2970,8 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
    bool timestamped = false;
    bool queue_dispatched = false;
-   uint64_t flow_id = chain->images[image_index].flow_id;
 
-   MESA_TRACE_FUNC_FLOW(&flow_id);
+   MESA_TRACE_FUNC_FLOW(&chain->images[image_index].wayland_buffer.flow);
 
    /* In case we're sending presentation feedback requests, make sure the
     * queue their events are in is dispatched.
@@ -2985,7 +3006,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    if (ret != VK_SUCCESS)
       return ret;
 
-   /* For EXT_swapchain_maintenance1. We might have transitioned from FIFO to MAILBOX.
+   /* For KHR_swapchain_maintenance1. We might have transitioned from FIFO to MAILBOX.
     * In this case we need to let the FIFO request complete, before presenting MAILBOX. */
    while (!chain->legacy_fifo_ready) {
       int ret = wl_display_dispatch_queue(wsi_wl_surface->display->wl_display,
@@ -3012,26 +3033,29 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    }
 
    assert(image_index < chain->base.image_count);
-   wl_surface_attach(wsi_wl_surface->surface, chain->images[image_index].buffer, 0, 0);
+   wl_surface_attach(wsi_wl_surface->wayland_surface.wrapper,
+                     chain->images[image_index].wayland_buffer.buffer, 0, 0);
 
-   if (wl_surface_get_version(wsi_wl_surface->surface) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+   if (wl_surface_get_version(wsi_wl_surface->wayland_surface.wrapper) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
       if (damage && damage->pRectangles && damage->rectangleCount > 0) {
          for (unsigned i = 0; i < damage->rectangleCount; i++) {
             const VkRectLayerKHR *rect = &damage->pRectangles[i];
             assert(rect->layer == 0);
-            wl_surface_damage_buffer(wsi_wl_surface->surface,
+            wl_surface_damage_buffer(wsi_wl_surface->wayland_surface.wrapper,
                                      rect->offset.x, rect->offset.y,
                                      rect->extent.width, rect->extent.height);
          }
       } else {
-         wl_surface_damage_buffer(wsi_wl_surface->surface, 0, 0, INT32_MAX, INT32_MAX);
+         wl_surface_damage_buffer(wsi_wl_surface->wayland_surface.wrapper,
+				  0, 0, INT32_MAX, INT32_MAX);
       }
    } else {
       /* If the compositor doesn't support damage_buffer, we deliberately
        * ignore the damage region and post maximum damage, because
        * we are unaware how to map the damage region from the buffer local
        * coordinate space to the surface local coordinate space */
-      wl_surface_damage(wsi_wl_surface->surface, 0, 0, INT32_MAX, INT32_MAX);
+      wl_surface_damage(wsi_wl_surface->wayland_surface.wrapper,
+			0, 0, INT32_MAX, INT32_MAX);
    }
 
    if (present_id > 0 || (mode_fifo && chain->commit_timer) ||
@@ -3042,26 +3066,20 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       id->chain = chain;
       id->present_id = present_id;
       id->alloc = chain->wsi_wl_surface->display->wsi_wl->alloc;
-      id->flow_id = flow_id;
-      id->buffer_id =
-         wl_proxy_get_id((struct wl_proxy *)chain->images[image_index].buffer);
-
-      id->submission_time = os_time_get_nano();
 
       mtx_lock(&chain->present_ids.lock);
 
       if (mode_fifo && chain->fifo && chain->commit_timer)
          timestamped = set_timestamp(chain, &id->target_time, &id->correction);
 
-      if (chain->present_ids.wp_presentation) {
-         id->feedback = wp_presentation_feedback(chain->present_ids.wp_presentation,
-                                                 chain->wsi_wl_surface->surface);
-         wp_presentation_feedback_add_listener(id->feedback,
-                                               &pres_feedback_listener,
-                                               id);
+      if (!chain->present_ids.frame_fallback) {
+         loader_wayland_presentation_feedback(&chain->present_ids.wayland_presentation,
+                                              &chain->images[image_index].wayland_buffer,
+                                              id);
       } else {
          id->frame = wl_surface_frame(chain->present_ids.surface);
          wl_callback_add_listener(id->frame, &pres_frame_listener, id);
+         wl_list_insert(&chain->present_ids.fallback_frame_list, &id->link);
       }
 
       chain->present_ids.prev_max_present_id = chain->present_ids.max_present_id;
@@ -3078,7 +3096,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
          chain->present_ids.max_forward_progress_present_id = chain->present_ids.prev_max_present_id;
       }
 
-      wl_list_insert(&chain->present_ids.outstanding_list, &id->link);
+      chain->present_ids.outstanding_count++;
       mtx_unlock(&chain->present_ids.lock);
    }
 
@@ -3086,7 +3104,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
 
    if (mode_fifo && !chain->fifo) {
       /* If we don't have FIFO protocol, we must fall back to legacy mechanism for throttling. */
-      chain->frame = wl_surface_frame(wsi_wl_surface->surface);
+      chain->frame = wl_surface_frame(wsi_wl_surface->wayland_surface.wrapper);
       wl_callback_add_listener(chain->frame, &frame_listener, chain);
       chain->legacy_fifo_ready = false;
    } else {
@@ -3130,7 +3148,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
        *   either to refresh rate or some fixed value. */
 
       if (timestamped) {
-         wl_surface_commit(wsi_wl_surface->surface);
+         wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
          /* Once we're in a steady state, we'd only need one of these
           * barrier waits. However, the first time we use a timestamp
           * we need both of our content updates to wait. The first
@@ -3154,7 +3172,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
        * When using timestamps, we already emit a dummy commit with the wait barrier anyway. */
       chain->next_present_force_wait_barrier = !timestamped;
    } else if (chain->fifo && chain->next_present_force_wait_barrier) {
-      /* If we're using EXT_swapchain_maintenance1 to transition from FIFO to something non-FIFO
+      /* If we're using KHR_swapchain_maintenance1 to transition from FIFO to something non-FIFO
        * the previous frame's FIFO must persist for a refresh cycle, i.e. it cannot be replaced by a MAILBOX presentation.
        * From 1.4.303 spec:
        * "Transition from VK_PRESENT_MODE_FIFO_KHR or VK_PRESENT_MODE_FIFO_RELAXED_KHR or VK_PRESENT_MODE_FIFO_LATEST_READY_EXT to
@@ -3167,7 +3185,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       wp_fifo_v1_wait_barrier(chain->fifo);
       chain->next_present_force_wait_barrier = false;
    }
-   wl_surface_commit(wsi_wl_surface->surface);
+   wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
    wl_display_flush(wsi_wl_surface->display->wl_display);
 
    if (!queue_dispatched && wsi_chain->image_info.explicit_sync) {
@@ -3183,7 +3201,7 @@ buffer_handle_release(void *data, struct wl_buffer *buffer)
 {
    struct wsi_wl_image *image = data;
 
-   assert(image->buffer == buffer);
+   assert(image->wayland_buffer.buffer == buffer);
 
    image->busy = false;
 }
@@ -3243,10 +3261,12 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
                                                     image->shm_fd,
                                                     image->shm_size);
       wl_proxy_set_queue((struct wl_proxy *)pool, display->queue);
-      image->buffer = wl_shm_pool_create_buffer(pool, 0, chain->extent.width,
-                                                chain->extent.height,
-                                                image->base.row_pitches[0],
-                                                chain->shm_format);
+      struct wl_buffer *buffer =
+         wl_shm_pool_create_buffer(pool, 0, chain->extent.width,
+                                   chain->extent.height,
+                                   image->base.row_pitches[0],
+                                   chain->shm_format);
+      loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
       wl_shm_pool_destroy(pool);
       break;
    }
@@ -3269,13 +3289,14 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
                                         image->base.drm_modifier & 0xffffffff);
       }
 
-      image->buffer =
+      struct wl_buffer *buffer =
          zwp_linux_buffer_params_v1_create_immed(params,
                                                  chain->extent.width,
                                                  chain->extent.height,
                                                  chain->drm_format,
                                                  0);
       zwp_linux_buffer_params_v1_destroy(params);
+      loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
 
       if (chain->base.image_info.explicit_sync) {
          for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
@@ -3291,15 +3312,15 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
    }
 
    default:
-      unreachable("Invalid buffer type");
+      UNREACHABLE("Invalid buffer type");
    }
 
-   if (!image->buffer)
+   if (!image->wayland_buffer.buffer)
       goto fail_image;
 
    /* No need to listen for release if we are explicit sync. */
    if (!chain->base.image_info.explicit_sync)
-      wl_buffer_add_listener(image->buffer, &buffer_listener, image);
+      wl_buffer_add_listener(image->wayland_buffer.buffer, &buffer_listener, image);
 
    return VK_SUCCESS;
 
@@ -3321,8 +3342,8 @@ wsi_wl_swapchain_images_free(struct wsi_wl_swapchain *chain)
          if (chain->images[i].wl_syncobj_timeline[j])
             wp_linux_drm_syncobj_timeline_v1_destroy(chain->images[i].wl_syncobj_timeline[j]);
       }
-      if (chain->images[i].buffer) {
-         wl_buffer_destroy(chain->images[i].buffer);
+      if (chain->images[i].wayland_buffer.buffer) {
+         loader_wayland_buffer_destroy(&chain->images[i].wayland_buffer);
          wsi_destroy_image(&chain->base, &chain->images[i].base);
          if (chain->images[i].shm_size) {
             close(chain->images[i].shm_fd);
@@ -3361,21 +3382,18 @@ wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
 
    assert(!chain->present_ids.dispatch_in_progress);
 
-   /* In VK_EXT_swapchain_maintenance1 there is no requirement to wait for all present IDs to be complete.
+   /* In VK_KHR_swapchain_maintenance1 there is no requirement to wait for all present IDs to be complete.
     * Waiting for the swapchain fence is enough.
     * Just clean up anything user did not wait for. */
    struct wsi_wl_present_id *id, *tmp;
-   wl_list_for_each_safe(id, tmp, &chain->present_ids.outstanding_list, link) {
-      if (id->feedback)
-         wp_presentation_feedback_destroy(id->feedback);
-      if (id->frame)
-         wl_callback_destroy(id->frame);
+   wl_list_for_each_safe(id, tmp, &chain->present_ids.fallback_frame_list, link) {
+      wl_callback_destroy(id->frame);
       wl_list_remove(&id->link);
       vk_free(id->alloc, id);
    }
 
-   if (chain->present_ids.wp_presentation)
-      wl_proxy_wrapper_destroy(chain->present_ids.wp_presentation);
+   loader_wayland_presentation_destroy(&chain->present_ids.wayland_presentation);
+
    if (chain->present_ids.surface)
       wl_proxy_wrapper_destroy(chain->present_ids.surface);
    u_cnd_monotonic_destroy(&chain->present_ids.list_advanced);
@@ -3443,7 +3461,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   wl_list_init(&chain->present_ids.outstanding_list);
+   wl_list_init(&chain->present_ids.fallback_frame_list);
 
    /* We are taking ownership of the wsi_wl_surface, so remove ownership from
     * oldSwapchain. If the surface is currently owned by a swapchain that is
@@ -3480,13 +3498,13 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
 
    uint32_t num_images = pCreateInfo->minImageCount;
 
-   /* If app provides a present mode list from EXT_swapchain_maintenance1,
+   /* If app provides a present mode list from KHR_swapchain_maintenance1,
     * we don't know which present mode will be used.
     * Application is assumed to be well-behaved and be spec-compliant.
     * It needs to query all per-present mode minImageCounts individually and use the max() of those modes,
     * so there should never be any need to bump image counts. */
    bool uses_present_mode_group = vk_find_struct_const(
-         pCreateInfo->pNext, SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT) != NULL;
+         pCreateInfo->pNext, SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR) != NULL;
 
    /* If FIFO manager is not used, minImageCount is already the bumped value for reasons outlined in
     * wsi_wl_surface_get_min_image_count(), so skip any attempt to bump the counts. */
@@ -3494,8 +3512,8 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       /* With proper FIFO, we return a lower minImageCount to make FIFO viable without requiring the use of KHR_present_wait.
        * The image count for MAILBOX should be bumped for performance reasons in this case.
        * This matches strategy for X11. */
-      const VkSurfacePresentModeEXT mode =
-            { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT, NULL, pCreateInfo->presentMode };
+      const VkSurfacePresentModeKHR mode =
+            { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR, NULL, pCreateInfo->presentMode };
 
       uint32_t min_images = wsi_wl_surface_get_min_image_count(wsi_wl_surface->display, &mode);
       bool requires_image_count_bump = min_images == WSI_WL_BUMPED_NUM_IMAGES;
@@ -3507,7 +3525,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    if (present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
       chain->tearing_control =
          wp_tearing_control_manager_v1_get_tearing_control(wsi_wl_surface->display->tearing_control_manager,
-                                                           wsi_wl_surface->surface);
+                                                           wsi_wl_surface->wayland_surface.wrapper);
       if (!chain->tearing_control) {
          result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
@@ -3588,6 +3606,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.release_images = wsi_wl_swapchain_release_images;
    chain->base.set_present_mode = wsi_wl_swapchain_set_present_mode;
    chain->base.wait_for_present = wsi_wl_swapchain_wait_for_present;
+   chain->base.wait_for_present2 = wsi_wl_swapchain_wait_for_present2;
    chain->base.present_mode = present_mode;
    chain->base.image_count = num_images;
    chain->base.set_hdr_metadata = wsi_wl_swapchain_set_hdr_metadata;
@@ -3622,7 +3641,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    char *queue_name = vk_asprintf(pAllocator,
                                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
                                   "mesa vk surface %d swapchain %d queue",
-                                  wl_proxy_get_id((struct wl_proxy *) wsi_wl_surface->surface),
+                                  wsi_wl_surface->wayland_surface.id,
                                   wsi_wl_surface->chain_count++);
    chain->present_ids.queue =
       wl_display_create_queue_with_name(chain->wsi_wl_surface->display->wl_display,
@@ -3630,15 +3649,21 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    vk_free(pAllocator, queue_name);
 
    if (chain->wsi_wl_surface->display->wp_presentation_notwrapped) {
-      chain->present_ids.wp_presentation =
-            wl_proxy_create_wrapper(chain->wsi_wl_surface->display->wp_presentation_notwrapped);
-      wl_proxy_set_queue((struct wl_proxy *) chain->present_ids.wp_presentation,
-                         chain->present_ids.queue);
+      chain->present_ids.frame_fallback = false;
+      loader_wayland_wrap_presentation(&chain->present_ids.wayland_presentation,
+                                       chain->wsi_wl_surface->display->wp_presentation_notwrapped,
+                                       chain->present_ids.queue,
+                                       chain->wsi_wl_surface->display->presentation_clock_id,
+                                       &chain->wsi_wl_surface->wayland_surface,
+                                       presentation_handle_presented,
+                                       presentation_handle_discarded,
+                                       presentation_handle_teardown);
    } else {
       /* Fallback to frame callbacks when presentation protocol is not available.
        * We already have a proxy for the surface, but need another since
        * presentID is pumped through a different queue to not disrupt
        * QueuePresentKHR frame callback's queue. */
+      chain->present_ids.frame_fallback = true;
       chain->present_ids.surface = wl_proxy_create_wrapper(wsi_wl_surface->base.surface);
       wl_proxy_set_queue((struct wl_proxy *) chain->present_ids.surface,
                          chain->present_ids.queue);
@@ -3648,11 +3673,11 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_wl_display *dpy = chain->wsi_wl_surface->display;
    if (dpy->fifo_manager) {
       chain->fifo = wp_fifo_manager_v1_get_fifo(dpy->fifo_manager,
-                                                chain->wsi_wl_surface->surface);
+                                                chain->wsi_wl_surface->wayland_surface.wrapper);
    }
-   if (dpy->commit_timing_manager && chain->present_ids.wp_presentation) {
+   if (dpy->commit_timing_manager && !chain->present_ids.frame_fallback) {
       chain->commit_timer = wp_commit_timing_manager_v1_get_timer(dpy->commit_timing_manager,
-                                                                  chain->wsi_wl_surface->surface);
+                                                                  chain->wsi_wl_surface->wayland_surface.wrapper);
    }
 
    for (uint32_t i = 0; i < chain->base.image_count; i++) {

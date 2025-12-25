@@ -18,6 +18,7 @@
 #include "amdgpu_virtio_private.h"
 
 #include "util/log.h"
+#include "util/u_math.h"
 
 int
 amdvgpu_query_info(amdvgpu_device_handle dev, struct drm_amdgpu_info *info)
@@ -44,67 +45,6 @@ amdvgpu_query_info(amdvgpu_device_handle dev, struct drm_amdgpu_info *info)
    return 0;
 }
 
-static int
-amdvgpu_query_info_simple(amdvgpu_device_handle dev, unsigned info_id, unsigned size, void *out)
-{
-   if (info_id == AMDGPU_INFO_DEV_INFO) {
-      assert(size == sizeof(dev->dev_info));
-      memcpy(out, &dev->dev_info, size);
-      return 0;
-   }
-   struct drm_amdgpu_info info;
-   info.return_pointer = (uintptr_t)out;
-   info.query = info_id;
-   info.return_size = size;
-   return amdvgpu_query_info(dev, &info);
-}
-
-static int
-amdvgpu_query_heap_info(amdvgpu_device_handle dev, unsigned heap, unsigned flags, struct amdgpu_heap_info *info)
-{
-   struct amdvgpu_shmem *shmem = to_amdvgpu_shmem(dev->vdev->shmem);
-   /* Get heap information from shared memory */
-   switch (heap) {
-   case AMDGPU_GEM_DOMAIN_VRAM:
-      if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
-         memcpy(info, &shmem->vis_vram, sizeof(*info));
-      else
-         memcpy(info, &shmem->vram, sizeof(*info));
-      break;
-   case AMDGPU_GEM_DOMAIN_GTT:
-      memcpy(info, &shmem->gtt, sizeof(*info));
-      break;
-   default:
-      return -EINVAL;
-   }
-
-   return 0;
-}
-
-static int
-amdvgpu_query_hw_ip_count(amdvgpu_device_handle dev, unsigned type, uint32_t *count)
-{
-   struct drm_amdgpu_info request;
-   request.return_pointer = (uintptr_t) count;
-   request.return_size = sizeof(*count);
-   request.query = AMDGPU_INFO_HW_IP_COUNT;
-   request.query_hw_ip.type = type;
-   return amdvgpu_query_info(dev, &request);
-}
-
-static int
-amdvgpu_query_video_caps_info(amdvgpu_device_handle dev, unsigned cap_type,
-                              unsigned size, void *value)
-{
-   struct drm_amdgpu_info request;
-   request.return_pointer = (uintptr_t)value;
-   request.return_size = size;
-   request.query = AMDGPU_INFO_VIDEO_CAPS;
-   request.sensor_info.type = cap_type;
-
-   return amdvgpu_query_info(dev, &request);
-}
-
 int
 amdvgpu_query_sw_info(amdvgpu_device_handle dev, enum amdgpu_sw_info info, void *value)
 {
@@ -114,49 +54,11 @@ amdvgpu_query_sw_info(amdvgpu_device_handle dev, enum amdgpu_sw_info info, void 
    return 0;
 }
 
-static int
-amdvgpu_query_firmware_version(amdvgpu_device_handle dev, unsigned fw_type, unsigned ip_instance, unsigned index,
-                               uint32_t *version, uint32_t *feature)
-{
-   struct drm_amdgpu_info request;
-   struct drm_amdgpu_info_firmware firmware = {};
-   int r;
-
-   memset(&request, 0, sizeof(request));
-   request.return_pointer = (uintptr_t)&firmware;
-   request.return_size = sizeof(firmware);
-   request.query = AMDGPU_INFO_FW_VERSION;
-   request.query_fw.fw_type = fw_type;
-   request.query_fw.ip_instance = ip_instance;
-   request.query_fw.index = index;
-
-   r = amdvgpu_query_info(dev, &request);
-
-   *version = firmware.ver;
-   *feature = firmware.feature;
-   return r;
-}
-
-static int
-amdvgpu_query_buffer_size_alignment(amdvgpu_device_handle dev,
-                                    struct amdgpu_buffer_size_alignments *info)
-{
-   memcpy(info, &dev->vdev->caps.u.amdgpu.alignments, sizeof(*info));
-   return 0;
-}
-
-static int
-amdvgpu_query_gpu_info(amdvgpu_device_handle dev, struct amdgpu_gpu_info *info)
-{
-   memcpy(info, &dev->vdev->caps.u.amdgpu.gpu_info, sizeof(*info));
-   return 0;
-}
-
 int
 amdvgpu_bo_set_metadata(amdvgpu_device_handle dev, uint32_t res_id,
                         struct amdgpu_bo_metadata *info)
 {
-   unsigned req_len = sizeof(struct amdgpu_ccmd_set_metadata_req) + info->size_metadata;
+   unsigned req_len = align(sizeof(struct amdgpu_ccmd_set_metadata_req) + info->size_metadata, 8);
    unsigned rsp_len = sizeof(struct amdgpu_ccmd_rsp);
 
    uint8_t buf[req_len];
@@ -346,53 +248,98 @@ amdvgpu_cs_submit_raw2(amdvgpu_device_handle dev, uint32_t ctx_id,
    /* Extract pointers from each chunk and copy them to the payload. */
    for (int i = 0; i < num_chunks; i++) {
       int extra_idx = 1 + chunk_count;
-      if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_BO_HANDLES) {
+      const uint32_t cid = chunks[i].chunk_id;
+      if (cid == AMDGPU_CHUNK_ID_BO_HANDLES) {
          struct drm_amdgpu_bo_list_in *list_in = (void*) (uintptr_t)chunks[i].chunk_data;
          extra[extra_idx].ptr = (void*) (uintptr_t)list_in->bo_info_ptr;
          extra[extra_idx].size = list_in->bo_info_size * list_in->bo_number;
-      } else if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_DEPENDENCIES ||
-                 chunks[i].chunk_id == AMDGPU_CHUNK_ID_FENCE ||
-                 chunks[i].chunk_id == AMDGPU_CHUNK_ID_IB) {
+      } else if (cid == AMDGPU_CHUNK_ID_DEPENDENCIES ||
+                 cid == AMDGPU_CHUNK_ID_FENCE ||
+                 cid == AMDGPU_CHUNK_ID_IB) {
          extra[extra_idx].ptr = (void*)(uintptr_t)chunks[i].chunk_data;
          extra[extra_idx].size = chunks[i].length_dw * 4;
 
-         if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_IB) {
+         if (cid == AMDGPU_CHUNK_ID_IB) {
             struct drm_amdgpu_cs_chunk_ib *ib = (void*)(uintptr_t)chunks[i].chunk_data;
             virtio_ring_idx = cs_chunk_ib_to_virtio_ring_idx(dev, ib);
          }
-      } else if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_OUT ||
-                 chunks[i].chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_IN) {
+      } else if (cid == AMDGPU_CHUNK_ID_SYNCOBJ_OUT ||
+                 cid == AMDGPU_CHUNK_ID_SYNCOBJ_IN ||
+                 cid == AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT ||
+                 cid == AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL) {
          /* Translate from amdgpu CHUNK_ID_SYNCOBJ_* to drm_virtgpu_execbuffer_syncobj */
-         struct drm_amdgpu_cs_chunk_sem *amd_syncobj = (void*) (uintptr_t)chunks[i].chunk_data;
-         unsigned syncobj_count = (chunks[i].length_dw * 4) / sizeof(struct drm_amdgpu_cs_chunk_sem);
-         struct drm_virtgpu_execbuffer_syncobj *syncobjs =
-            calloc(syncobj_count, sizeof(struct drm_virtgpu_execbuffer_syncobj));
+         struct drm_amdgpu_cs_chunk_sem *amd_sem = NULL;
+         struct drm_amdgpu_cs_chunk_syncobj *amd_syncobj = NULL;
+         unsigned new_syncobj_count;
+         struct drm_virtgpu_execbuffer_syncobj **syncobjs;
+         uint32_t *count;
 
-         if (syncobjs == NULL) {
+         switch (cid) {
+            case AMDGPU_CHUNK_ID_SYNCOBJ_OUT:
+               syncobjs = &syncobj_out;
+               count = &syncobj_out_count;
+               new_syncobj_count = (chunks[i].length_dw * 4) / sizeof(*amd_sem);
+               amd_sem = (void*) (uintptr_t)chunks[i].chunk_data;
+               break;
+            case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
+               syncobjs = &syncobj_in;
+               count = &syncobj_in_count;
+               new_syncobj_count = (chunks[i].length_dw * 4) / sizeof(*amd_sem);
+               amd_sem = (void*) (uintptr_t)chunks[i].chunk_data;
+               break;
+            case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL:
+               syncobjs = &syncobj_out;
+               count = &syncobj_out_count;
+               new_syncobj_count = (chunks[i].length_dw * 4) / sizeof(*amd_syncobj);
+               amd_syncobj = (void*) (uintptr_t)chunks[i].chunk_data;
+               break;
+            case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
+               syncobjs = &syncobj_in;
+               count = &syncobj_in_count;
+               new_syncobj_count = (chunks[i].length_dw * 4) / sizeof(*amd_syncobj);
+               amd_syncobj = (void*) (uintptr_t)chunks[i].chunk_data;
+               break;
+            default:
+               assert(false);
+               ret = -EINVAL;
+               goto error;
+         }
+
+
+         *syncobjs = realloc(*syncobjs, (*count + new_syncobj_count) * sizeof(struct drm_virtgpu_execbuffer_syncobj));
+         if (*syncobjs == NULL) {
             ret = -ENOMEM;
             goto error;
          }
 
-         for (int j = 0; j < syncobj_count; j++)
-            syncobjs[j].handle = amd_syncobj[j].handle;
-
-         if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_IN) {
-            syncobj_in_count = syncobj_count;
-            syncobj_in = syncobjs;
-         } else {
-            syncobj_out_count = syncobj_count;
-            syncobj_out = syncobjs;
+         int start = *count;
+         for (int j = 0; j < new_syncobj_count; j++) {
+            if (amd_syncobj) {
+               (*syncobjs)[start + j].handle = amd_syncobj[j].handle;
+               /* radv uses DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT but vk_queue already used
+                * WAIT_AVAILABLE, so clear the flag. This is not 100% correct as between
+                * the wait and the submit the syncobj fence might get changed but since
+                * virtgpu doesn't support WAIT_FOR_SUBMIT yet, this is the best we can do.
+                */
+               (*syncobjs)[start + j].flags = 0;
+               (*syncobjs)[start + j].point = amd_syncobj[j].point;
+            } else {
+               (*syncobjs)[start + j].handle = amd_sem[j].handle;
+               (*syncobjs)[start + j].flags = 0;
+               (*syncobjs)[start + j].point = 0;
+            }
          }
+         *count += new_syncobj_count;
 
          /* This chunk was converted to virtgpu UAPI so we don't need to forward it
           * to the host.
           */
          continue;
       } else {
-         mesa_loge("Unhandled chunk_id: %d\n", chunks[i].chunk_id);
+         mesa_loge("Unhandled chunk_id: %d\n", cid);
          continue;
       }
-      descriptors[chunk_count].chunk_id = chunks[i].chunk_id;
+      descriptors[chunk_count].chunk_id = cid;
       descriptors[chunk_count].offset = offset;
       descriptors[chunk_count].length_dw = extra[extra_idx].size / 4;
       offset += extra[extra_idx].size;
@@ -574,4 +521,9 @@ amdvgpu_va_range_alloc(amdvgpu_device_handle dev,
                                  va_base_alignment, va_base_required,
                                  va_base_allocated, va_range_handle,
                                  flags);
+}
+
+bool amdvgpu_has_vm_always_valid(amdvgpu_device_handle dev)
+{
+   return dev->vdev->caps.u.amdgpu.has_vm_always_valid;
 }

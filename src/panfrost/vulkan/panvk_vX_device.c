@@ -10,13 +10,17 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "drm-uapi/panthor_drm.h"
+
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_common_entrypoints.h"
+#include "vk_drm_syncobj.h"
 
 #include "panvk_buffer.h"
 #include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_device.h"
+#include "panvk_cmd_draw.h"
 #include "panvk_entrypoints.h"
 #include "panvk_instance.h"
 #include "panvk_macros.h"
@@ -30,7 +34,6 @@
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
 
-#include "clc/panfrost_compile.h"
 #include "kmod/pan_kmod.h"
 #include "util/os_file.h"
 #include "util/u_printf.h"
@@ -67,7 +70,8 @@ static void
 panvk_device_init_mempools(struct panvk_device *dev)
 {
    struct panvk_pool_properties rw_pool_props = {
-      .create_flags = 0,
+      .create_flags =
+         panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 16 * 1024,
       .label = "Device RW cached memory pool",
       .owns_bos = false,
@@ -75,10 +79,11 @@ panvk_device_init_mempools(struct panvk_device *dev)
       .prealloc = false,
    };
 
-   panvk_pool_init(&dev->mempools.rw, dev, NULL, &rw_pool_props);
+   panvk_pool_init(&dev->mempools.rw, dev, NULL, NULL, &rw_pool_props);
 
    struct panvk_pool_properties rw_nc_pool_props = {
-      .create_flags = PAN_ARCH <= 9 ? 0 : PAN_KMOD_BO_FLAG_GPU_UNCACHED,
+      .create_flags =
+         panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_GPU_UNCACHED),
       .slab_size = 16 * 1024,
       .label = "Device RW uncached memory pool",
       .owns_bos = false,
@@ -86,10 +91,11 @@ panvk_device_init_mempools(struct panvk_device *dev)
       .prealloc = false,
    };
 
-   panvk_pool_init(&dev->mempools.rw_nc, dev, NULL, &rw_nc_pool_props);
+   panvk_pool_init(&dev->mempools.rw_nc, dev, NULL, NULL, &rw_nc_pool_props);
 
    struct panvk_pool_properties exec_pool_props = {
-      .create_flags = PAN_KMOD_BO_FLAG_EXECUTABLE,
+      .create_flags = panvk_device_adjust_bo_flags(
+         dev, PAN_KMOD_BO_FLAG_EXECUTABLE | PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 16 * 1024,
       .label = "Device executable memory pool (shaders)",
       .owns_bos = false,
@@ -97,7 +103,7 @@ panvk_device_init_mempools(struct panvk_device *dev)
       .prealloc = false,
    };
 
-   panvk_pool_init(&dev->mempools.exec, dev, NULL, &exec_pool_props);
+   panvk_pool_init(&dev->mempools.exec, dev, NULL, NULL, &exec_pool_props);
 }
 
 static void
@@ -116,7 +122,7 @@ panvk_meta_cmd_bind_map_buffer(struct vk_command_buffer *cmd,
    VK_FROM_HANDLE(panvk_buffer, buffer, buf);
    struct panvk_cmd_buffer *cmdbuf =
       container_of(cmd, struct panvk_cmd_buffer, vk);
-   struct panfrost_ptr mem =
+   struct pan_ptr mem =
       panvk_cmd_alloc_dev_mem(cmdbuf, desc, buffer->vk.size, 64);
 
    if (!mem.gpu)
@@ -193,7 +199,7 @@ global_priority_to_group_allow_priority_flag(
    case VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR:
       return PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME;
    default:
-      unreachable("Invalid global priority");
+      UNREACHABLE("Invalid global priority");
    }
 }
 
@@ -201,6 +207,7 @@ static VkResult
 check_global_priority(const struct panvk_physical_device *phys_dev,
                       const VkDeviceQueueCreateInfo *create_info)
 {
+   const unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(create_info->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
@@ -208,15 +215,118 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   enum pan_kmod_group_allow_priority_flags requested_prio =
-      global_priority_to_group_allow_priority_flag(priority);
-   enum pan_kmod_group_allow_priority_flags allowed_prio_mask =
-      phys_dev->kmod.props.allowed_group_priorities_mask;
+   switch (create_info->queueFamilyIndex) {
+   case PANVK_QUEUE_FAMILY_GPU: {
+      enum pan_kmod_group_allow_priority_flags requested_prio =
+         global_priority_to_group_allow_priority_flag(priority);
+      enum pan_kmod_group_allow_priority_flags allowed_prio_mask =
+         phys_dev->kmod.dev->props.allowed_group_priorities_mask;
 
-   if (requested_prio & allowed_prio_mask)
-      return VK_SUCCESS;
+      /* Non-medium priority context is not hooked-up in the JM backend, even
+       * though the panfrost kmod advertize it. Manually filter non-medium
+       * priority for now.
+       */
+      if (arch < 10)
+         allowed_prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
 
-   return VK_ERROR_NOT_PERMITTED_KHR;
+      if (requested_prio & allowed_prio_mask)
+         return VK_SUCCESS;
+
+      return VK_ERROR_NOT_PERMITTED_KHR;
+   }
+
+   case PANVK_QUEUE_FAMILY_BIND: {
+      if (priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM)
+         return VK_SUCCESS;
+
+      return VK_ERROR_NOT_PERMITTED_KHR;
+   }
+
+   default:
+      UNREACHABLE("Unknown queue family");
+   }
+}
+
+static VkResult
+panvk_queue_check_status(struct vk_queue *queue)
+{
+   switch (queue->queue_family_index) {
+   case PANVK_QUEUE_FAMILY_GPU:
+      return panvk_per_arch(gpu_queue_check_status)(queue);
+   case PANVK_QUEUE_FAMILY_BIND:
+      return panvk_per_arch(bind_queue_check_status)(queue);
+   default:
+      UNREACHABLE("Unknown queue family");
+   }
+}
+
+static VkResult
+panvk_device_check_status(struct vk_device *vk_dev)
+{
+   struct panvk_device *dev = to_panvk_device(vk_dev);
+   VkResult result = vk_check_printf_status(&dev->vk, &dev->printf.ctx);
+
+   for (uint32_t qfi = 0; qfi < PANVK_QUEUE_FAMILY_COUNT; qfi++) {
+      struct panvk_device_queue_family *qf = &dev->queue_families[qfi];
+
+      for (uint32_t q = 0; q < qf->queue_count; q++) {
+         struct vk_queue *queue = qf->queues[q];
+
+         if (panvk_queue_check_status(queue) != VK_SUCCESS)
+            result = VK_ERROR_DEVICE_LOST;
+      }
+   }
+
+   if (pan_kmod_vm_query_state(dev->kmod.vm) != PAN_KMOD_VM_USABLE) {
+      vk_device_set_lost(&dev->vk, "vm state: not usable");
+      result = VK_ERROR_DEVICE_LOST;
+   }
+
+   return result;
+}
+
+static VkResult
+panvk_device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
+{
+   struct panvk_physical_device *pdev =
+      to_panvk_physical_device(vk_dev->physical);
+
+   *timestamp = pan_kmod_query_timestamp(pdev->kmod.dev);
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+panvk_queue_create(struct panvk_device *dev,
+                   const VkDeviceQueueCreateInfo *create_info,
+                   uint32_t queue_idx,
+                   struct vk_queue **out_queue)
+{
+   switch (create_info->queueFamilyIndex) {
+   case PANVK_QUEUE_FAMILY_GPU:
+      return panvk_per_arch(create_gpu_queue)(
+         dev, create_info, queue_idx, out_queue);
+   case PANVK_QUEUE_FAMILY_BIND:
+      return panvk_per_arch(create_bind_queue)(
+         dev, create_info, queue_idx, out_queue);
+   default:
+      return panvk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+   }
+}
+
+static void
+panvk_queue_destroy(struct vk_queue *queue)
+{
+   switch (queue->queue_family_index) {
+   case PANVK_QUEUE_FAMILY_GPU:
+      panvk_per_arch(destroy_gpu_queue)(queue);
+      break;
+   case PANVK_QUEUE_FAMILY_BIND:
+      panvk_per_arch(destroy_bind_queue)(queue);
+      break;
+   default:
+      UNREACHABLE("Unknown queue family");
+   }
 }
 
 VkResult
@@ -276,16 +386,18 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    device->vk.command_dispatch_table = &device->cmd_dispatch;
    device->vk.command_buffer_ops = &panvk_per_arch(cmd_buffer_ops);
    device->vk.shader_ops = &panvk_per_arch(device_shader_ops);
-   device->vk.check_status = panvk_per_arch(device_check_status);
+   device->vk.check_status = panvk_device_check_status;
+   device->vk.get_timestamp = panvk_device_get_timestamp;
+   device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
 
    device->kmod.allocator = (struct pan_kmod_allocator){
       .zalloc = panvk_kmod_zalloc,
       .free = panvk_kmod_free,
       .priv = &device->vk.alloc,
    };
-   device->kmod.dev =
-      pan_kmod_dev_create(os_dupfd_cloexec(physical_device->kmod.dev->fd),
-                          PAN_KMOD_DEV_FLAG_OWNS_FD, &device->kmod.allocator);
+   device->kmod.dev = pan_kmod_dev_create(
+      os_dupfd_cloexec(physical_device->kmod.dev->fd),
+      physical_device->kmod.dev->flags, &device->kmod.allocator);
 
    if (!device->kmod.dev) {
       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -293,18 +405,17 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_finish_dev;
    }
 
-   if (instance->debug_flags &
-       (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC | PANVK_DEBUG_DUMP))
+   if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || PANVK_DEBUG(DUMP))
       device->debug.decode_ctx = pandecode_create_context(false);
 
    /* 32bit address space, with the lower 32MB reserved. We clamp
     * things so it matches kmod VA range limitations.
     */
-   uint64_t user_va_start = panfrost_clamp_to_usable_va_range(
+   uint64_t user_va_start = pan_clamp_to_usable_va_range(
       device->kmod.dev, PANVK_VA_RESERVE_BOTTOM);
    uint64_t user_va_end =
-      panfrost_clamp_to_usable_va_range(device->kmod.dev, 1ull << 32);
-   uint32_t vm_flags = PAN_ARCH <= 7 ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
+      pan_clamp_to_usable_va_range(device->kmod.dev, 1ull << 32);
+   uint32_t vm_flags = PAN_ARCH < 9 ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
 
    device->kmod.vm =
       pan_kmod_vm_create(device->kmod.dev, vm_flags,
@@ -315,11 +426,43 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_destroy_kdev;
    }
 
+#if PAN_ARCH >= 10
+   const struct drm_panthor_csif_info *csif_info =
+      panthor_kmod_get_csif_props(device->kmod.dev);
+
+   assert(csif_info->scoreboard_slot_count <= 16);
+   device->csf.sb.count = csif_info->scoreboard_slot_count;
+   device->csf.sb.all_mask = (uint16_t)BITFIELD_MASK(csif_info->scoreboard_slot_count);
+
+   assert(device->csf.sb.count > PANVK_SB_ITER_START);
+   device->csf.sb.iter_count = device->csf.sb.count - PANVK_SB_ITER_START;
+
+#if PAN_ARCH == 10
+   device->csf.sb.iter_count =
+      MIN2(device->csf.sb.iter_count, PANVK_SB_ITER_COUNT);
+#endif
+
+   device->csf.sb.all_iters_mask =
+      BITFIELD_RANGE(PANVK_SB_ITER_START, device->csf.sb.iter_count);
+#endif
+
    simple_mtx_init(&device->as.lock, mtx_plain);
    util_vma_heap_init(&device->as.heap, user_va_start,
                       user_va_end - user_va_start);
 
    panvk_device_init_mempools(device);
+
+#if PAN_ARCH >= 10
+   /* The only reason this is a heap allocation is that PANVK_SUBQUEUE_COUNT
+    * isn't available in the header */
+   device->dump_region_size =
+      vk_zalloc(&device->vk.alloc, PANVK_SUBQUEUE_COUNT * sizeof(uint32_t),
+                alignof(uint32_t), VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!device->dump_region_size) {
+      result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto err_free_priv_bos;
+   }
+#endif
 
 #if PAN_ARCH <= 9
    result = panvk_priv_bo_create(
@@ -328,15 +471,26 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
+
+   result = panvk_priv_bo_create(
+      device,
+      PANVK_JM_MAX_VERTICES_INDIRECT * PANVK_JM_MAX_PER_VTX_ATTRIBUTES_INDIRECT_SIZE,
+      PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->indirect_varying_buffer);
+   if (result != VK_SUCCESS)
+      goto err_free_priv_bos;
 #endif
 
    result = panvk_priv_bo_create(
-      device, panfrost_sample_positions_buffer_size(), 0,
+      device, pan_sample_positions_buffer_size(),
+      panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->sample_positions);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
 
-   panfrost_upload_sample_positions(device->sample_positions->addr.host);
+   pan_upload_sample_positions(device->sample_positions->addr.host);
+   panvk_priv_bo_flush(device->sample_positions, 0,
+                       pan_sample_positions_buffer_size());
 
 #if PAN_ARCH >= 10
    result = panvk_per_arch(init_tiler_oom)(device);
@@ -344,7 +498,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_free_priv_bos;
 #endif
 
-   result = panvk_priv_bo_create(device, LIBPAN_PRINTF_BUFFER_SIZE, 0,
+   result = panvk_priv_bo_create(device, PAN_PRINTF_BUFFER_SIZE, 0,
                                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE,
                                  &device->printf.bo);
    if (result != VK_SUCCESS)
@@ -361,9 +515,24 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
 
+   struct vk_pipeline_cache_create_info cache_info = {
+      .weak_ref = true,
+   };
+   device->vk.mem_cache = vk_pipeline_cache_create(&device->vk, &cache_info, NULL);
+   if (device->vk.mem_cache == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto err_free_precomp;
+   }
+
+#if PAN_ARCH >= 10
+   result = panvk_per_arch(device_draw_context_init)(device);
+   if (result != VK_SUCCESS)
+      goto err_free_mem_cache;
+#endif
+
    result = panvk_meta_init(device);
    if (result != VK_SUCCESS)
-      goto err_free_precomp;
+      goto err_free_draw_ctx;
 
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create =
@@ -374,26 +543,30 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
          goto err_finish_queues;
 
       uint32_t qfi = queue_create->queueFamilyIndex;
-      device->queues[qfi] =
+      struct panvk_device_queue_family *qf = &device->queue_families[qfi];
+
+      qf->queues =
          vk_zalloc(&device->vk.alloc,
-                  queue_create->queueCount * sizeof(struct panvk_queue), 8,
-                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-      if (!device->queues[qfi]) {
+                   queue_create->queueCount * sizeof(qf->queues[0]), 8,
+                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (!qf->queues) {
          result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
          goto err_finish_queues;
       }
 
       for (unsigned q = 0; q < queue_create->queueCount; q++) {
-         result = panvk_per_arch(queue_init)(device, &device->queues[qfi][q], q,
-                                             queue_create);
+         result = panvk_queue_create(device, queue_create, q, &qf->queues[q]);
          if (result != VK_SUCCESS)
             goto err_finish_queues;
 
-         device->queue_count[qfi]++;
+         qf->queue_count++;
       }
    }
 
-   panvk_per_arch(utrace_context_init)(device);
+   result = panvk_per_arch(utrace_context_init)(device);
+   if (result != VK_SUCCESS)
+      goto err_finish_queues;
+
 #if PAN_ARCH >= 10
    panvk_utrace_perfetto_init(device, PANVK_SUBQUEUE_COUNT);
 #else
@@ -404,15 +577,24 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    return VK_SUCCESS;
 
 err_finish_queues:
-   for (unsigned i = 0; i < PANVK_MAX_QUEUE_FAMILIES; i++) {
-      for (unsigned q = 0; q < device->queue_count[i]; q++)
-         panvk_per_arch(queue_finish)(&device->queues[i][q]);
-      if (device->queues[i])
-         vk_free(&device->vk.alloc, device->queues[i]);
+   for (unsigned i = 0; i < PANVK_QUEUE_FAMILY_COUNT; i++) {
+      struct panvk_device_queue_family *qf = &device->queue_families[i];
+
+      for (unsigned q = 0; q < qf->queue_count; q++)
+         panvk_queue_destroy(qf->queues[q]);
+
+      if (qf->queues)
+         vk_free(&device->vk.alloc, qf->queues);
    }
 
    panvk_meta_cleanup(device);
 
+err_free_draw_ctx:
+#if PAN_ARCH >= 10
+   panvk_per_arch(device_draw_context_cleanup)(device);
+err_free_mem_cache:
+#endif
+   vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
 err_free_precomp:
    panvk_precomp_cleanup(device);
 err_free_priv_bos:
@@ -421,13 +603,18 @@ err_free_priv_bos:
    panvk_priv_bo_unref(device->printf.bo);
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->sample_positions);
+   panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_device_cleanup_mempools(device);
+   vk_free(&device->vk.alloc, device->dump_region_size);
    pan_kmod_vm_destroy(device->kmod.vm);
    util_vma_heap_finish(&device->as.heap);
    simple_mtx_destroy(&device->as.lock);
 
 err_destroy_kdev:
+   if (device->debug.decode_ctx)
+      pandecode_destroy_context(device->debug.decode_ctx);
+
    pan_kmod_dev_destroy(device->kmod.dev);
 
 err_finish_dev:
@@ -447,21 +634,31 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 
    panvk_per_arch(utrace_context_fini)(device);
 
-   for (unsigned i = 0; i < PANVK_MAX_QUEUE_FAMILIES; i++) {
-      for (unsigned q = 0; q < device->queue_count[i]; q++)
-         panvk_per_arch(queue_finish)(&device->queues[i][q]);
-      if (device->queue_count[i])
-         vk_free(&device->vk.alloc, device->queues[i]);
+   for (unsigned i = 0; i < PANVK_QUEUE_FAMILY_COUNT; i++) {
+      struct panvk_device_queue_family *qf = &device->queue_families[i];
+
+      for (unsigned q = 0; q < qf->queue_count; q++)
+         panvk_queue_destroy(qf->queues[q]);
+
+      if (qf->queues)
+         vk_free(&device->vk.alloc, qf->queues);
    }
 
    panvk_precomp_cleanup(device);
+#if PAN_ARCH >= 10
+   panvk_per_arch(device_draw_context_cleanup)(device);
+#endif
    panvk_meta_cleanup(device);
+   vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
+   pan_kmod_bo_put(device->sparse_mem.blackhole);
    u_printf_destroy(&device->printf.ctx);
    panvk_priv_bo_unref(device->printf.bo);
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
+   panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_device_cleanup_mempools(device);
+   vk_free(&device->vk.alloc, device->dump_region_size);
    pan_kmod_vm_destroy(device->kmod.vm);
    util_vma_heap_finish(&device->as.heap);
    simple_mtx_destroy(&device->as.lock);

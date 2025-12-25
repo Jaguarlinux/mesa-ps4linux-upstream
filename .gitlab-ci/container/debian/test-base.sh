@@ -3,7 +3,7 @@
 
 # When changing this file, you need to bump the following
 # .gitlab-ci/image-tags.yml tags:
-# DEBIAN_BASE_TAG
+# DEBIAN_TEST_BASE_TAG
 
 set -e
 
@@ -15,13 +15,11 @@ uncollapsed_section_start debian_setup "Base Debian system setup"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get install -y curl ca-certificates gnupg2 software-properties-common
+apt-get install -y curl ca-certificates gnupg2
 
 sed -i -e 's/http:\/\/deb/https:\/\/deb/g' /etc/apt/sources.list.d/*
 
 echo "deb [trusted=yes] https://gitlab.freedesktop.org/gfx-ci/ci-deb-repo/-/raw/${PKG_REPO_REV}/ ${FDO_DISTRIBUTION_VERSION%-*} main" | tee /etc/apt/sources.list.d/gfx-ci_.list
-
-echo "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian ${FDO_DISTRIBUTION_VERSION%-*} non-free-firmware" | tee /etc/apt/sources.list.d/non-free-firmware.list
 
 : "${LLVM_VERSION:?llvm version not set!}"
 
@@ -42,6 +40,7 @@ EPHEMERAL=(
     glslang-tools
     g++
     libasound2-dev
+    libcairo2-dev
     libcap-dev
     "libclang-cpp${LLVM_VERSION}-dev"
     "libclang-rt-${LLVM_VERSION}-dev"
@@ -51,28 +50,37 @@ EPHEMERAL=(
     libepoxy-dev
     libexpat1-dev
     libgbm-dev
+    libinput-dev
     libgles2-mesa-dev
     liblz4-dev
     libpciaccess-dev
+    libpixman-1-dev
     libssl-dev
+    libtirpc-dev
     libvulkan-dev
     libudev-dev
     libwaffle-dev
-    libwayland-dev
     libx11-xcb-dev
+    libxcb-composite0-dev
     libxcb-dri2-0-dev
     libxcb-dri3-dev
     libxcb-present-dev
     libxfixes-dev
     libxcb-ewmh-dev
+    libxcursor-dev
+    libxcvt-dev
     libxext-dev
+    libxfont-dev
     libxkbcommon-dev
+    libxkbfile-dev
     libxrandr-dev
     libxrender-dev
+    libxshmfence-dev
     libzstd-dev
     "llvm-${LLVM_VERSION}-dev"
     make
     meson
+    mesa-common-dev
     patch
     pkgconf
     protobuf-compiler
@@ -97,30 +105,41 @@ DEPS=(
     jq
     kmod
     libasan8
+    libcairo2
     libcap2
     libdrm2
     libegl1
     libepoxy0
     libexpat1
     libfdt1
+    libinput10
     "libclang-common-${LLVM_VERSION}-dev"
     "libclang-cpp${LLVM_VERSION}"
     "libllvm${LLVM_VERSION}"
     liblz4-1
-    libpng16-16
+    libpixman-1-0
+    libpng16-16t64
     libproc2-0
-    libpython3.11
+    libpython3.13
+    libtirpc3t64
     libubsan1
     libvulkan1
     libwayland-client0
     libwayland-server0
+    libxcb-composite0
+    libxcb-dri2-0
     libxcb-ewmh2
     libxcb-randr0
     libxcb-shm0
     libxcb-xfixes0
+    libxcursor1
+    libxcvt0
+    libxfont2
     libxkbcommon0
     libxrandr2
     libxrender1
+    ntpsec-ntpdig
+    libxshmfence1
     ocl-icd-libopencl1
     pciutils
     python3-lxml
@@ -133,42 +152,25 @@ DEPS=(
     python3-simplejson
     python3-six
     python3-yaml
-    sntp
     socat
     spirv-tools
     sysvinit-core
     vulkan-tools
     waffle-utils
-    weston
-    xwayland
     xinit
+    xserver-common
     xserver-xorg-video-amdgpu
     xserver-xorg-video-ati
     xauth
-    xvfb
     zlib1g
 )
 
 HW_DEPS=(
-    firmware-realtek
     netcat-openbsd
     mount
-    python3-distutils
     python3-serial
     tzdata
     zstd
-)
-
-[ "$DEBIAN_ARCH" = "arm64" ] && ARCH_DEPS=(
-    firmware-linux-nonfree
-    firmware-qcom-media
-)
-[ "$DEBIAN_ARCH" = "armhf" ] && ARCH_DEPS=(
-    firmware-misc-nonfree
-)
-[ "$DEBIAN_ARCH" = "amd64" ] && ARCH_DEPS=(
-    firmware-amd-graphics
-    firmware-misc-nonfree
 )
 
 apt-get update
@@ -177,7 +179,7 @@ apt-get dist-upgrade -y
 apt-get install --purge -y \
       sysvinit-core libelogind0
 
-apt-get install -y --no-remove "${DEPS[@]}" "${HW_DEPS[@]}" "${ARCH_DEPS[@]}"
+apt-get install -y --no-remove "${DEPS[@]}" "${HW_DEPS[@]}"
 
 apt-get install -y --no-install-recommends "${EPHEMERAL[@]}"
 
@@ -195,10 +197,6 @@ section_end debian_setup
 
 . .gitlab-ci/container/build-kdl.sh
 
-############### Download firmware
-
-. .gitlab-ci/container/get-firmware-from-source.sh / "$FIRMWARE_FILES"
-
 ############### Build mold
 
 . .gitlab-ci/container/build-mold.sh
@@ -215,9 +213,17 @@ section_end debian_setup
 
 . .gitlab-ci/container/build-wayland.sh
 
+############### Build Weston
+
+. .gitlab-ci/container/build-weston.sh
+
+############### Build XWayland
+
+. .gitlab-ci/container/build-xwayland.sh
+
 ############### Install Rust toolchain
 
-. .gitlab-ci/container/build-rust.sh
+. .gitlab-ci/container/build-rust.sh test
 
 ############### Build Crosvm
 

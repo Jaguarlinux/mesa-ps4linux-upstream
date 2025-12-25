@@ -121,10 +121,10 @@ __gen_padded(uint32_t v, uint32_t start, uint32_t end)
  * pointer address space */
 #ifndef __OPENCL_VERSION__
 #define pan_cast_and_pack(dst, T, name)                                        \
-   pan_pack((PREFIX2(T, PACKED_T) *)dst, T, name)
+   pan_pack((PREFIX2(T, PACKED_T) *)(dst), T, name)
 
 #define pan_cast_and_pack_nodefaults(dst, T, name)                             \
-   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)dst, T, name)
+   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)(dst), T, name)
 
 #define pan_cast_and_unpack(src, T, name)                                      \
    pan_unpack((const PREFIX2(T, PACKED_T) *)(src), T, name)
@@ -150,17 +150,12 @@ __gen_padded(uint32_t v, uint32_t start, uint32_t end)
 #define pan_section_print(fp, A, S, var, indent)                               \
    PREFIX4(A, SECTION, S, print)(fp, &(var), indent)
 
-static inline void
-pan_merge_helper(uint32_t *dst, const uint32_t *src, size_t bytes)
-{
-   assert((bytes & 3) == 0);
-
-   for (unsigned i = 0; i < (bytes / 4); ++i)
-      dst[i] |= src[i];
-}
-
 #define pan_merge(packed1, packed2, type)                                      \
-   pan_merge_helper((packed1).opaque, (packed2).opaque, pan_size(type))
+   do {                                                                        \
+      size_t __tmp_bytes = pan_size(type);                                     \
+      for (unsigned i = 0; i < (__tmp_bytes / 4); ++i)                         \
+         (packed1)->opaque[i] |= (packed2)->opaque[i];                         \
+   } while (0);
 
 #ifndef __OPENCL_VERSION__
 static inline const char *

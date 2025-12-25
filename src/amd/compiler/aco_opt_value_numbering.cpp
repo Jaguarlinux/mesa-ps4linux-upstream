@@ -226,7 +226,8 @@ struct InstrPred {
       case Format::EXP:
       case Format::SOPP:
       case Format::PSEUDO_BRANCH:
-      case Format::PSEUDO_BARRIER: unreachable("unsupported instruction format");
+      case Format::PSEUDO_BARRIER:
+      case Format::PSEUDO_CALL: UNREACHABLE("unsupported instruction format");
       default: return true;
       }
    }
@@ -239,6 +240,7 @@ struct vn_ctx {
    monotonic_buffer_resource m;
    expr_set expr_values;
    aco::unordered_map<uint32_t, Temp> renames;
+   std::vector<uint16_t> uses;
 
    /* The exec id should be the same on the same level of control flow depth.
     * Together with the check for dominator relations, it is safe to assume
@@ -254,6 +256,7 @@ struct vn_ctx {
       for (Block& block : program->blocks)
          size += block.instructions.size();
       expr_values.reserve(size);
+      uses = dead_code_analysis(program);
    }
 };
 
@@ -313,8 +316,8 @@ can_eliminate(aco_ptr<Instruction>& instr)
    if (instr->definitions.empty() || instr->opcode == aco_opcode::p_phi ||
        instr->opcode == aco_opcode::p_linear_phi ||
        instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
-       instr->opcode == aco_opcode::p_shader_cycles_hi_lo_hi ||
-       instr->definitions[0].isNoCSE())
+       instr->opcode == aco_opcode::p_shader_cycles_hi_lo_hi || instr->definitions[0].isNoCSE() ||
+       instr->opcode == aco_opcode::p_reload_preserved)
       return false;
 
    return true;
@@ -342,6 +345,10 @@ process_block(vn_ctx& ctx, Block& block)
    new_instructions.reserve(block.instructions.size());
 
    for (aco_ptr<Instruction>& instr : block.instructions) {
+      /* Clean up dead create_vector/split_vector left behind by instruction selection. */
+      if (is_dead(ctx.uses, instr.get()))
+         continue;
+
       /* first, rename operands */
       for (Operand& op : instr->operands) {
          if (!op.isTemp())
@@ -354,6 +361,14 @@ process_block(vn_ctx& ctx, Block& block)
       if (instr->opcode == aco_opcode::p_discard_if ||
           instr->opcode == aco_opcode::p_demote_to_helper || instr->opcode == aco_opcode::p_end_wqm)
          ctx.exec_id++;
+      /* Clear all recorded values when encountering a call instruction to prevent replacing
+       * values across call instructions. The live state that can be kept in registers during
+       * function calls is typically very limited, so it's better to compute the same thing twice
+       * instead of increasing live ranges. This also disables value numbering of call instructions
+       * themselves, which is obviously invalid because callees can have side effects.
+       */
+      if (instr->isCall())
+         ctx.expr_values.clear();
 
       /* simple copy-propagation through renaming */
       bool copy_instr =

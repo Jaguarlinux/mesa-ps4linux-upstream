@@ -26,7 +26,6 @@
  **************************************************************************/
 
 #include "gallivm/lp_bld_sample.h"
-#include "gallivm/lp_bld_limits.h"
 #include "gallivm/lp_bld_tgsi.h"
 #include "gallivm/lp_bld_type.h"
 #include "gallivm/lp_bld_init.h"
@@ -231,7 +230,7 @@ lp_bld_llvm_sampler_soa_emit_fetch_texel(const struct lp_build_sampler_soa *base
 
       for (uint32_t i = 0; i < 4; i++) {
          if (LLVMIsUndef(params->coords[i]))
-            args[num_args++] = LLVMGetUndef(coord_type);
+            args[num_args++] = LLVMConstNull(coord_type);
          else
             args[num_args++] = params->coords[i];
       }
@@ -607,7 +606,7 @@ lp_bld_llvm_image_soa_emit_size_query(const struct lp_build_image_soa *base,
          .target = params->target,
          .level_zero_only = params->ms,
       };
-      
+
       lp_build_size_query_soa(gallivm, &state, &image->dynamic_state.base, params);
 
       gallivm->texture_descriptor = old_texture;

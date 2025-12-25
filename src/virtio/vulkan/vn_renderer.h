@@ -53,6 +53,12 @@ struct vn_renderer_info {
       VkPhysicalDevicePCIBusInfoPropertiesEXT props;
    } pci;
 
+   struct {
+      bool has_luid;
+      uint32_t node_mask;
+      uint8_t luid[VK_LUID_SIZE];
+   } id;
+
    bool has_dma_buf_import;
    bool has_external_sync;
    bool has_implicit_fencing;
@@ -160,7 +166,9 @@ struct vn_renderer_bo_ops {
                          struct vn_renderer_bo *bo);
 
    /* map is not thread-safe */
-   void *(*map)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
+   void *(*map)(struct vn_renderer *renderer,
+                struct vn_renderer_bo *bo,
+                void *placed_addr);
 
    void (*flush)(struct vn_renderer *renderer,
                  struct vn_renderer_bo *bo,
@@ -218,10 +226,12 @@ struct vn_renderer {
    struct vn_renderer_sync_ops sync_ops;
 };
 
+#ifdef HAVE_LIBDRM
 VkResult
 vn_renderer_create_virtgpu(struct vn_instance *instance,
                            const VkAllocationCallbacks *alloc,
                            struct vn_renderer **renderer);
+#endif
 
 VkResult
 vn_renderer_create_vtest(struct vn_instance *instance,
@@ -233,6 +243,7 @@ vn_renderer_create(struct vn_instance *instance,
                    const VkAllocationCallbacks *alloc,
                    struct vn_renderer **renderer)
 {
+#ifdef HAVE_LIBDRM
    if (VN_DEBUG(VTEST)) {
       VkResult result = vn_renderer_create_vtest(instance, alloc, renderer);
       if (result == VK_SUCCESS)
@@ -240,6 +251,9 @@ vn_renderer_create(struct vn_instance *instance,
    }
 
    return vn_renderer_create_virtgpu(instance, alloc, renderer);
+#else
+   return vn_renderer_create_vtest(instance, alloc, renderer);
+#endif
 }
 
 static inline void
@@ -362,9 +376,11 @@ vn_renderer_bo_export_dma_buf(struct vn_renderer *renderer,
 }
 
 static inline void *
-vn_renderer_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
+vn_renderer_bo_map(struct vn_renderer *renderer,
+                   struct vn_renderer_bo *bo,
+                   void *placed_addr)
 {
-   return renderer->bo_ops.map(renderer, bo);
+   return renderer->bo_ops.map(renderer, bo, placed_addr);
 }
 
 static inline void

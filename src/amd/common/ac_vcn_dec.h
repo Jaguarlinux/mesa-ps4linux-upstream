@@ -151,7 +151,12 @@
 
 #define RDECODE_FEEDBACK_PROFILING                          0x00000001
 
-#define RDECODE_SPS_INFO_H264_EXTENSION_SUPPORT_FLAG_SHIFT  7
+#define RDECODE_SPS_INFO_H264_DIRECT_8X8_INFERENCE_FLAG_SHIFT            0
+#define RDECODE_SPS_INFO_H264_MB_ADAPTIVE_FRAME_FIELD_FLAG_SHIFT         1
+#define RDECODE_SPS_INFO_H264_FRAME_MBS_ONLY_FLAG_SHIFT                  2
+#define RDECODE_SPS_INFO_H264_DELTA_PIC_ORDER_ALWAYS_ZERO_FLAG_SHIFT     3
+#define RDECODE_SPS_INFO_H264_GAPS_IN_FRAME_NUM_VALUE_ALLOWED_FLAG_SHIFT 5
+#define RDECODE_SPS_INFO_H264_EXTENSION_SUPPORT_FLAG_SHIFT               7
 
 #define RDECODE_VP9_PROBS_DATA_SIZE                         2304
 
@@ -293,6 +298,7 @@
 #define TYPE7 7
 
 /* VP9 Frame header flags */
+#define RDECODE_FRAME_HDR_INFO_VP9_USE_FRAME_SIZE_AS_OFFSET_SHIFT     (15)
 #define RDECODE_FRAME_HDR_INFO_VP9_USE_UNCOMPRESSED_HEADER_SHIFT      (14)
 #define RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_SHIFT     (13)
 #define RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_UPDATE_SHIFT        (12)
@@ -309,7 +315,7 @@
 #define RDECODE_FRAME_HDR_INFO_VP9_FRAME_TYPE_SHIFT                   (1)
 #define RDECODE_FRAME_HDR_INFO_VP9_SHOW_EXISTING_FRAME_SHIFT          (0)
 
-
+#define RDECODE_FRAME_HDR_INFO_VP9_USE_FRAME_SIZE_AS_OFFSET_MASK     (0x00008000)
 #define RDECODE_FRAME_HDR_INFO_VP9_USE_UNCOMPRESSED_HEADER_MASK      (0x00004000)
 #define RDECODE_FRAME_HDR_INFO_VP9_USE_PREV_IN_FIND_MV_REFS_MASK     (0x00002000)
 #define RDECODE_FRAME_HDR_INFO_VP9_MODE_REF_DELTA_UPDATE_MASK        (0x00001000)
@@ -1080,6 +1086,7 @@ typedef struct rvcn_dec_message_av1_s {
    rvcn_dec_warped_motion_params_t global_motion[8];
    rvcn_dec_av1_tile_info_t tile_info[256];
    unsigned char reserved[3];
+   unsigned int av1_intrabc_workaround;
 } rvcn_dec_message_av1_t;
 
 typedef struct rvcn_dec_feature_index_s {
@@ -1256,6 +1263,9 @@ struct jpeg_params {
 
 #define RDECODE_SESSION_CONTEXT_SIZE (128 * 1024)
 #define RDECODE_MAX_SUBSAMPLE_SIZE   (2048 * 2 * 4)
+#define RDECODE_IT_SCALING_TABLE_SIZE       992
+
+void ac_vcn_vp9_fill_probs_table(void *ptr);
 
 unsigned ac_vcn_dec_calc_ctx_size_av1(unsigned av1_version);
 void ac_vcn_av1_init_probs(unsigned av1_version, uint8_t *prob);

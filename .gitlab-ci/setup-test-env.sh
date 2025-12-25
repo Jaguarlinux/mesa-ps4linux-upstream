@@ -33,7 +33,13 @@ function _error_msg() (
     echo -e "${RED}$*${ENDCOLOR}"
 )
 
-export JOB_START_S=$(date -u +"%s" -d "${CI_JOB_STARTED_AT:?}")
+# Some date binaries (like the BusyBox one) use -D instead of -d for date parsing.
+# This fallback handles both cases: try GNU coreutils-style first, then fallback to BusyBox if it fails.
+# The BusyBox fallback needs '|| true' because it returns an error status even when it outputs the time.
+export JOB_START_S=$(
+  date -u +"%s" -d "$CI_JOB_STARTED_AT" 2>/dev/null ||
+  { date -u +"%s" -D "%Y-%m-%dT%H:%M:%SZ" "$CI_JOB_STARTED_AT" 2>/dev/null || true; }
+)
 
 function get_current_minsec {
     DATE_S=$(date -u +"%s")
@@ -82,7 +88,7 @@ function _section_end {
 alias section_end="x_off; _section_end"
 
 function _section_switch {
-    if [ -n "$CURRENT_SECTION" ]
+    if [ -n "${CURRENT_SECTION:-}" ]
     then
         build_section_end $CURRENT_SECTION
         x_off
@@ -93,7 +99,7 @@ function _section_switch {
 alias section_switch="x_off; _section_switch"
 
 function _uncollapsed_section_switch {
-    if [ -n "$CURRENT_SECTION" ]
+    if [ -n "${CURRENT_SECTION:-}" ]
     then
         build_section_end $CURRENT_SECTION
         x_off
@@ -116,7 +122,7 @@ export -f _uncollapsed_section_switch
 export -f _error_msg
 
 # Freedesktop requirement (needed for Wayland)
-[ -n "${XDG_RUNTIME_DIR:-}" ] || export XDG_RUNTIME_DIR="$(mktemp -p "$PWD" -d xdg-runtime-XXXXXX)"
+[ -n "${XDG_RUNTIME_DIR:-}" ] || export XDG_RUNTIME_DIR="$(mktemp --tmpdir -d xdg-runtime-XXXXXX)"
 
 if [ -z "${RESULTS_DIR:-}" ]; then
 	export RESULTS_DIR="${PWD%/}/results"
@@ -285,8 +291,88 @@ export -f get_tag_file
 
 # Structured tagging ------
 
+curl-with-retry() {
+    curl --fail --location --retry-connrefused --retry 4 --retry-delay 15 "$@"
+}
+export -f curl-with-retry
+
+function find_s3_project_artifact() {
+    x_off
+    local artifact_path="$1"
+
+    for project in "${FDO_UPSTREAM_REPO}" "${CI_PROJECT_PATH}"; do
+        local full_path="${FDO_HTTP_CACHE_URI:-}${S3_BASE_PATH}/${project}/${artifact_path}"
+        if curl-with-retry -s --head "https://${full_path}" >/dev/null; then
+            echo "https://${full_path}"
+            x_restore
+            return 0
+        fi
+    done
+
+    x_restore
+    return 1
+}
+export -f find_s3_project_artifact
+
 export -f error
 export -f trap_err
+
+function filter_env_vars() {
+    x_off
+    if [[ -n "${S3_JWT:-}" ]]; then
+        echo >&2 "Fatal: S3_JWT is set. This should have been cleared at this point."
+        return 1
+    fi
+
+    local exclude_vars=(
+        # GitLab tokens/passwords
+        CI_JOB_TOKEN
+        CI_DEPLOY_USER
+        CI_DEPLOY_PASSWORD
+        CI_DEPENDENCY_PROXY_PASSWORD
+        CI_REGISTRY_PASSWORD
+        CI_REPOSITORY_URL
+
+        # Too long and unnecessary GitLab variables
+        CI_COMMIT_DESCRIPTION
+        CI_COMMIT_MESSAGE
+        CI_MERGE_REQUEST_DESCRIPTION
+
+        # Shell-managed variables
+        _
+        HOME
+        HOSTNAME
+        OLDPWD
+        PATH
+        PWD
+        TERM
+        XDG_RUNTIME_DIR
+    )
+
+    env -0 | sort -z | while IFS= read -r -d '' line; do
+        [[ "$line" == *=* ]] || continue
+        local varname="${line%%=*}"
+
+        # Skip certain Mesa-specific variables
+        if echo "$varname" | grep -qxE "$CI_EXCLUDE_ENV_VAR_REGEX"; then
+            echo >&2 "${FUNCNAME[0]}: $varname is not passed to the DUT as it matches the pattern in CI_EXCLUDE_ENV_VAR_REGEX"
+            continue
+        fi
+        # Skip excluded or invalid names
+        if printf '%s\n' "${exclude_vars[@]}" | grep -qxF "$varname"; then
+            echo >&2 "${FUNCNAME[0]}: $varname is not passed to the DUT as it is a variable listed for exclusion in ${FUNCNAME[0]}"
+            continue
+        fi
+        # Skip shell function exports
+        if [[ "$varname" == BASH_FUNC_* ]] || [[ ! "$varname" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+            continue
+        fi
+
+        echo "${!varname@A}"
+    done
+    x_restore
+}
+export -f filter_env_vars
 
 set -E
 trap 'trap_err $?' ERR

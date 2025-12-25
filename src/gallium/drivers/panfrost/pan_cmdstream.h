@@ -40,7 +40,7 @@
 
 #include "util/u_prim.h"
 
-#define PAN_GPU_SUPPORTS_DISPATCH_INDIRECT (PAN_ARCH == 7 || PAN_ARCH >= 10)
+#define PAN_GPU_SUPPORTS_DISPATCH_INDIRECT (PAN_ARCH >= 6)
 #define PAN_GPU_SUPPORTS_DRAW_INDIRECT     (PAN_ARCH >= 10)
 
 struct panfrost_rasterizer {
@@ -146,7 +146,7 @@ panfrost_overdraw_alpha(const struct panfrost_context *ctx, bool zero)
    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
       const struct pan_blend_info info = so->info[i];
 
-      bool enabled = ctx->pipe_framebuffer.cbufs[i] && !info.enabled;
+      bool enabled = ctx->pipe_framebuffer.cbufs[i].texture && !info.enabled;
       bool flag = zero ? info.alpha_zero_nop : info.alpha_one_store;
 
       if (enabled && !flag)
@@ -200,7 +200,7 @@ pan_draw_mode(enum mesa_prim mode)
 #undef DEFINE_CASE
 
    default:
-      unreachable("Invalid draw mode");
+      UNREACHABLE("Invalid draw mode");
    }
 }
 
@@ -225,6 +225,11 @@ panfrost_fs_required(struct panfrost_compiled_shader *fs,
    if (fs->info.fs.sidefx)
       return true;
 
+   /* If alpha to coverage is enabled we need to execute, as
+    * writing the pixel can modify occlusion query results. */
+   if (blend->base.alpha_to_coverage)
+      return true;
+
    /* Using an empty FS requires early-z to be enabled, but alpha test
     * needs it disabled. Alpha test is only native on Midgard, so only
     * check there.
@@ -232,9 +237,13 @@ panfrost_fs_required(struct panfrost_compiled_shader *fs,
    if (PAN_ARCH <= 5 && zsa->base.alpha_func != PIPE_FUNC_ALWAYS)
       return true;
 
+   /* if pixel local storage is enabled we need to execute */
+   if (state->pls_enabled)
+      return true;
+
    /* If colour is written we need to execute */
    for (unsigned i = 0; i < state->nr_cbufs; ++i) {
-      if (state->cbufs[i] && blend->info[i].enabled)
+      if (state->cbufs[i].texture && blend->info[i].enabled)
          return true;
    }
 
@@ -249,7 +258,7 @@ panfrost_get_position_shader(struct panfrost_batch *batch,
                              const struct pipe_draw_info *info)
 {
    /* IDVS/points vertex shader */
-   uint64_t vs_ptr = batch->rsd[PIPE_SHADER_VERTEX];
+   uint64_t vs_ptr = batch->rsd[MESA_SHADER_VERTEX];
 
    /* IDVS/triangle vertex shader */
    if (vs_ptr && info->mode != MESA_PRIM_POINTS)
@@ -262,7 +271,7 @@ panfrost_get_position_shader(struct panfrost_batch *batch,
 static inline uint64_t
 panfrost_get_varying_shader(struct panfrost_batch *batch)
 {
-   return batch->rsd[PIPE_SHADER_VERTEX] + (2 * pan_size(SHADER_PROGRAM));
+   return batch->rsd[MESA_SHADER_VERTEX] + (2 * pan_size(SHADER_PROGRAM));
 }
 #endif
 
@@ -281,11 +290,12 @@ panfrost_vertex_attribute_stride(struct panfrost_compiled_shader *vs,
 
 static inline uint64_t
 panfrost_emit_resources(struct panfrost_batch *batch,
-                        enum pipe_shader_type stage)
+                        mesa_shader_stage stage)
 {
    struct panfrost_context *ctx = batch->ctx;
-   struct panfrost_ptr T;
-   unsigned nr_tables = PAN_NUM_RESOURCE_TABLES;
+   struct pan_ptr T;
+   unsigned nr_tables =
+      ALIGN_POT(PAN_NUM_RESOURCE_TABLES, MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
 
    /* Although individual resources need only 16 byte alignment, the
     * resource table as a whole must be 64-byte aligned.
@@ -297,35 +307,33 @@ panfrost_emit_resources(struct panfrost_batch *batch,
 
    memset(T.cpu, 0, nr_tables * pan_size(RESOURCE));
 
-   panfrost_make_resource_table(T, PAN_TABLE_UBO, batch->uniform_buffers[stage],
-                                batch->nr_uniform_buffers[stage]);
+   pan_make_resource_table(T, PAN_TABLE_UBO, batch->uniform_buffers[stage],
+                           batch->nr_uniform_buffers[stage]);
 
-   panfrost_make_resource_table(T, PAN_TABLE_TEXTURE, batch->textures[stage],
-                                ctx->sampler_view_count[stage]);
+   pan_make_resource_table(T, PAN_TABLE_TEXTURE, batch->textures[stage],
+                           ctx->sampler_view_count[stage]);
 
    /* We always need at least 1 sampler for txf to work */
-   panfrost_make_resource_table(T, PAN_TABLE_SAMPLER, batch->samplers[stage],
-                                MAX2(ctx->sampler_count[stage], 1));
+   pan_make_resource_table(T, PAN_TABLE_SAMPLER, batch->samplers[stage],
+                           MAX2(ctx->sampler_count[stage], 1));
 
-   panfrost_make_resource_table(T, PAN_TABLE_IMAGE, batch->images[stage],
-                                util_last_bit(ctx->image_mask[stage]));
+   pan_make_resource_table(T, PAN_TABLE_IMAGE, batch->images[stage],
+                           util_last_bit(ctx->image_mask[stage]));
 
-   if (stage == PIPE_SHADER_FRAGMENT) {
-      panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
-                                   batch->attribs[stage],
-                                   batch->nr_varying_attribs[PIPE_SHADER_FRAGMENT]);
-   } else if (stage == PIPE_SHADER_VERTEX) {
-      panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE,
-                                   batch->attribs[stage],
-                                   ctx->vertex->num_elements);
+   if (stage == MESA_SHADER_FRAGMENT) {
+      pan_make_resource_table(T, PAN_TABLE_ATTRIBUTE, batch->attribs[stage],
+                              batch->nr_varying_attribs[MESA_SHADER_FRAGMENT]);
+   } else if (stage == MESA_SHADER_VERTEX) {
+      pan_make_resource_table(T, PAN_TABLE_ATTRIBUTE, batch->attribs[stage],
+                              ctx->vertex->num_elements);
 
-      panfrost_make_resource_table(T, PAN_TABLE_ATTRIBUTE_BUFFER,
-                                   batch->attrib_bufs[stage],
-                                   util_last_bit(ctx->vb_mask));
+      pan_make_resource_table(T, PAN_TABLE_ATTRIBUTE_BUFFER,
+                              batch->attrib_bufs[stage],
+                              util_last_bit(ctx->vb_mask));
    }
 
-   panfrost_make_resource_table(T, PAN_TABLE_SSBO, batch->ssbos[stage],
-                                util_last_bit(ctx->ssbo_mask[stage]));
+   pan_make_resource_table(T, PAN_TABLE_SSBO, batch->ssbos[stage],
+                           util_last_bit(ctx->ssbo_mask[stage]));
 
    return T.gpu | nr_tables;
 }

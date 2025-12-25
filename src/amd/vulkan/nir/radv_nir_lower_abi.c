@@ -34,13 +34,13 @@ load_ring(nir_builder *b, unsigned ring, lower_abi_state *s)
 
    nir_def *ring_offsets = ac_nir_load_arg(b, &s->args->ac, arg);
    ring_offsets = nir_pack_64_2x32_split(b, nir_channel(b, ring_offsets, 0), nir_channel(b, ring_offsets, 1));
-   return nir_load_smem_amd(b, 4, ring_offsets, nir_imm_int(b, ring * 16u), .align_mul = 4u);
+   return ac_nir_load_smem(b, 4, ring_offsets, nir_imm_int(b, ring * 16u), 4, ACCESS_CAN_SPECULATE);
 }
 
 static nir_def *
 nggc_bool_setting(nir_builder *b, unsigned mask, lower_abi_state *s)
 {
-   nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->ngg_culling_settings);
+   nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->nggc_settings);
    return nir_test_mask(b, settings, mask);
 }
 
@@ -62,7 +62,7 @@ static bool
 lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
 {
    lower_abi_state *s = (lower_abi_state *)state;
-   gl_shader_stage stage = b->shader->info.stage;
+   mesa_shader_stage stage = b->shader->info.stage;
 
    b->cursor = nir_before_instr(&intrin->instr);
 
@@ -80,8 +80,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
       if (s->info->num_tess_patches) {
          replacement = nir_imm_int(b, s->info->num_tess_patches);
       } else {
-         nir_def *n = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_PATCHES);
-         replacement = nir_iadd_imm_nuw(b, n, 1);
+         replacement = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_PATCHES);
       }
       break;
    case nir_intrinsic_load_tcs_tess_levels_to_tes_amd:
@@ -89,14 +88,14 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          replacement = nir_imm_bool(b, s->info->tcs.tes_reads_tess_factors);
       } else {
          replacement =
-            nir_ine_imm(b, GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_TES_READS_TF), 0);
+            nir_ine_imm(b, GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_TES_READS_TF), 0);
       }
       break;
    case nir_intrinsic_load_tcs_primitive_mode_amd:
       if (s->info->outputs_linked) {
          replacement = nir_imm_int(b, s->info->tes._primitive_mode);
       } else {
-         replacement = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_PRIMITIVE_MODE);
+         replacement = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_PRIMITIVE_MODE);
       }
       break;
    case nir_intrinsic_load_ring_esgs_amd:
@@ -124,18 +123,18 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          if (s->gfx_state->ts.patch_control_points) {
             replacement = nir_imm_int(b, s->gfx_state->ts.patch_control_points);
          } else {
-            nir_def *n = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_PATCH_CONTROL_POINTS);
+            nir_def *n = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_PATCH_VERTICES_IN);
             replacement = nir_iadd_imm_nuw(b, n, 1);
          }
       } else if (stage == MESA_SHADER_TESS_EVAL) {
          if (s->info->tes.tcs_vertices_out) {
             replacement = nir_imm_int(b, s->info->tes.tcs_vertices_out);
          } else {
-            nir_def *n = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_OUT_PATCH_CP);
+            nir_def *n = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_PATCH_VERTICES_IN);
             replacement = nir_iadd_imm_nuw(b, n, 1);
          }
       } else
-         unreachable("invalid tessellation shader stage");
+         UNREACHABLE("invalid tessellation shader stage");
       break;
    case nir_intrinsic_load_pipeline_stat_query_enabled_amd:
       replacement = shader_query_bool_setting(b, radv_shader_query_pipeline_stat, s);
@@ -149,7 +148,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
    case nir_intrinsic_load_cull_any_enabled_amd: {
       nir_def *gs_tg_info = ac_nir_load_arg(b, &s->args->ac, s->args->ac.gs_tg_info);
 
-      /* Consider a workgroup small if it contains less than 16 triangles.
+      /* Cull only if the workgroup contains at least 16 triangles.
        *
        * The gs_tg_info[30:22] is the number of primitives, which we know is non-zero,
        * so the below is equivalent to: "ult(ubfe(gs_tg_info, 22, 9), 16)", but
@@ -157,10 +156,24 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
        */
       nir_def *small_workgroup = nir_ieq_imm(b, nir_iand_imm(b, gs_tg_info, BITFIELD_RANGE(22 + 4, 9 - 4)), 0);
 
+      if (b->shader->info.cull_distance_array_size) {
+         /* If cull distances are present, always cull in the shader. We don't export them in order to increase
+          * primitive throughput.
+          */
+         replacement = nir_imm_true(b);
+         break;
+      }
+
+      if (b->shader->info.clip_distance_array_size) {
+         /* If clip distances are present, cull in the shader only when the workgroup is large enough. */
+         replacement = nir_inot(b, small_workgroup);
+         break;
+      }
+
       nir_def *mask =
          nir_bcsel(b, small_workgroup, nir_imm_int(b, radv_nggc_none),
                    nir_imm_int(b, radv_nggc_front_face | radv_nggc_back_face | radv_nggc_small_primitives));
-      nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->ngg_culling_settings);
+      nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->nggc_settings);
       replacement = nir_ine_imm(b, nir_iand(b, settings, mask), 0);
       break;
    }
@@ -182,7 +195,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
        * exponent = nggc_settings >> 24
        * precision = 1.0 * 2 ^ exponent
        */
-      nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->ngg_culling_settings);
+      nir_def *settings = ac_nir_load_arg(b, &s->args->ac, s->args->nggc_settings);
       nir_def *exponent = nir_ishr_imm(b, settings, 24u);
       replacement = nir_ldexp(b, nir_imm_float(b, 1.0f), exponent);
       break;
@@ -190,10 +203,10 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
 
    case nir_intrinsic_load_cull_triangle_viewport_xy_scale_and_offset_amd: {
       nir_def *comps[] = {
-         ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_scale[0]),
-         ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_scale[1]),
-         ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_translate[0]),
-         ac_nir_load_arg(b, &s->args->ac, s->args->ngg_viewport_translate[1]),
+         ac_nir_load_arg(b, &s->args->ac, s->args->nggc_viewport_scale[0]),
+         ac_nir_load_arg(b, &s->args->ac, s->args->nggc_viewport_scale[1]),
+         ac_nir_load_arg(b, &s->args->ac, s->args->nggc_viewport_translate[0]),
+         ac_nir_load_arg(b, &s->args->ac, s->args->nggc_viewport_translate[1]),
       };
       replacement = nir_vec(b, comps, 4);
       break;
@@ -208,14 +221,6 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
    case nir_intrinsic_load_ring_mesh_scratch_amd:
       replacement = load_ring(b, RING_MS_SCRATCH, s);
       break;
-   case nir_intrinsic_load_ring_mesh_scratch_offset_amd:
-      /* gs_tg_info[0:11] is ordered_wave_id. Multiply by the ring entry size. */
-      replacement = nir_imul_imm(b, nir_iand_imm(b, ac_nir_load_arg(b, &s->args->ac, s->args->ac.gs_tg_info), 0xfff),
-                                 RADV_MESH_SCRATCH_ENTRY_BYTES);
-      break;
-   case nir_intrinsic_load_task_ring_entry_amd:
-      replacement = ac_nir_load_arg(b, &s->args->ac, s->args->ac.task_ring_entry);
-      break;
    case nir_intrinsic_load_lshs_vertex_stride_amd: {
       if (stage == MESA_SHADER_VERTEX) {
          replacement = nir_imm_int(b, get_tcs_input_vertex_stride(s->info->vs.num_linked_outputs));
@@ -224,7 +229,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          if (s->info->inputs_linked) {
             replacement = nir_imm_int(b, get_tcs_input_vertex_stride(s->info->tcs.num_linked_inputs));
          } else {
-            nir_def *num_ls_out = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_LS_OUTPUTS);
+            nir_def *num_ls_out = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_LS_OUTPUTS);
             nir_def *extra_dw = nir_bcsel(b, nir_ieq_imm(b, num_ls_out, 0), nir_imm_int(b, 0), nir_imm_int(b, 4));
             replacement = nir_iadd_nuw(b, nir_ishl_imm(b, num_ls_out, 4), extra_dw);
          }
@@ -238,41 +243,40 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          replacement = ac_nir_load_arg(b, &s->args->ac, s->args->vgt_esgs_ring_itemsize);
       } else {
          const unsigned stride =
-            s->info->is_ngg ? s->info->ngg_info.vgt_esgs_ring_itemsize : s->info->gs_ring_info.esgs_itemsize;
+            s->info->is_ngg ? s->info->ngg_info.vgt_esgs_ring_itemsize : s->info->legacy_gs_info.esgs_itemsize / 4;
          replacement = nir_imm_int(b, stride);
       }
       break;
    }
-   case nir_intrinsic_load_hs_out_patch_data_offset_amd: {
-      nir_def *num_tcs_outputs, *out_vertices_per_patch;
-
-      if (stage == MESA_SHADER_TESS_CTRL) {
-         num_tcs_outputs = nir_imm_int(b, s->info->tcs.num_linked_outputs);
-         out_vertices_per_patch = nir_imm_int(b, s->info->tcs.tcs_vertices_out);
+   case nir_intrinsic_load_tcs_mem_attrib_stride:
+   case nir_intrinsic_load_hs_out_patch_data_offset_amd:
+      if (s->info->num_tess_patches) {
+         /* The stride is a compile-time constant. */
+         unsigned tcs_vertices_out =
+            stage == MESA_SHADER_TESS_CTRL ? b->shader->info.tess.tcs_vertices_out : s->info->tes.tcs_vertices_out;
+         assert(tcs_vertices_out);
+         /* Align the stride to 256B. */
+         replacement = nir_imm_int(b, align(s->info->num_tess_patches * tcs_vertices_out * 16, 256));
       } else {
-         if (s->info->inputs_linked) {
-            out_vertices_per_patch = nir_imm_int(b, s->info->tes.tcs_vertices_out);
-            num_tcs_outputs = nir_imm_int(b, s->info->tes.num_linked_inputs);
-         } else {
-            nir_def *n = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_OUT_PATCH_CP);
-            out_vertices_per_patch = nir_iadd_imm_nuw(b, n, 1);
-            num_tcs_outputs = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_HS_OUTPUTS);
-         }
+         replacement = nir_imul_imm(
+            b, GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_TCS_MEM_ATTRIB_STRIDE), 256);
       }
 
-      nir_def *per_vertex_output_patch_size =
-         nir_imul(b, out_vertices_per_patch, nir_imul_imm(b, num_tcs_outputs, 16u));
+      if (intrin->intrinsic == nir_intrinsic_load_hs_out_patch_data_offset_amd) {
+         nir_def *num_tcs_mem_outputs;
 
-      if (s->info->num_tess_patches) {
-         unsigned num_patches = s->info->num_tess_patches;
-         replacement = nir_imul_imm(b, per_vertex_output_patch_size, num_patches);
-      } else {
-         nir_def *n = GET_SGPR_FIELD_NIR(s->args->tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_PATCHES);
-         nir_def *num_patches = nir_iadd_imm_nuw(b, n, 1);
-         replacement = nir_imul(b, per_vertex_output_patch_size, num_patches);
+         if (stage == MESA_SHADER_TESS_CTRL) {
+            num_tcs_mem_outputs = nir_imm_int(b, s->info->tcs.io_info.highest_remapped_vram_output);
+         } else if (s->info->inputs_linked) {
+            num_tcs_mem_outputs = nir_imm_int(b, s->info->tes.num_linked_inputs);
+         } else {
+            assert(stage == MESA_SHADER_TESS_EVAL);
+            num_tcs_mem_outputs = GET_SGPR_FIELD_NIR(s->args->ac.tcs_offchip_layout, TCS_OFFCHIP_LAYOUT_NUM_HS_OUTPUTS);
+         }
+
+         replacement = nir_imul(b, replacement, num_tcs_mem_outputs);
       }
       break;
-   }
    case nir_intrinsic_load_sample_positions_amd: {
       uint32_t sample_pos_offset = (RING_PS_SAMPLE_POSITIONS * 16) - 8;
 
@@ -288,8 +292,10 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          offset = nir_iadd(b, offset, nir_ishl_imm(b, intrin->src[1].ssa, 3));
       }
 
+      offset = nir_iadd_imm_nuw(b, offset, sample_pos_offset);
+      addr = nir_iadd(b, addr, nir_u2u64(b, offset));
       replacement =
-         nir_load_global_amd(b, 2, 32, addr, offset, .base = sample_pos_offset, .access = ACCESS_NON_WRITEABLE);
+         nir_load_global(b, 2, 32, addr, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_SPECULATE | ACCESS_CAN_REORDER);
       break;
    }
    case nir_intrinsic_load_rasterization_samples_amd:
@@ -316,7 +322,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
                /* TES won't use this intrinsic, because it can get primitive id directly
                 * instead of using this intrinsic to pass primitive id by LDS.
                 */
-               unreachable("load_provoking_vtx_in_prim_amd is only supported in VS and GS");
+               UNREACHABLE("load_provoking_vtx_in_prim_amd is only supported in VS and GS");
             }
          }
 
@@ -349,13 +355,9 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
          }
       }
 
-      if (s->gfx_level >= GFX12) {
+      if (s->gfx_level >= GFX11) {
          nir_def *va = nir_pack_64_2x32_split(b, ac_nir_load_arg(b, &s->args->ac, s->args->ngg_query_buf_va),
                                               nir_imm_int(b, s->address32_hi));
-
-         /* Only generated/written primitives query are emulated on GFX12+. */
-         offset -= RADV_SHADER_QUERY_PRIM_GEN_OFFSET(0);
-         assert(offset <= RADV_SHADER_QUERY_PRIM_XFB_OFFSET(3));
 
          nir_global_atomic_amd(b, 32, va, intrin->src[0].ssa, nir_imm_int(b, offset), .atomic_op = nir_atomic_op_iadd);
       } else {
@@ -366,7 +368,8 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
    case nir_intrinsic_load_streamout_buffer_amd: {
       nir_def *ptr = nir_pack_64_2x32_split(b, ac_nir_load_arg(b, &s->args->ac, s->args->streamout_buffers),
                                             nir_imm_int(b, s->address32_hi));
-      replacement = nir_load_smem_amd(b, 4, ptr, nir_imm_int(b, nir_intrinsic_base(intrin) * 16));
+      replacement =
+         ac_nir_load_smem(b, 4, ptr, nir_imm_int(b, nir_intrinsic_base(intrin) * 16), 4, ACCESS_CAN_SPECULATE);
       break;
    }
    case nir_intrinsic_load_xfb_state_address_gfx12_amd:
@@ -374,18 +377,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
                                            nir_imm_int(b, s->address32_hi));
       break;
    case nir_intrinsic_load_lds_ngg_gs_out_vertex_base_amd:
-      if (s->info->merged_shader_compiled_separately) {
-         replacement = GET_SGPR_FIELD_NIR(s->args->ngg_lds_layout, NGG_LDS_LAYOUT_GS_OUT_VERTEX_BASE);
-      } else {
-         replacement = nir_imm_int(b, s->info->ngg_info.esgs_ring_size);
-      }
-      break;
-   case nir_intrinsic_load_lds_ngg_scratch_base_amd:
-      if (s->info->merged_shader_compiled_separately) {
-         replacement = GET_SGPR_FIELD_NIR(s->args->ngg_lds_layout, NGG_LDS_LAYOUT_SCRATCH_BASE);
-      } else {
-         replacement = nir_imm_int(b, s->info->ngg_info.scratch_lds_base);
-      }
+      replacement = GET_SGPR_FIELD_NIR(s->args->ngg_lds_layout, NGG_LDS_LAYOUT_GS_OUT_VERTEX_BASE);
       break;
    case nir_intrinsic_load_num_vertices_per_primitive_amd: {
       unsigned num_vertices;
@@ -419,7 +411,7 @@ lower_abi_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
             num_vertices = 3;
             break;
          default:
-            unreachable("invalid GS output primitive");
+            UNREACHABLE("invalid GS output primitive");
             break;
          }
          replacement = nir_imm_int(b, num_vertices);
@@ -474,7 +466,7 @@ load_gsvs_ring(nir_builder *b, lower_abi_state *s, unsigned stream_id)
    unsigned stream_offset = 0;
    unsigned stride = 0;
    for (unsigned i = 0; i <= stream_id; i++) {
-      stride = 4 * s->info->gs.num_stream_output_components[i] * s->info->gs.vertices_out;
+      stride = 4 * (uint32_t)s->info->gs.num_components_per_stream[i] * s->info->gs.vertices_out;
       if (i < stream_id)
          stream_offset += stride * s->info->wave_size;
    }

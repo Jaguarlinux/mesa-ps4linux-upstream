@@ -182,7 +182,7 @@ _mesa_init_transform_feedback(struct gl_context *ctx)
 
    assert(ctx->TransformFeedback.DefaultObject->RefCount == 2);
 
-   _mesa_InitHashTable(&ctx->TransformFeedback.Objects, ctx->Shared->ReuseGLNames);
+   _mesa_InitHashTable(&ctx->TransformFeedback.Objects);
 
    _mesa_reference_buffer_object(ctx,
                                  &ctx->TransformFeedback.CurrentBuffer, NULL);
@@ -373,7 +373,7 @@ begin_transform_feedback(struct gl_context *ctx, GLenum mode, bool no_error)
          return;
       } else {
          /* Stop compiler warnings */
-         unreachable("Error in API use when using KHR_no_error");
+         UNREACHABLE("Error in API use when using KHR_no_error");
       }
    }
 
@@ -884,6 +884,7 @@ transform_feedback_varyings(struct gl_context *ctx,
 
    if (!shProg->TransformFeedback.VaryingNames) {
       _mesa_error(ctx, GL_OUT_OF_MEMORY, "glTransformFeedbackVaryings()");
+      shProg->TransformFeedback.NumVarying = 0;
       return;
    }
 

@@ -32,7 +32,7 @@ using namespace std;
 
 bool
 d3d12_video_encoder_references_manager_h264::get_current_frame_picture_control_data(
-   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA &codecAllocation)
+   D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA1 &codecAllocation)
 {
    assert(codecAllocation.DataSize == sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264));
    if (codecAllocation.DataSize != sizeof(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264))
@@ -89,7 +89,7 @@ d3d12_video_encoder_friendly_frame_type_h264(D3D12_VIDEO_ENCODER_FRAME_TYPE_H264
       } break;
       default:
       {
-         unreachable("Unsupported pipe_h2645_enc_picture_type");
+         UNREACHABLE("Unsupported pipe_h2645_enc_picture_type");
       } break;
    }
 }
@@ -269,13 +269,13 @@ d3d12_video_encoder_convert_frame_type_h264(enum pipe_h2645_enc_picture_type pic
       } break;
       default:
       {
-         unreachable("Unsupported pipe_h2645_enc_picture_type");
+         UNREACHABLE("Unsupported pipe_h2645_enc_picture_type");
       } break;
    }
 }
 
 void
-d3d12_video_encoder_references_manager_h264::begin_frame(D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA curFrameData,
+d3d12_video_encoder_references_manager_h264::begin_frame(const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA1& curFrameData,
                                                          bool bUsedAsReference,
                                                          struct pipe_picture_desc *picture)
 {
@@ -549,7 +549,7 @@ d3d12_video_encoder_references_manager_h264::print_mmco_lists()
          } break;
          default:
          {
-            unreachable("Unsupported memory_management_control_operation");
+            UNREACHABLE("Unsupported memory_management_control_operation");
          } break;
       }
    }

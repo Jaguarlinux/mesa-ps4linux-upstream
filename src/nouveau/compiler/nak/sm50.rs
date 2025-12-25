@@ -13,7 +13,7 @@ use std::ops::Range;
 pub fn instr_latency(_sm: u8, op: &Op, dst_idx: usize) -> u32 {
     let file = match &op.dsts_as_slice()[dst_idx] {
         Dst::None => return 0,
-        Dst::SSA(vec) => vec.file().unwrap(),
+        Dst::SSA(vec) => vec.file(),
         Dst::Reg(reg) => reg.file(),
     };
 
@@ -147,23 +147,24 @@ impl ShaderModel for ShaderModel50 {
         instr_latency(self.sm, a, a_dst_idx)
     }
 
-    fn paw_latency(&self, write: &Op, _dst_idx: usize) -> u32 {
-        if self.sm == 70 {
-            match write {
-                Op::DSetP(_) | Op::HSetP2(_) => 15,
-                _ => 13,
-            }
-        } else {
-            13
-        }
+    fn paw_latency(&self, _write: &Op, _dst_idx: usize) -> u32 {
+        13
+    }
+
+    fn latency_upper_bound(&self) -> u32 {
+        14
     }
 
     fn worst_latency(&self, write: &Op, dst_idx: usize) -> u32 {
         instr_latency(self.sm, write, dst_idx)
     }
 
+    fn max_instr_delay(&self) -> u8 {
+        15
+    }
+
     fn legalize_op(&self, b: &mut LegalizeBuilder, op: &mut Op) {
-        as_sm50_op_mut(op).legalize(b);
+        op.legalize(b);
     }
 
     fn encode_shader(&self, s: &Shader<'_>) -> Vec<u32> {
@@ -197,12 +198,6 @@ impl BitViewable for SM50Encoder<'_> {
 impl BitMutViewable for SM50Encoder<'_> {
     fn set_bit_range_u64(&mut self, range: Range<usize>, val: u64) {
         BitMutView::new(&mut self.inst).set_bit_range_u64(range, val);
-    }
-}
-
-impl SetFieldU64 for SM50Encoder<'_> {
-    fn set_field_u64(&mut self, range: Range<usize>, val: u64) {
-        BitMutView::new(&mut self.inst).set_field_u64(range, val);
     }
 }
 
@@ -943,7 +938,7 @@ impl SM50Op for OpFSwzAdd {
             );
         }
 
-        e.set_bit(38, false); /* .NDV */
+        e.set_tex_ndv(38, self.deriv_mode);
         e.set_bit(44, self.ftz);
         e.set_bit(47, false); /* dst.CC */
     }
@@ -2134,6 +2129,15 @@ impl SM50Encoder<'_> {
         );
     }
 
+    fn set_tex_ndv(&mut self, bit: usize, deriv_mode: TexDerivMode) {
+        let ndv = match deriv_mode {
+            TexDerivMode::Auto => false,
+            TexDerivMode::NonDivergent => true,
+            _ => panic!("{deriv_mode} is not supported"),
+        };
+        self.set_bit(bit, ndv);
+    }
+
     fn set_tex_channel_mask(
         &mut self,
         range: Range<usize>,
@@ -2185,7 +2189,7 @@ impl SM50Op for OpTex {
 
         e.set_tex_dim(28..31, self.dim);
         e.set_tex_channel_mask(31..35, self.channel_mask);
-        e.set_bit(35, false); // ToDo: NDV
+        e.set_tex_ndv(35, self.deriv_mode);
         e.set_bit(49, self.nodep);
         e.set_bit(50, self.z_cmpr);
     }
@@ -2298,7 +2302,7 @@ impl SM50Op for OpTmml {
 
         e.set_tex_dim(28..31, self.dim);
         e.set_tex_channel_mask(31..35, self.channel_mask);
-        e.set_bit(35, false); // ToDo: NDV
+        e.set_tex_ndv(35, self.deriv_mode);
         e.set_bit(49, self.nodep);
     }
 }
@@ -2392,10 +2396,6 @@ impl SM50Encoder<'_> {
         );
     }
 
-    fn set_mem_order(&mut self, _order: &MemOrder) {
-        // TODO: order and scope aren't present before SM70, what should we do?
-    }
-
     fn set_mem_access(&mut self, access: &MemAccess) {
         self.set_field(
             45..46,
@@ -2405,7 +2405,27 @@ impl SM50Encoder<'_> {
             },
         );
         self.set_mem_type(48..51, access.mem_type);
-        self.set_mem_order(&access.order);
+    }
+
+    fn set_ld_cache_op(&mut self, range: Range<usize>, op: LdCacheOp) {
+        let cache_op = match op {
+            LdCacheOp::CacheAll => 0_u8,
+            LdCacheOp::CacheGlobal => 1_u8,
+            LdCacheOp::CacheIncoherent => 2_u8,
+            LdCacheOp::CacheInvalidate => 3_u8,
+            _ => panic!("Unsupported cache op: ld{op}"),
+        };
+        self.set_field(range, cache_op);
+    }
+
+    fn set_st_cache_op(&mut self, range: Range<usize>, op: StCacheOp) {
+        let cache_op = match op {
+            StCacheOp::WriteBack => 0_u8,
+            StCacheOp::CacheGlobal => 1_u8,
+            StCacheOp::CacheStreaming => 2_u8,
+            StCacheOp::WriteThrough => 3_u8,
+        };
+        self.set_field(range, cache_op);
     }
 
     fn set_image_dim(&mut self, range: Range<usize>, dim: ImageDim) {
@@ -2457,23 +2477,13 @@ impl SM50Op for OpSuLd {
         }
         e.set_image_dim(33..36, self.image_dim);
 
-        // mem_eviction_policy not a thing for sm < 70
-
-        let scope = match self.mem_order {
-            MemOrder::Constant => MemScope::System,
-            MemOrder::Weak => MemScope::CTA,
-            MemOrder::Strong(s) => s,
-        };
-
-        e.set_field(
-            24..26,
-            match scope {
-                MemScope::CTA => 0_u8,
-                /* SM => 1_u8, */
-                MemScope::GPU => 2_u8,
-                MemScope::System => 3_u8,
-            },
+        let cache_op = LdCacheOp::select(
+            e.sm,
+            MemSpace::Global(MemAddrType::A64),
+            self.mem_order,
+            self.mem_eviction_priority,
         );
+        e.set_ld_cache_op(24..26, cache_op);
 
         e.set_dst(&self.dst);
 
@@ -2505,8 +2515,15 @@ impl SM50Op for OpSuSt {
         e.set_reg_src(0..8, &self.data);
         e.set_reg_src(39..47, &self.handle);
 
+        let cache_op = StCacheOp::select(
+            e.sm,
+            MemSpace::Global(MemAddrType::A64),
+            self.mem_order,
+            self.mem_eviction_priority,
+        );
+        e.set_st_cache_op(24..26, cache_op);
+
         e.set_image_dim(33..36, self.image_dim);
-        e.set_mem_order(&self.mem_order);
     }
 }
 
@@ -2589,6 +2606,7 @@ impl SM50Op for OpLd {
         e.set_field(20..44, self.offset);
 
         e.set_mem_access(&self.access);
+        e.set_ld_cache_op(46..48, self.access.ld_cache_op(e.sm));
     }
 }
 
@@ -2642,6 +2660,7 @@ impl SM50Op for OpSt {
         e.set_reg_src(8..16, &self.addr);
         e.set_field(20..44, self.offset);
         e.set_mem_access(&self.access);
+        e.set_st_cache_op(46..48, self.access.st_cache_op(e.sm));
     }
 }
 
@@ -2751,8 +2770,6 @@ impl SM50Op for OpAtom {
                     e.set_field(49..52, data_type);
                     e.set_atom_op(52..56, self.atom_op);
                 }
-
-                e.set_mem_order(&self.mem_order);
 
                 e.set_reg_src(8..16, &self.addr);
                 e.set_field(28..48, self.addr_offset);
@@ -3257,97 +3274,98 @@ impl SM50Op for OpOut {
     }
 }
 
-macro_rules! as_sm50_op_match {
-    ($op: expr) => {
+macro_rules! sm50_op_match {
+    ($op: expr, |$x: ident| $y: expr) => {
         match $op {
-            Op::FAdd(op) => op,
-            Op::FMnMx(op) => op,
-            Op::FMul(op) => op,
-            Op::FFma(op) => op,
-            Op::FSet(op) => op,
-            Op::FSetP(op) => op,
-            Op::FSwzAdd(op) => op,
-            Op::Rro(op) => op,
-            Op::MuFu(op) => op,
-            Op::Flo(op) => op,
-            Op::DAdd(op) => op,
-            Op::DFma(op) => op,
-            Op::DMnMx(op) => op,
-            Op::DMul(op) => op,
-            Op::DSetP(op) => op,
-            Op::IAdd2(op) => op,
-            Op::IAdd2X(op) => op,
-            Op::Mov(op) => op,
-            Op::Sel(op) => op,
-            Op::Shfl(op) => op,
-            Op::Vote(op) => op,
-            Op::PSetP(op) => op,
-            Op::SuSt(op) => op,
-            Op::S2R(op) => op,
-            Op::PopC(op) => op,
-            Op::Prmt(op) => op,
-            Op::Ld(op) => op,
-            Op::Ldc(op) => op,
-            Op::St(op) => op,
-            Op::Lop2(op) => op,
-            Op::Shf(op) => op,
-            Op::Shl(op) => op,
-            Op::Shr(op) => op,
-            Op::F2F(op) => op,
-            Op::F2I(op) => op,
-            Op::I2F(op) => op,
-            Op::I2I(op) => op,
-            Op::IMad(op) => op,
-            Op::IMul(op) => op,
-            Op::IMnMx(op) => op,
-            Op::ISetP(op) => op,
-            Op::Tex(op) => op,
-            Op::Tld(op) => op,
-            Op::Tld4(op) => op,
-            Op::Tmml(op) => op,
-            Op::Txd(op) => op,
-            Op::Txq(op) => op,
-            Op::Ipa(op) => op,
-            Op::AL2P(op) => op,
-            Op::ALd(op) => op,
-            Op::ASt(op) => op,
-            Op::CCtl(op) => op,
-            Op::MemBar(op) => op,
-            Op::Atom(op) => op,
-            Op::Bra(op) => op,
-            Op::SSy(op) => op,
-            Op::Sync(op) => op,
-            Op::Brk(op) => op,
-            Op::PBk(op) => op,
-            Op::Cont(op) => op,
-            Op::PCnt(op) => op,
-            Op::Exit(op) => op,
-            Op::Bar(op) => op,
-            Op::SuLd(op) => op,
-            Op::SuAtom(op) => op,
-            Op::Kill(op) => op,
-            Op::CS2R(op) => op,
-            Op::Nop(op) => op,
-            Op::PixLd(op) => op,
-            Op::Isberd(op) => op,
-            Op::Out(op) => op,
-            Op::Bfe(op) => op,
+            Op::FAdd($x) => $y,
+            Op::FMnMx($x) => $y,
+            Op::FMul($x) => $y,
+            Op::FFma($x) => $y,
+            Op::FSet($x) => $y,
+            Op::FSetP($x) => $y,
+            Op::FSwzAdd($x) => $y,
+            Op::Rro($x) => $y,
+            Op::MuFu($x) => $y,
+            Op::Flo($x) => $y,
+            Op::DAdd($x) => $y,
+            Op::DFma($x) => $y,
+            Op::DMnMx($x) => $y,
+            Op::DMul($x) => $y,
+            Op::DSetP($x) => $y,
+            Op::IAdd2($x) => $y,
+            Op::IAdd2X($x) => $y,
+            Op::Mov($x) => $y,
+            Op::Sel($x) => $y,
+            Op::Shfl($x) => $y,
+            Op::Vote($x) => $y,
+            Op::PSetP($x) => $y,
+            Op::SuSt($x) => $y,
+            Op::S2R($x) => $y,
+            Op::PopC($x) => $y,
+            Op::Prmt($x) => $y,
+            Op::Ld($x) => $y,
+            Op::Ldc($x) => $y,
+            Op::St($x) => $y,
+            Op::Lop2($x) => $y,
+            Op::Shf($x) => $y,
+            Op::Shl($x) => $y,
+            Op::Shr($x) => $y,
+            Op::F2F($x) => $y,
+            Op::F2I($x) => $y,
+            Op::I2F($x) => $y,
+            Op::I2I($x) => $y,
+            Op::IMad($x) => $y,
+            Op::IMul($x) => $y,
+            Op::IMnMx($x) => $y,
+            Op::ISetP($x) => $y,
+            Op::Tex($x) => $y,
+            Op::Tld($x) => $y,
+            Op::Tld4($x) => $y,
+            Op::Tmml($x) => $y,
+            Op::Txd($x) => $y,
+            Op::Txq($x) => $y,
+            Op::Ipa($x) => $y,
+            Op::AL2P($x) => $y,
+            Op::ALd($x) => $y,
+            Op::ASt($x) => $y,
+            Op::CCtl($x) => $y,
+            Op::MemBar($x) => $y,
+            Op::Atom($x) => $y,
+            Op::Bra($x) => $y,
+            Op::SSy($x) => $y,
+            Op::Sync($x) => $y,
+            Op::Brk($x) => $y,
+            Op::PBk($x) => $y,
+            Op::Cont($x) => $y,
+            Op::PCnt($x) => $y,
+            Op::Exit($x) => $y,
+            Op::Bar($x) => $y,
+            Op::SuLd($x) => $y,
+            Op::SuAtom($x) => $y,
+            Op::Kill($x) => $y,
+            Op::CS2R($x) => $y,
+            Op::Nop($x) => $y,
+            Op::PixLd($x) => $y,
+            Op::Isberd($x) => $y,
+            Op::Out($x) => $y,
+            Op::Bfe($x) => $y,
             _ => panic!("Unhandled instruction {}", $op),
         }
     };
 }
 
-fn as_sm50_op(op: &Op) -> &dyn SM50Op {
-    as_sm50_op_match!(op)
-}
-
-fn as_sm50_op_mut(op: &mut Op) -> &mut dyn SM50Op {
-    as_sm50_op_match!(op)
+impl SM50Op for Op {
+    fn legalize(&mut self, b: &mut LegalizeBuilder) {
+        sm50_op_match!(self, |op| op.legalize(b));
+    }
+    fn encode(&self, e: &mut SM50Encoder<'_>) {
+        sm50_op_match!(self, |op| op.encode(e));
+    }
 }
 
 fn encode_instr(
     instr_index: usize,
-    instr: Option<&Box<Instr>>,
+    instr: Option<&Instr>,
     sm: &ShaderModel50,
     labels: &FxHashMap<Label, usize>,
     ip: &mut usize,
@@ -3362,7 +3380,7 @@ fn encode_instr(
     };
 
     if let Some(instr) = instr {
-        as_sm50_op(&instr.op).encode(&mut e);
+        instr.op.encode(&mut e);
         e.set_pred(&instr.pred);
         e.set_instr_deps(&instr.deps);
     } else {

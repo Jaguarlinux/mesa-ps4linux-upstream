@@ -15,6 +15,7 @@
 
 # When changing this file, you need to bump the following
 # .gitlab-ci/image-tags.yml tags:
+# DEBIAN_TEST_ANDROID_TAG
 # DEBIAN_TEST_GL_TAG
 # DEBIAN_TEST_VIDEO_TAG
 # DEBIAN_TEST_VK_TAG
@@ -44,6 +45,14 @@ buildah_export() {
         exit 1
     fi
 
+    # These components will be provided via LAVA overlays,
+    # so remove them from the core rootfs
+    rm -rf "${mountpoint}/android-cts"
+    rm -rf "${mountpoint}/cuttlefish"
+    rm -rf "${mountpoint}/fluster/resources"
+    rm -rf "${mountpoint}/vkd3d-proton-tests"
+    rm -rf "${mountpoint}/vkd3d-proton-wine64"
+
     # Compress to zstd
     ZSTD_CLEVEL=10 tar -C "$mountpoint" -I zstd -cf "$2" .
 }
@@ -65,8 +74,7 @@ buildah umount "$container"
 buildah rm "$container"
 
 # Upload the rootfs tarball to S3.
-# The URL format matches the registry format, and LAVA_DISTRIBUTION_TAG is
-# used later to match this URL.
+# The URL format matches the registry format, making it easier to match this URL later.
 curl --fail --retry-connrefused --retry 4 --retry-delay 30 \
   --header "Authorization: Bearer $(cat "${S3_JWT_FILE}")" \
   -X PUT --form file=@"$ROOTFSTAR" \

@@ -16,11 +16,6 @@ enum si_color_output_type {
    SI_TYPE_UINT16,
 };
 
-struct si_vs_tcs_input_info {
-   uint8_t semantic;
-   uint8_t usage_mask;
-};
-
 /* Shader info from initial NIR before optimizations for shader variants. */
 struct si_shader_info {
    struct {
@@ -28,12 +23,7 @@ struct si_shader_info {
 
       bool use_aco_amd:1;
       bool writes_memory:1;
-      enum gl_subgroup_size subgroup_size;
-
-      uint64_t outputs_read;
-      uint64_t outputs_written;
-      uint32_t patch_outputs_read;
-      uint32_t patch_outputs_written;
+      uint8_t api_subgroup_size;
 
       uint8_t num_ubos;
       uint8_t num_ssbos;
@@ -42,7 +32,7 @@ struct si_shader_info {
       uint32_t image_buffers;
       uint32_t msaa_images;
 
-      unsigned shared_size;
+      unsigned task_payload_size;
       uint16_t workgroup_size[3];
       bool workgroup_size_variable:1;
       enum gl_derivative_group derivative_group:2;
@@ -69,7 +59,6 @@ struct si_shader_info {
             enum mesa_prim input_primitive;
             uint16_t vertices_out;
             uint8_t invocations;
-            uint8_t active_stream_mask:4;
          } gs;
 
          struct {
@@ -86,22 +75,29 @@ struct si_shader_info {
          struct {
             uint8_t user_data_components_amd:4;
          } cs;
+
+         struct {
+            uint16_t max_vertices_out;
+            uint16_t max_primitives_out;
+         } mesh;
+
+         struct {
+            bool linear_taskmesh_dispatch : 1;
+         } task;
       };
    } base;
+
+   ac_nir_tess_io_info tess_io_info;
 
    uint32_t options; /* bitmask of SI_PROFILE_* */
 
    uint8_t num_inputs;
    uint8_t num_outputs;
-   struct si_vs_tcs_input_info input[PIPE_MAX_SHADER_INPUTS];
+   uint8_t input_semantic[PIPE_MAX_SHADER_INPUTS];
    uint8_t output_semantic[PIPE_MAX_SHADER_OUTPUTS];
-   uint8_t output_usagemask[PIPE_MAX_SHADER_OUTPUTS];
-   uint8_t output_streams[PIPE_MAX_SHADER_OUTPUTS];
-   uint8_t output_type[PIPE_MAX_SHADER_OUTPUTS]; /* enum nir_alu_type */
 
    uint8_t num_vs_inputs;
    uint8_t num_vbos_in_user_sgprs;
-   uint8_t num_gs_stream_components[4];
    uint16_t enabled_streamout_buffer_mask;
 
    uint64_t inputs_read; /* "get_unique_index" bits */
@@ -111,17 +107,13 @@ struct si_shader_info {
    /* For VS before {TCS, TES, GS} and TES before GS. */
    uint64_t ls_es_outputs_written;     /* "get_unique_index" bits */
    uint64_t outputs_written_before_ps; /* "get_unique_index" bits */
-   uint64_t tcs_outputs_written_for_tes;   /* "get_unique_index" bits */
-   uint32_t patch_outputs_written_for_tes; /* "get_unique_index_patch" bits */
-   uint32_t tess_levels_written_for_tes;   /* "get_unique_index_patch" bits */
+   uint8_t num_tess_level_vram_outputs; /* max "get_unique_index_patch" + 1*/
 
    uint8_t clipdist_mask;
-   uint8_t culldist_mask;
+   bool has_clip_outputs;
+   bool gs_writes_stream0;
 
    uint16_t esgs_vertex_stride;
-   uint16_t gsvs_vertex_size;
-   uint8_t gs_input_verts_per_prim;
-   unsigned max_gsvs_emit_size;
 
    /* Set 0xf or 0x0 (4 bits) per each written output.
     * ANDed with spi_shader_col_format.
@@ -167,16 +159,12 @@ struct si_shader_info {
    bool uses_tg_size;
    bool uses_atomic_ordered_add;
    bool writes_psize;
-   bool writes_clipvertex;
    bool writes_primid;
    bool writes_viewport_index;
    bool writes_layer;
    bool uses_bindless_samplers;
    bool uses_bindless_images;
    bool has_divergent_loop;
-
-   /** Whether all codepaths write tess factors in all invocations. */
-   bool tessfactors_are_def_in_all_invocs;
 
    /* A flag to check if vrs2x2 can be enabled to reduce number of
     * fragment shader invocations if flat shading.
@@ -198,17 +186,6 @@ struct si_shader_info {
  * finished.
  */
 struct si_temp_shader_variant_info {
-   /* Legacy GS output info. */
-   uint8_t gs_streams[64];
-   uint8_t gs_streams_16bit_lo[16];
-   uint8_t gs_streams_16bit_hi[16];
-
-   uint8_t gs_out_usage_mask[64];
-   uint8_t gs_out_usage_mask_16bit_lo[16];
-   uint8_t gs_out_usage_mask_16bit_hi[16];
-
-   ac_nir_gs_output_info gs_out_info;
-
    uint8_t vs_output_param_offset[NUM_TOTAL_VARYING_SLOTS];
    bool has_non_uniform_tex_access : 1;
    bool has_shadow_comparison : 1;
@@ -228,6 +205,8 @@ struct si_shader_variant_info {
    uint32_t vs_output_ps_input_cntl[NUM_TOTAL_VARYING_SLOTS];
    union si_ps_input_info ps_inputs[SI_NUM_INTERP];
    uint8_t num_ps_inputs;
+   uint8_t num_ps_per_primitive_inputs;
+   uint8_t num_ps_maybe_per_primitive_inputs;
    uint8_t ps_colors_read;
    uint8_t num_input_sgprs;
    uint8_t num_input_vgprs;
@@ -243,11 +222,19 @@ struct si_shader_variant_info {
    bool writes_stencil : 1;
    bool writes_sample_mask : 1;
    bool uses_discard : 1;
+   bool uses_mesh_scratch_ring : 1;
    uint8_t nr_pos_exports;
    uint8_t nr_param_exports;
+   uint8_t nr_prim_param_exports;
+   uint8_t clipdist_mask;
+   uint8_t culldist_mask;
    uint8_t num_streamout_vec4s;
-   unsigned private_mem_vgprs;
-   unsigned max_simd_waves;
+   uint8_t max_simd_waves;
+   uint8_t ngg_lds_scratch_size;
+   uint16_t private_mem_vgprs;
+   uint32_t ngg_lds_vertex_size; /* VS,TES: Cull+XFB, GS: GSVS size */
+   uint32_t shared_size;
+   ac_nir_legacy_gs_info legacy_gs;
 };
 
 #endif

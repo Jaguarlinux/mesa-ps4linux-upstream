@@ -208,7 +208,7 @@ i965_postprocess_labels()
 int main(int argc, char **argv)
 {
    char *output_file = NULL;
-   char c;
+   int c;
    FILE *output = stdout;
    bool help = false, compact = false;
    void *store;
@@ -282,7 +282,7 @@ int main(int argc, char **argv)
       goto end;
    }
 
-   if (!argv[optind]) {
+   if (optind == argc) {
       fprintf(stderr, "Please specify input file\n");
       goto end;
    }
@@ -375,11 +375,9 @@ end:
    if (output)
       fclose(output);
 
-   if (p)
-      ralloc_free(p);
+   ralloc_free(p);
 
-   if (devinfo)
-      free(devinfo);
+   free(devinfo);
 
    exit(result);
 }

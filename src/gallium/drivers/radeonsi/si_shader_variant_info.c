@@ -25,6 +25,16 @@ void si_get_shader_variant_info(struct si_shader *shader,
        */
       for (unsigned i = 0; i < ARRAY_SIZE(shader->info.ps_inputs); i++)
          shader->info.ps_inputs[i].interpolate = INTERP_MODE_FLAT;
+
+      shader->info.num_ps_per_primitive_inputs =
+         util_bitcount64(nir->info.per_primitive_inputs);
+
+      /* gl_Layer is always from shader arg, not varying */
+      uint64_t maybe_per_prim_inputs =
+         nir->info.inputs_read & ~nir->info.per_primitive_inputs &
+         (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT);
+      shader->info.num_ps_maybe_per_primitive_inputs =
+         util_bitcount64(maybe_per_prim_inputs);
    }
 
    nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
@@ -50,6 +60,7 @@ void si_get_shader_variant_info(struct si_shader *shader,
             case nir_intrinsic_load_input:
             case nir_intrinsic_load_input_vertex:
             case nir_intrinsic_load_per_vertex_input:
+            case nir_intrinsic_load_per_primitive_input:
             case nir_intrinsic_load_interpolated_input: {
                if (nir->info.stage == MESA_SHADER_VERTEX) {
                   shader->info.uses_vmem_load_other = true;
@@ -78,6 +89,9 @@ void si_get_shader_variant_info(struct si_shader *shader,
                      shader->info.ps_inputs[index].interpolate = INTERP_MODE_SMOOTH;
                      if (intr->def.bit_size == 16)
                         shader->info.ps_inputs[index].fp16_lo_hi_valid |= 0x1 << sem.high_16bits;
+                  } else if (intr->intrinsic == nir_intrinsic_load_per_primitive_input) {
+                     /* per primitive input from mesh shader */
+                     shader->info.ps_inputs[index].interpolate = INTERP_MODE_NONE;
                   }
                }
                break;
@@ -128,6 +142,7 @@ void si_get_shader_variant_info(struct si_shader *shader,
                   shader->info.uses_vmem_load_other = true;
                break;
             case nir_intrinsic_store_output:
+            case nir_intrinsic_store_per_vertex_output:
                if (nir->info.stage == MESA_SHADER_FRAGMENT) {
                   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
 
@@ -137,6 +152,28 @@ void si_get_shader_variant_info(struct si_shader *shader,
                      shader->info.writes_stencil = true;
                   else if (sem.location == FRAG_RESULT_SAMPLE_MASK)
                      shader->info.writes_sample_mask = true;
+               } else if ((nir->info.stage <= MESA_SHADER_GEOMETRY &&
+                           !shader->key.ge.as_ls && !shader->key.ge.as_es) ||
+                          nir->info.stage == MESA_SHADER_MESH) {
+                  nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+
+                  /* Clip/cull distances must be gathered manually because nir_opt_clip_cull_const
+                   * can reduce their number.
+                   */
+                  if ((sem.location == VARYING_SLOT_CLIP_DIST0 ||
+                       sem.location == VARYING_SLOT_CLIP_DIST1) && !sem.no_sysval_output) {
+                     assert(nir_src_as_uint(*nir_get_io_offset_src(intr)) == 0);
+                     unsigned index = (sem.location - VARYING_SLOT_CLIP_DIST0) * 4 +
+                                      nir_intrinsic_component(intr);
+
+                     if (index < nir->info.clip_distance_array_size) {
+                        assert(shader->selector->info.clipdist_mask & BITFIELD_BIT(index));
+                        shader->info.clipdist_mask |= BITFIELD_BIT(index);
+                     } else if (index < nir->info.clip_distance_array_size +
+                                        nir->info.cull_distance_array_size) {
+                        shader->info.culldist_mask |= BITFIELD_BIT(index);
+                     }
+                  }
                }
                break;
             case nir_intrinsic_demote:
@@ -249,13 +286,22 @@ void si_get_shader_variant_info(struct si_shader *shader,
       }
    }
 
-   if (nir->info.stage <= MESA_SHADER_GEOMETRY && nir->xfb_info &&
-       !shader->key.ge.as_ls && !shader->key.ge.as_es) {
-      unsigned num_streamout_dwords = 0;
+   if ((nir->info.stage <= MESA_SHADER_GEOMETRY &&
+        !shader->key.ge.as_ls && !shader->key.ge.as_es) ||
+       nir->info.stage == MESA_SHADER_MESH) {
+      if (nir->xfb_info) {
+         unsigned num_streamout_dwords = 0;
 
-      for (unsigned i = 0; i < 4; i++)
-         num_streamout_dwords += nir->info.xfb_stride[i];
-      shader->info.num_streamout_vec4s = DIV_ROUND_UP(num_streamout_dwords, 4);
+         for (unsigned i = 0; i < 4; i++)
+            num_streamout_dwords += nir->info.xfb_stride[i];
+         shader->info.num_streamout_vec4s = DIV_ROUND_UP(num_streamout_dwords, 4);
+      }
+
+      if (shader->key.ge.mono.write_pos_to_clipvertex ||
+          nir->info.outputs_written & VARYING_BIT_CLIP_VERTEX)
+         shader->info.clipdist_mask = SI_USER_CLIP_PLANE_MASK;
+
+      shader->info.clipdist_mask &= ~shader->key.ge.opt.kill_clip_distances;
    }
 }
 
@@ -263,16 +309,21 @@ void si_get_shader_variant_info(struct si_shader *shader,
 void si_get_late_shader_variant_info(struct si_shader *shader, struct si_shader_args *args,
                                      nir_shader *nir)
 {
-   if ((nir->info.stage != MESA_SHADER_VERTEX || nir->info.vs.blit_sgprs_amd) &&
-       nir->info.stage != MESA_SHADER_TESS_EVAL &&
-       (nir->info.stage != MESA_SHADER_GEOMETRY || !shader->key.ge.as_ngg))
-      return;
+   /* mesh shader know this after ac_nir_lower_ngg_mesh() */
+   shader->info.shared_size = nir->info.shared_size;
 
    nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
       nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scalar_arg_amd &&
-             nir_intrinsic_base(nir_instr_as_intrinsic(instr)) == args->vs_state_bits.arg_index) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_scalar_arg_amd:
+            if (!args->vs_state_bits.used ||
+                nir_intrinsic_base(intr) != args->vs_state_bits.arg_index)
+               continue;
+
             assert(args->vs_state_bits.used);
 
             /* Gather which VS_STATE and GS_STATE user SGPR bits are used. */
@@ -289,6 +340,17 @@ void si_get_late_shader_variant_info(struct si_shader *shader, struct si_shader_
                if (bits_used & ENCODE_FIELD(GS_STATE_OUTPRIM, ~0))
                   shader->info.uses_gs_state_outprim = true;
             }
+            break;
+         case nir_intrinsic_export_amd: {
+            unsigned target = nir_intrinsic_base(intr);
+            if (target >= V_008DFC_SQ_EXP_POS && target <= V_008DFC_SQ_EXP_POS + 4) {
+               shader->info.nr_pos_exports = MAX2(shader->info.nr_pos_exports,
+                                                  target - V_008DFC_SQ_EXP_POS + 1);
+            }
+            break;
+         }
+         default:
+            break;
          }
       }
    }
@@ -361,7 +423,15 @@ void si_fixup_spi_ps_input_config(struct si_shader *shader)
       shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
    }
 
-   /* At least one pair of interpolation weights must be enabled. */
-   if (!(shader->config.spi_ps_input_ena & 0x7f))
-      shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+   /* At least one pair of barycentric coordinates or LINE_STIPPLE_TEX_ENA must be enabled.
+    * Since LINE_STIPPLE_TEX_ENA is the only one that loads only 1 VGPR, use it.
+    */
+   if (!(shader->config.spi_ps_input_ena & 0x7f) &&
+       !G_0286CC_LINE_STIPPLE_TEX_ENA(shader->config.spi_ps_input_ena)) {
+      /* LLVM sets PERSP_SAMPLE_ENA in this case, so we have to do the same. */
+      if (shader->selector->info.base.use_aco_amd)
+         shader->config.spi_ps_input_ena |= S_0286CC_LINE_STIPPLE_TEX_ENA(1);
+      else
+         shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+   }
 }

@@ -215,7 +215,7 @@ DD_CSO_DELETE(sampler)
 
 static void
 dd_context_bind_sampler_states(struct pipe_context *_pipe,
-                               enum pipe_shader_type shader,
+                               mesa_shader_stage shader,
                                unsigned start, unsigned count, void **states)
 {
    struct dd_context *dctx = dd_context(_pipe);
@@ -271,7 +271,7 @@ DD_CSO_DELETE(vertex_elements)
       struct pipe_context *pipe = dctx->pipe; \
       struct dd_state *hstate = state; \
    \
-      dctx->draw_state.shaders[PIPE_SHADER_##NAME] = hstate; \
+      dctx->draw_state.shaders[MESA_SHADER_##NAME] = hstate; \
       pipe->bind_##name##_state(pipe, hstate ? hstate->cso : NULL); \
    } \
     \
@@ -312,6 +312,8 @@ DD_SHADER(VERTEX, vs)
 DD_SHADER(GEOMETRY, gs)
 DD_SHADER(TESS_CTRL, tcs)
 DD_SHADER(TESS_EVAL, tes)
+DD_SHADER(TASK, ts)
+DD_SHADER(MESH, ms)
 
 static void * \
 dd_context_create_compute_state(struct pipe_context *_pipe,
@@ -359,8 +361,7 @@ DD_IMM_STATE(polygon_stipple, const struct pipe_poly_stipple, *state, state)
 
 static void
 dd_context_set_constant_buffer(struct pipe_context *_pipe,
-                               enum pipe_shader_type shader, uint index,
-                               bool take_ownership,
+                               mesa_shader_stage shader, uint index,
                                const struct pipe_constant_buffer *constant_buffer)
 {
    struct dd_context *dctx = dd_context(_pipe);
@@ -368,7 +369,7 @@ dd_context_set_constant_buffer(struct pipe_context *_pipe,
 
    safe_memcpy(&dctx->draw_state.constant_buffers[shader][index],
                constant_buffer, sizeof(*constant_buffer));
-   pipe->set_constant_buffer(pipe, shader, index, take_ownership, constant_buffer);
+   pipe->set_constant_buffer(pipe, shader, index, constant_buffer);
 }
 
 static void
@@ -436,30 +437,6 @@ static void dd_context_set_window_rectangles(struct pipe_context *_pipe,
  * views
  */
 
-static struct pipe_surface *
-dd_context_create_surface(struct pipe_context *_pipe,
-                          struct pipe_resource *resource,
-                          const struct pipe_surface *surf_tmpl)
-{
-   struct pipe_context *pipe = dd_context(_pipe)->pipe;
-   struct pipe_surface *view =
-      pipe->create_surface(pipe, resource, surf_tmpl);
-
-   if (!view)
-      return NULL;
-   view->context = _pipe;
-   return view;
-}
-
-static void
-dd_context_surface_destroy(struct pipe_context *_pipe,
-                           struct pipe_surface *surf)
-{
-   struct pipe_context *pipe = dd_context(_pipe)->pipe;
-
-   pipe->surface_destroy(pipe, surf);
-}
-
 static struct pipe_sampler_view *
 dd_context_create_sampler_view(struct pipe_context *_pipe,
                                struct pipe_resource *resource,
@@ -526,7 +503,7 @@ dd_context_stream_output_target_destroy(struct pipe_context *_pipe,
 
 static void
 dd_context_set_sampler_views(struct pipe_context *_pipe,
-                             enum pipe_shader_type shader,
+                             mesa_shader_stage shader,
                              unsigned start, unsigned num,
                              unsigned unbind_num_trailing_slots,
                              struct pipe_sampler_view **views)
@@ -544,7 +521,7 @@ dd_context_set_sampler_views(struct pipe_context *_pipe,
 
 static void
 dd_context_set_shader_images(struct pipe_context *_pipe,
-                             enum pipe_shader_type shader,
+                             mesa_shader_stage shader,
                              unsigned start, unsigned num,
                              unsigned unbind_num_trailing_slots,
                              const struct pipe_image_view *views)
@@ -562,7 +539,7 @@ dd_context_set_shader_images(struct pipe_context *_pipe,
 
 static void
 dd_context_set_shader_buffers(struct pipe_context *_pipe,
-                              enum pipe_shader_type shader,
+                              mesa_shader_stage shader,
                               unsigned start, unsigned num_buffers,
                               const struct pipe_shader_buffer *buffers,
                               unsigned writable_bitmask)
@@ -614,12 +591,13 @@ dd_context_set_stream_output_targets(struct pipe_context *_pipe,
 
 static void
 dd_context_fence_server_sync(struct pipe_context *_pipe,
-                             struct pipe_fence_handle *fence)
+                             struct pipe_fence_handle *fence,
+                             uint64_t value)
 {
    struct dd_context *dctx = dd_context(_pipe);
    struct pipe_context *pipe = dctx->pipe;
 
-   pipe->fence_server_sync(pipe, fence);
+   pipe->fence_server_sync(pipe, fence, value);
 }
 
 
@@ -841,7 +819,7 @@ dd_context_set_context_param(struct pipe_context *_pipe,
 
 static void
 dd_context_set_inlinable_constants(struct pipe_context *_pipe,
-                                   enum pipe_shader_type shader,
+                                   mesa_shader_stage shader,
                                    uint num_values, uint32_t *values)
 {
    struct pipe_context *pipe = dd_context(_pipe)->pipe;
@@ -907,6 +885,12 @@ dd_context_create(struct dd_screen *dscreen, struct pipe_context *pipe)
    CTX_INIT(create_compute_state);
    CTX_INIT(bind_compute_state);
    CTX_INIT(delete_compute_state);
+   CTX_INIT(create_ts_state);
+   CTX_INIT(bind_ts_state);
+   CTX_INIT(delete_ts_state);
+   CTX_INIT(create_ms_state);
+   CTX_INIT(bind_ms_state);
+   CTX_INIT(delete_ms_state);
    CTX_INIT(create_vertex_elements_state);
    CTX_INIT(bind_vertex_elements_state);
    CTX_INIT(delete_vertex_elements_state);
@@ -935,8 +919,6 @@ dd_context_create(struct dd_screen *dscreen, struct pipe_context *pipe)
    CTX_INIT(create_sampler_view);
    CTX_INIT(sampler_view_destroy);
    CTX_INIT(sampler_view_release);
-   CTX_INIT(create_surface);
-   CTX_INIT(surface_destroy);
    CTX_INIT(texture_barrier);
    CTX_INIT(memory_barrier);
    CTX_INIT(resource_commit);

@@ -341,6 +341,8 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.generate_mipmap``: Indicates whether pipe_context::generate_mipmap
   is supported.
 * ``pipe_caps.string_marker``: Whether pipe->emit_string_marker() is supported.
+* ``pipe_caps.surface_no_compress``: Indicates that
+  pipe_context::create_surface does not support compression
 * ``pipe_caps.surface_reinterpret_blocks``: Indicates whether
   pipe_context::create_surface supports reinterpreting a texture as a surface
   of a format with different block width/height (but same block size in bits).
@@ -348,6 +350,9 @@ Capability about the features and limits of the driver/GPU.
   non-compressed surface whose texels are the same number of bits as the
   compressed blocks, and vice versa. The width and height of the surface is
   adjusted appropriately.
+* ``pipe_caps.compressed_surface_reinterpret_blocks_layered``: Same as
+  ``pipe_caps.surface_reinterpret_blocks`` but for supporting multiple layers
+  of a compressed texture.
 * ``pipe_caps.query_buffer_object``: Driver supports
   context::get_query_result_resource callback.
 * ``pipe_caps.pci_group``: Return the PCI segment group number.
@@ -377,8 +382,6 @@ Capability about the features and limits of the driver/GPU.
   shaders.
 * ``pipe_caps.max_window_rectangles``: The maximum number of window rectangles
   supported in ``set_window_rectangles``.
-* ``pipe_caps.polygon_offset_units_unscaled``: If true, the driver implements support
-  for ``pipe_rasterizer_state::offset_units_unscaled``.
 * ``pipe_caps.viewport_subpixel_bits``: Number of bits of subpixel precision for
   floating point viewport bounds.
 * ``pipe_caps.rasterizer_subpixel_bits``: Number of bits of subpixel precision used
@@ -554,13 +557,12 @@ Capability about the features and limits of the driver/GPU.
 
 * ``pipe_caps.cl_gl_sharing``: True if driver supports everything required by a frontend implementing the CL extension, and
   also supports importing/exporting all of pipe_texture_target via dma buffers.
-* ``pipe_caps.prefer_compute_for_multimedia``: Whether VDPAU and VAAPI
+* ``pipe_caps.prefer_compute_for_multimedia``: Whether VAAPI
   should use a compute-based blit instead of pipe_context::blit and compute pipeline for compositing images.
 * ``pipe_caps.fragment_shader_interlock``: True if fragment shader interlock
   functionality is supported.
 * ``pipe_caps.atomic_float_minmax``: Atomic float point minimum,
   maximum, exchange and compare-and-swap support to buffer and shared variables.
-* ``pipe_caps.tgsi_div``: Whether opcode DIV is supported
 * ``pipe_caps.dithering``: Whether dithering is supported
 * ``pipe_caps.fragment_shader_texture_lod``: Whether texture lookups with
   explicit LOD is supported in the fragment shader.
@@ -580,9 +582,9 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.demote_to_helper_invocation``: True if driver supports demote keyword in GLSL programs.
 * ``pipe_caps.tgsi_tg4_component_in_swizzle``: True if driver wants the TG4 component encoded in sampler swizzle rather than as a separate source.
 * ``pipe_caps.flatshade``: Driver supports pipe_rasterizer_state::flatshade.  Must be 1
-    for non-NIR drivers or gallium nine.
+    for non-NIR drivers.
 * ``pipe_caps.alpha_test``: Driver supports alpha-testing.  Must be 1
-    for non-NIR drivers or gallium nine.  If set, frontend may set
+    for non-NIR drivers.  If set, frontend may set
     ``pipe_depth_stencil_alpha_state->alpha_enabled`` and ``alpha_func``.
     Otherwise, alpha test will be lowered to a comparison and discard_if in the
     fragment shader.
@@ -593,7 +595,11 @@ Capability about the features and limits of the driver/GPU.
     that back-facing primitives should use the back-side color as the FS input
     color.  If unset, mesa/st will lower it to gl_FrontFacing reads in the
     fragment shader.
-* ``pipe_caps.clip_planes``: Driver supports user-defined clip-planes. 0 denotes none, 1 denotes MAX_CLIP_PLANES. > 1 overrides MAX. When is 0, pipe_rasterizer_state::clip_plane_enable is unused.
+* ``pipe_caps.clip_planes``: Driver supports user-defined clip-planes. 0 denotes
+    none, 1 denotes MAX_CLIP_PLANES. > 1 overrides MAX. When is 0,
+    ``set_clip_state()`` will never be called.  Instead, user clip planes are
+    lowered to clip distance writes to CLIP_DIST[] corresponding to
+    pipe_rasterizer_state::clip_plane_enable bits.
 * ``pipe_caps.max_vertex_buffers``: Number of supported vertex buffers.
 * ``pipe_caps.opencl_integer_functions``: Driver supports extended OpenCL-style integer functions.  This includes average, saturating addition, saturating subtraction, absolute difference, count leading zeros, and count trailing zeros.
 * ``pipe_caps.integer_multiply_32x16``: Driver supports integer multiplication between a 32-bit integer and a 16-bit integer.  If the second operand is 32-bits, the upper 16-bits are ignored, and the low 16-bits are possibly sign extended as necessary.
@@ -639,7 +645,7 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.validate_all_dirty_states`` : Whether state validation must also validate the state changes for resources types used in the previous shader but not in the current shader.
 * ``pipe_caps.has_const_bw``: Whether the driver only supports non-data-dependent layouts (ie. not bandwidth compressed formats like AFBC, UBWC, etc), or supports ``PIPE_BIND_CONST_BW`` to disable data-dependent layouts on requested resources.
 * ``pipe_caps.performance_monitor``: Whether GL_AMD_performance_monitor should be exposed.
-* ``pipe_caps.texture_sampler_independent``: Whether sampler views and sampler states are independent objects, meaning both can be freely mixed and matched by the frontend. This isn't required for OpenGL where on the shader level those are the same object. However for proper gallium nine and OpenCL support this is required.
+* ``pipe_caps.texture_sampler_independent``: Whether sampler views and sampler states are independent objects, meaning both can be freely mixed and matched by the frontend. This isn't required for OpenGL where on the shader level those are the same object. However for proper OpenCL support this is required.
 * ``pipe_caps.astc_decode_mode``: Whether the driver supports ASTC decode precision. The :ext:`GL_EXT_texture_compression_astc_decode_mode` extension will only get exposed if :ext:`GL_KHR_texture_compression_astc_ldr<GL_KHR_texture_compression_astc_hdr>` is also supported.
 * ``pipe_caps.shader_subgroup_size``: A fixed subgroup size shader runs on GPU when GLSL GL_KHR_shader_subgroup_* extensions are enabled.
 * ``pipe_caps.shader_subgroup_supported_stages``: Bitmask of shader stages which support GL_KHR_shader_subgroup_* intrinsics.
@@ -647,6 +653,7 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.shader_subgroup_quad_all_stages``: Whether shader subgroup quad operations are supported by shader stages other than fragment shader.
 * ``pipe_caps.multiview``: Whether multiview rendering of array textures is supported. A return of ``1`` indicates support for OVR_multiview, and ``2`` additionally supports OVR_multiview2. 
 * ``pipe_caps.call_finalize_nir_in_linker``: Whether ``pipe_screen::finalize_nir`` can be called in the GLSL linker before the NIR is stored in the shader cache. It's always called again after st/mesa adds code for shader variants. It must be 1 if the driver wants to report compile failures to the GLSL linker. It must be 0 if two consecutive ``finalize_nir`` calls on the same shader can break it, or if ``finalize_nir`` can't handle NIR that isn't fully lowered for the driver, or if ``finalize_nir`` breaks passes that st/mesa runs after it. Setting it to 1 is generally safe for drivers that expose nir_io_has_intrinsics and that don't enable any optional shader variants in st/mesa. Since it's difficult to support, any future refactoring can change it to 0.
+* ``pipe_caps.representative_fragment_test``: Support for GL_NV_representative_fragment_test.
 * ``pipe_caps.min_line_width``: The minimum width of a regular line.
 * ``pipe_caps.min_line_width_aa``: The minimum width of a smoothed line.
 * ``pipe_caps.max_line_width``: The maximum width of a regular line.
@@ -811,6 +818,9 @@ resources might be created and handled quite differently.
   pipe_screen::flush_front_buffer must have this flag set.
 * ``PIPE_BIND_SAMPLER_VIEW``: A texture that may be sampled from in a fragment
   or vertex shader.
+* ``PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL``: A hint to go along with ``PIPE_BIND_SAMPLER_VIEW``
+  that we'd like to use a particular format (ie. for zero-copy import) even if
+  it is not optimal from a hw standpoint.
 * ``PIPE_BIND_VERTEX_BUFFER``: A vertex buffer.
 * ``PIPE_BIND_INDEX_BUFFER``: An vertex index/element buffer.
 * ``PIPE_BIND_CONSTANT_BUFFER``: A buffer of shader constants.
@@ -999,7 +1009,11 @@ resource_destroy
 
 Destroy a resource. A resource is destroyed if it has no more references.
 
+resource_get_address
+^^^^^^^^^^^^^^^^^^^^
 
+Returns the address of **resource** created with
+``PIPE_RESOURCE_FLAG_FIXED_ADDRESS``.
 
 get_timestamp
 ^^^^^^^^^^^^^

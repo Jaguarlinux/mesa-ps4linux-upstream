@@ -29,12 +29,15 @@
 #ifndef LP_BLD_INIT_H
 #define LP_BLD_INIT_H
 
+#include <stdbool.h>
 
-#include "util/compiler.h"
 #include "util/u_pointer.h" // for func_pointer
+
+#if DETECT_ARCH_PPC_64
 #include "util/u_cpu_detect.h"
-#include "lp_bld.h"
-#include "lp_bld_passmgr.h"
+#endif
+
+#include <llvm-c/Core.h>
 
 #if GALLIVM_USE_ORCJIT
 #include <llvm-c/Orc.h>
@@ -47,6 +50,9 @@ extern "C" {
 #endif
 
 struct lp_cached_code;
+struct lp_jit_texture;
+struct lp_context_ref;
+
 struct gallivm_state
 {
    char *module_name;
@@ -82,6 +88,7 @@ struct gallivm_state
    LLVMValueRef get_time_hook;
 
    LLVMValueRef texture_descriptor;
+   struct lp_jit_texture *texture_dynamic_state;
    LLVMValueRef sampler_descriptor;
 };
 
@@ -93,7 +100,7 @@ lp_build_init(void);
 
 
 struct gallivm_state *
-gallivm_create(const char *name, lp_context_ref *context,
+gallivm_create(const char *name, struct lp_context_ref *context,
                struct lp_cached_code *cache);
 
 void

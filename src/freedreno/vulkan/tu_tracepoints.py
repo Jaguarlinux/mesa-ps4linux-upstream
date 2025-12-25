@@ -26,6 +26,7 @@ from u_trace import utrace_generate_perfetto_utils
 
 Header('vk_enum_to_str.h', scope=HeaderScope.SOURCE|HeaderScope.PERFETTO)
 Header('vk_format.h')
+Header('util/sha1/sha1.h')
 Header('tu_cmd_buffer.h', scope=HeaderScope.SOURCE)
 Header('tu_device.h', scope=HeaderScope.SOURCE)
 Header('common/freedreno_lrz.h')
@@ -37,6 +38,7 @@ ForwardDecl('struct tu_cmd_buffer')
 ForwardDecl('struct tu_device')
 ForwardDecl('struct tu_framebuffer')
 ForwardDecl('struct tu_tiling_config')
+ForwardDecl('typedef char tu_sha1_str[SHA1_DIGEST_STRING_LENGTH]')
 
 # List of the default tracepoints enabled. By default tracepoints are enabled,
 # set tp_default_enabled=False to disable them by default.
@@ -80,8 +82,10 @@ def begin_end_tp(name, args=[], tp_struct=None, tp_print=None,
 begin_end_tp('cmd_buffer',
     args=[Arg(type='str',                       var='TUdebugFlags', c_format='%s', length_arg='96', copy_func='strncpy'),
           Arg(type='str',                       var='IR3debugFlags', c_format='%s', length_arg='96', copy_func='strncpy')],
-    tp_struct=[Arg(type='const char *',         name='appName',              var='cmd->device->instance->vk.app_info.app_name', c_format='%s'),
-               Arg(type='const char *',         name='engineName',           var='cmd->device->instance->vk.app_info.engine_name', c_format='%s')],
+    tp_struct=[Arg(type='const char *',         name='appName',              var='cmd->device->instance->vk.app_info.app_name ? cmd->device->instance->vk.app_info.app_name : "Unknown"', c_format='%s'),
+               Arg(type='const char *',         name='engineName',           var='cmd->device->instance->vk.app_info.engine_name ? cmd->device->instance->vk.app_info.engine_name : "Unknown"', c_format='%s'),
+               Arg(type='uint8_t',              name='oneTimeSubmit',        var='(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)', c_format='%u'),
+               Arg(type='uint8_t',              name='simultaneousUse',      var='(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)', c_format='%u')],
     end_args=[ArgStruct(type='const struct tu_cmd_buffer *', var='cmd')],
     end_tp_struct=[Arg(type='uint32_t',         name='renderpasses',         var='cmd->state.total_renderpasses', c_format='%u'),
                    Arg(type='uint32_t',         name='dispatches',           var='cmd->state.total_dispatches', c_format='%u')])
@@ -98,7 +102,8 @@ begin_end_tp('render_pass',
           Arg(type='uint8_t',  var='loadCPP',     c_format='%u'),
           Arg(type='uint8_t',  var='storeCPP',    c_format='%u'),
           Arg(type='bool',     var='hasDepth',    c_format='%s', to_prim_type='({} ? "true" : "false")'),
-          Arg(type='str',      var='ubwc',        c_format='%s', length_arg='11', copy_func='strncpy'),],
+          Arg(type='str',      var='ubwc',        c_format='%s', length_arg='11', copy_func='strncpy'),
+          Arg(type='const char *', var='cbDisableReason', c_format='%s'),],
     tp_struct=[Arg(type='uint16_t', name='width',               var='fb->width',                                            c_format='%u'),
                Arg(type='uint16_t', name='height',              var='fb->height',                                           c_format='%u'),
                Arg(type='uint8_t',  name='attachment_count',    var='fb->attachment_count',                                 c_format='%u'),
@@ -116,10 +121,25 @@ begin_end_tp('render_pass',
               Arg(type='int32_t',                               var='lrzWriteDisabledAtDraw',                               c_format='%d'),
               Arg(type='uint32_t',                              var='lrzStatus', c_format='%s', to_prim_type='(fd_lrz_gpu_dir_to_str((enum fd_lrz_gpu_dir)({} & 0xff)))', is_indirect=True),])
 
+begin_end_tp('draw',
+             [Arg(type='uint32_t', var='count', c_format='%u'),
+              Arg(type='tu_sha1_str', var='vs_sha1',  c_format='%s',
+                  copy_func='strcpy'),
+              Arg(type='tu_sha1_str', var='tcs_sha1',  c_format='%s',
+                  copy_func='strcpy'),
+              Arg(type='tu_sha1_str', var='tes_sha1',  c_format='%s',
+                  copy_func='strcpy'),
+              Arg(type='tu_sha1_str', var='gs_sha1',  c_format='%s',
+                  copy_func='strcpy'),
+              Arg(type='tu_sha1_str', var='fs_sha1',  c_format='%s',
+                  copy_func='strcpy'),
+              ], tp_default_enabled=False)
 
 begin_end_tp('binning_ib')
+begin_end_tp('concurrent_binning_ib')
 begin_end_tp('draw_ib_sysmem')
 begin_end_tp('draw_ib_gmem')
+begin_end_tp('concurrent_binning_barrier')
 
 begin_end_tp('generic_clear',
     args=[Arg(type='enum VkFormat',  var='format',  c_format='%s', to_prim_type='vk_format_description({})->short_name'),
@@ -151,6 +171,8 @@ begin_end_tp('gmem_store',
 begin_end_tp('sysmem_resolve',
     args=[Arg(type='enum VkFormat',  var='format',   c_format='%s', to_prim_type='vk_format_description({})->short_name')])
 
+begin_end_tp('custom_resolve')
+
 begin_end_tp('blit',
     # TODO: add source megapixels count and target megapixels count arguments
     args=[Arg(type='uint8_t',        var='uses_3d_blit', c_format='%u'),
@@ -166,10 +188,16 @@ begin_end_tp('compute',
           Arg(type='uint16_t', var='local_size_z',   c_format='%u'),
           Arg(type='uint16_t', var='num_groups_x',   c_format='%u'),
           Arg(type='uint16_t', var='num_groups_y',   c_format='%u'),
-          Arg(type='uint16_t', var='num_groups_z',   c_format='%u')])
+          Arg(type='uint16_t', var='num_groups_z',   c_format='%u'),
+          Arg(type='tu_sha1_str', var='cs_sha1',
+              c_format='%s', copy_func='strcpy'),
+          ])
 
 begin_end_tp('compute_indirect',
-             args=[Arg(type='uint8_t', var='unaligned', c_format='%u')],
+             args=[Arg(type='uint8_t', var='unaligned', c_format='%u'),
+                   Arg(type='tu_sha1_str', var='cs_sha1',
+                       c_format='%s', copy_func='strcpy'),
+                   ],
              end_args=[ArgStruct(type='VkDispatchIndirectCommand', var='size',
                                       is_indirect=True, c_format="%ux%ux%u",
                                       fields=['x', 'y', 'z'])])

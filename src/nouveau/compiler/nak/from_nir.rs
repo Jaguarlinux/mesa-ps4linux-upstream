@@ -47,7 +47,9 @@ fn init_info_from_nir(nak: &nak_compiler, nir: &nir_shader) -> ShaderInfo {
                     smem_size: nir.info.shared_size.try_into().unwrap(),
                 })
             }
-            MESA_SHADER_VERTEX => ShaderStageInfo::Vertex,
+            MESA_SHADER_VERTEX => ShaderStageInfo::Vertex(VertexShaderInfo {
+                isbe_space_sharing_enable: false,
+            }),
             MESA_SHADER_FRAGMENT => {
                 let info_fs = unsafe { &nir.info.__bindgen_anon_1.fs };
                 ShaderStageInfo::Fragment(FragmentShaderInfo {
@@ -316,7 +318,7 @@ enum SyncType {
 
 struct ShaderFromNir<'a> {
     nir: &'a nir_shader,
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
     info: ShaderInfo,
     float_ctl: ShaderFloatControls,
     cfg: CFGBuilder<u32, BasicBlock, FxBuildHasher>,
@@ -336,7 +338,7 @@ impl<'a> ShaderFromNir<'a> {
     fn new(
         nak: &nak_compiler,
         nir: &'a nir_shader,
-        sm: &'a dyn ShaderModel,
+        sm: &'a ShaderModelInfo,
     ) -> Self {
         Self {
             nir: nir,
@@ -752,22 +754,33 @@ impl<'a> ShaderFromNir<'a> {
             }
             nir_op_bitfield_reverse => b.brev(srcs(0)).into(),
             nir_op_ibitfield_extract | nir_op_ubitfield_extract => {
-                let range = b.alloc_ssa(RegFile::GPR);
-                b.push_op(OpPrmt {
-                    dst: range.into(),
-                    srcs: [srcs(1), srcs(2)],
-                    sel: 0x0040.into(),
-                    mode: PrmtMode::Index,
-                });
-
                 let dst = b.alloc_ssa(RegFile::GPR);
-                b.push_op(OpBfe {
-                    dst: dst.into(),
-                    base: srcs(0),
-                    signed: !matches!(alu.op, nir_op_ubitfield_extract),
-                    range: range.into(),
-                    reverse: false,
-                });
+                let signed = !matches!(alu.op, nir_op_ubitfield_extract);
+                if self.sm.sm() >= 70 {
+                    let shifted = b.shr(srcs(0), srcs(1), signed);
+                    b.push_op(OpSgxt {
+                        dst: dst.into(),
+                        a: shifted.into(),
+                        bits: srcs(2),
+                        signed,
+                    });
+                } else {
+                    let range = b.alloc_ssa(RegFile::GPR);
+                    b.push_op(OpPrmt {
+                        dst: range.into(),
+                        srcs: [srcs(1), srcs(2)],
+                        sel: 0x0040.into(),
+                        mode: PrmtMode::Index,
+                    });
+
+                    b.push_op(OpBfe {
+                        dst: dst.into(),
+                        base: srcs(0),
+                        signed,
+                        range: range.into(),
+                        reverse: false,
+                    });
+                };
                 dst.into()
             }
             nir_op_extract_u8 | nir_op_extract_i8 | nir_op_extract_u16
@@ -1355,7 +1368,7 @@ impl<'a> ShaderFromNir<'a> {
                 let src = srcs(0).to_ssa();
                 if src_bits == 64 {
                     if dst_bits == 64 {
-                        src.into()
+                        src
                     } else {
                         b.prmt(src[0].into(), src[1].into(), prmt_lo).into()
                     }
@@ -1866,6 +1879,17 @@ impl<'a> ShaderFromNir<'a> {
                 nodep: flags.nodep(),
                 channel_mask,
             });
+        } else if tex.op == nir_texop_sample_pos_nv {
+            let src = self.get_src(&srcs[0].src);
+            assert!(fault.is_none());
+            b.push_op(OpTxq {
+                dsts: dsts,
+                tex: tex_ref,
+                src: src,
+                query: TexQuery::SamplerPos,
+                nodep: flags.nodep(),
+                channel_mask,
+            });
         } else {
             let lod_mode = match flags.lod_mode() {
                 NAK_NIR_LOD_MODE_AUTO => TexLodMode::Auto,
@@ -1876,6 +1900,17 @@ impl<'a> ShaderFromNir<'a> {
                 NAK_NIR_LOD_MODE_BIAS_CLAMP => TexLodMode::BiasClamp,
                 _ => panic!("Invalid LOD mode"),
             };
+
+            // Starting with Blackwell B, the shader stage check for derivatives
+            // is back to defaulting to disabled on compute and instead we have
+            // a new derivative mode to re-enable it.  If tex_lod_mode == Zero,
+            // there is no implicit derivative so this doesn't matter.
+            let deriv_mode =
+                if self.sm.sm() >= 120 && lod_mode != TexLodMode::Zero {
+                    TexDerivMode::DerivXY
+                } else {
+                    TexDerivMode::Auto
+                };
 
             let offset_mode = match flags.offset_mode() {
                 NAK_NIR_OFFSET_MODE_NONE => TexOffsetMode::None,
@@ -1908,12 +1943,14 @@ impl<'a> ShaderFromNir<'a> {
                     channel_mask,
                 });
             } else if tex.op == nir_texop_lod {
+                assert!(lod_mode == TexLodMode::Auto);
                 assert!(offset_mode == TexOffsetMode::None);
                 b.push_op(OpTmml {
                     dsts: dsts,
                     tex: tex_ref,
                     srcs: srcs,
                     dim: dim,
+                    deriv_mode,
                     nodep: flags.nodep(),
                     channel_mask,
                 });
@@ -1955,6 +1992,7 @@ impl<'a> ShaderFromNir<'a> {
                     srcs: srcs,
                     dim: dim,
                     lod_mode: lod_mode,
+                    deriv_mode,
                     z_cmpr: flags.has_z_cmpr(),
                     offset_mode,
                     mem_eviction_priority: MemEvictionPriority::Normal,
@@ -1980,12 +2018,6 @@ impl<'a> ShaderFromNir<'a> {
             }
         }
 
-        if self.sm.sm() < 50 {
-            // TODO: texbar should be created by calc_instr_deps() and
-            // should be less conservative than textures_left=0.
-            // See the old pass: NVC0LegalizePostRA::insertTextureBarriers
-            b.push_op(OpTexDepBar { textures_left: 0 });
-        }
         self.set_ssa(tex.def.as_def(), nir_dst);
     }
 
@@ -2328,6 +2360,14 @@ impl<'a> ShaderFromNir<'a> {
                         op: ShflOp::Bfly,
                     });
 
+                    // Starting with Blackwell, the shader stage now affects
+                    // fswzadd so we need to use fswzadd.ndv
+                    let deriv_mode = if self.sm.sm() >= 100 {
+                        TexDerivMode::NonDivergent
+                    } else {
+                        TexDerivMode::Auto
+                    };
+
                     b.push_op(OpFSwzAdd {
                         dst: dst.into(),
                         srcs: [scratch.into(), self.get_src(&srcs[0])],
@@ -2339,6 +2379,7 @@ impl<'a> ShaderFromNir<'a> {
                         ],
                         rnd_mode: self.float_ctl[ftype].rnd_mode,
                         ftz: self.float_ctl[ftype].ftz,
+                        deriv_mode,
                     });
                 } else {
                     b.push_op(OpFSwz {
@@ -2352,6 +2393,7 @@ impl<'a> ShaderFromNir<'a> {
                         ],
                         rnd_mode: self.float_ctl[ftype].rnd_mode,
                         ftz: self.float_ctl[ftype].ftz,
+                        deriv_mode: TexDerivMode::Auto,
                         shuffle: FSwzShuffle::SwapHorizontal,
                     });
                 }
@@ -2379,6 +2421,14 @@ impl<'a> ShaderFromNir<'a> {
                         op: ShflOp::Bfly,
                     });
 
+                    // Starting with Blackwell, the shader stage now affects
+                    // fswzadd so we need to use fswzadd.ndv
+                    let deriv_mode = if self.sm.sm() >= 100 {
+                        TexDerivMode::NonDivergent
+                    } else {
+                        TexDerivMode::Auto
+                    };
+
                     b.push_op(OpFSwzAdd {
                         dst: dst.into(),
                         srcs: [scratch.into(), self.get_src(&srcs[0])],
@@ -2390,6 +2440,7 @@ impl<'a> ShaderFromNir<'a> {
                         ],
                         rnd_mode: self.float_ctl[ftype].rnd_mode,
                         ftz: self.float_ctl[ftype].ftz,
+                        deriv_mode,
                     });
                 } else {
                     b.push_op(OpFSwz {
@@ -2403,6 +2454,7 @@ impl<'a> ShaderFromNir<'a> {
                         ],
                         rnd_mode: self.float_ctl[ftype].rnd_mode,
                         ftz: self.float_ctl[ftype].ftz,
+                        deriv_mode: TexDerivMode::Auto,
                         shuffle: FSwzShuffle::SwapVertical,
                     });
                 }
@@ -2534,35 +2586,185 @@ impl<'a> ShaderFromNir<'a> {
                 });
                 self.set_dst(&intrin.def, dst);
             }
-            nir_intrinsic_bindless_image_load
-            | nir_intrinsic_bindless_image_load_raw_nv => {
+            nir_intrinsic_suclamp_nv => {
+                let coords = self.get_src(&srcs[0]);
+                let params = self.get_src(&srcs[1]);
+
+                let flags = intrin.flags();
+                let flags: nak_nir_suclamp_flags =
+                    unsafe { std::mem::transmute_copy(&flags) };
+
+                let mode = match flags.mode() {
+                    NAK_SUCLAMP_MODE_BLOCK_LINEAR => SuClampMode::BlockLinear,
+                    NAK_SUCLAMP_MODE_PITCH_LINEAR => SuClampMode::PitchLinear,
+                    NAK_SUCLAMP_MODE_STORED_DESCRIPTOR => {
+                        SuClampMode::StoredInDescriptor
+                    }
+                    _ => panic!("Invalid suclamp mode"),
+                };
+
+                let round = match flags.round() {
+                    NAK_SUCLAMP_ROUND_R1 => SuClampRound::R1,
+                    NAK_SUCLAMP_ROUND_R2 => SuClampRound::R2,
+                    NAK_SUCLAMP_ROUND_R4 => SuClampRound::R4,
+                    NAK_SUCLAMP_ROUND_R8 => SuClampRound::R8,
+                    NAK_SUCLAMP_ROUND_R16 => SuClampRound::R16,
+                    _ => panic!("Invalid suclamp round"),
+                };
+
+                let dst = b.alloc_ssa(RegFile::GPR);
+                let out_of_bounds = b.alloc_ssa(RegFile::Pred);
+                b.push_op(OpSuClamp {
+                    dst: dst.into(),
+                    out_of_bounds: out_of_bounds.into(),
+                    coords,
+                    params,
+                    mode,
+                    round,
+                    is_2d: flags.is_2d(),
+                    is_s32: flags.is_s32(),
+                    imm: 0,
+                });
+                let final_dst =
+                    vec![dst, b.sel(out_of_bounds.into(), 1.into(), 0.into())];
+
+                self.set_ssa(&intrin.def, final_dst);
+            }
+            nir_intrinsic_subfm_nv => {
+                let x = self.get_src(&srcs[0]);
+                let y = self.get_src(&srcs[1]);
+                let z = self.get_src(&srcs[2]);
+                let is_3d = intrin.flags() != 0;
+
+                let dst = b.alloc_ssa(RegFile::GPR);
+                let out_of_bounds = b.alloc_ssa(RegFile::Pred);
+                b.push_op(OpSuBfm {
+                    dst: dst.into(),
+                    pdst: out_of_bounds.into(),
+                    srcs: [x, y, z],
+                    is_3d,
+                });
+                let final_dst =
+                    vec![dst, b.sel(out_of_bounds.into(), 1.into(), 0.into())];
+
+                self.set_ssa(&intrin.def, final_dst);
+            }
+            nir_intrinsic_sueau_nv => {
+                let off = self.get_src(&srcs[0]);
+                let bit_field = self.get_src(&srcs[1]);
+                let addr = self.get_src(&srcs[2]);
+
+                let dst = b.alloc_ssa(RegFile::GPR);
+                b.push_op(OpSuEau {
+                    dst: dst.into(),
+                    off,
+                    bit_field,
+                    addr,
+                });
+                self.set_dst(&intrin.def, dst.into());
+            }
+            nir_intrinsic_imadsp_nv => {
+                let src0 = self.get_src(&srcs[0]);
+                let src1 = self.get_src(&srcs[1]);
+                let src2 = self.get_src(&srcs[2]);
+
+                let flags = intrin.flags();
+                let flags: nak_nir_imadsp_flags =
+                    unsafe { std::mem::transmute_copy(&flags) };
+
+                let translate_src_type = |s| {
+                    use IMadSpSrcType::*;
+                    match s {
+                        NAK_IMAD_TYPE_U32 => U32,
+                        NAK_IMAD_TYPE_U24 => U24,
+                        NAK_IMAD_TYPE_U16_LO => U16Lo,
+                        NAK_IMAD_TYPE_U16_HI => U16Hi,
+                        NAK_IMAD_TYPE_S32 => S32,
+                        NAK_IMAD_TYPE_S24 => S24,
+                        NAK_IMAD_TYPE_S16_LO => S16Lo,
+                        NAK_IMAD_TYPE_S16_HI => S16Hi,
+                        _ => panic!("Invalid imadsp mode"),
+                    }
+                };
+
+                let mode = if flags.params_from_src1() {
+                    IMadSpMode::FromSrc1
+                } else {
+                    IMadSpMode::Explicit([
+                        translate_src_type(flags.src0()),
+                        translate_src_type(flags.src1()),
+                        translate_src_type(flags.src2()),
+                    ])
+                };
+
+                let dst = b.alloc_ssa(RegFile::GPR);
+                b.push_op(OpIMadSp {
+                    srcs: [src0, src1, src2],
+                    dst: dst.into(),
+                    mode,
+                });
+                self.set_dst(&intrin.def, dst.into());
+            }
+            nir_intrinsic_suldga_nv => {
+                let addr = self.get_src(&srcs[0]);
+                let format = self.get_src(&srcs[1]);
+                let out_of_bounds = self.get_src(&srcs[2]);
+
+                let comps = intrin.num_components;
+
+                assert!(intrin.def.bit_size() == 32);
+                let mem_type = self.get_image_mem_type(intrin);
+
+                let flags = intrin.flags();
+                let offset_mode = match flags {
+                    NAK_SUGA_OFF_MODE_U32 => SuGaOffsetMode::U32,
+                    NAK_SUGA_OFF_MODE_S32 => SuGaOffsetMode::S32,
+                    NAK_SUGA_OFF_MODE_U8 => SuGaOffsetMode::U8,
+                    NAK_SUGA_OFF_MODE_S8 => SuGaOffsetMode::S8,
+                    _ => panic!("Invalid suldga flags"),
+                };
+
+                let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
+                    MemOrder::Constant
+                } else {
+                    MemOrder::Strong(MemScope::GPU)
+                };
+                let cache_op = LdCacheOp::select(
+                    self.sm,
+                    MemSpace::Global(MemAddrType::A64),
+                    mem_order,
+                    self.get_eviction_priority(intrin.access()),
+                );
+
+                let dst = b.alloc_ssa_vec(RegFile::GPR, comps);
+                b.push_op(OpSuLdGa {
+                    dst: dst.clone().into(),
+                    addr,
+                    format,
+                    out_of_bounds,
+                    mem_type,
+                    offset_mode,
+                    cache_op,
+                });
+                self.set_dst(&intrin.def, dst);
+            }
+            nir_intrinsic_bindless_image_load => {
                 let handle = self.get_src(&srcs[0]);
                 let dim = self.get_image_dim(intrin);
                 let coord = self.get_image_coord(intrin, dim);
                 // let sample = self.get_src(&srcs[2]);
 
                 let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
-                    if self.sm.sm() >= 80 {
-                        MemOrder::Constant
-                    } else {
-                        MemOrder::Weak
-                    }
+                    MemOrder::Constant
                 } else {
                     MemOrder::Strong(MemScope::GPU)
                 };
 
                 let comps = intrin.num_components;
                 assert!(intrin.def.bit_size() == 32);
-                let image_access = if intrin.intrinsic
-                    == nir_intrinsic_bindless_image_load_raw_nv
-                {
-                    let mem_type = self.get_image_mem_type(intrin);
-                    assert!(mem_type.bits().div_ceil(32) == comps.into());
-                    ImageAccess::Binary(mem_type)
-                } else {
-                    assert!(comps == 1 || comps == 2 || comps == 4);
-                    ImageAccess::Formatted(ChannelMask::for_comps(comps))
-                };
+                assert!(comps == 1 || comps == 2 || comps == 4);
+                let image_access =
+                    ImageAccess::Formatted(ChannelMask::for_comps(comps));
 
                 let dst = b.alloc_ssa_vec(RegFile::GPR, comps);
 
@@ -2586,11 +2788,7 @@ impl<'a> ShaderFromNir<'a> {
                 // let sample = self.get_src(&srcs[2]);
 
                 let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
-                    if self.sm.sm() >= 80 {
-                        MemOrder::Constant
-                    } else {
-                        MemOrder::Weak
-                    }
+                    MemOrder::Constant
                 } else {
                     MemOrder::Strong(MemScope::GPU)
                 };
@@ -2624,6 +2822,41 @@ impl<'a> ShaderFromNir<'a> {
 
                 self.set_ssa(&intrin.def, final_dst);
             }
+            nir_intrinsic_sustga_nv => {
+                let addr = self.get_src(&srcs[0]);
+                let format = self.get_src(&srcs[1]);
+                let out_of_bounds = self.get_src(&srcs[2]);
+
+                let data = self.get_src(&srcs[3]);
+                let image_access =
+                    ImageAccess::Formatted(ChannelMask::new(0xf));
+
+                let flags = intrin.flags();
+                let offset_mode = match flags {
+                    NAK_SUGA_OFF_MODE_U32 => SuGaOffsetMode::U32,
+                    NAK_SUGA_OFF_MODE_S32 => SuGaOffsetMode::S32,
+                    NAK_SUGA_OFF_MODE_U8 => SuGaOffsetMode::U8,
+                    NAK_SUGA_OFF_MODE_S8 => SuGaOffsetMode::S8,
+                    _ => panic!("Invalid sustga flags"),
+                };
+
+                let cache_op = StCacheOp::select(
+                    self.sm,
+                    MemSpace::Global(MemAddrType::A64),
+                    MemOrder::Strong(MemScope::GPU),
+                    self.get_eviction_priority(intrin.access()),
+                );
+
+                b.push_op(OpSuStGa {
+                    addr,
+                    format,
+                    data,
+                    out_of_bounds,
+                    image_access,
+                    offset_mode,
+                    cache_op,
+                });
+            }
             nir_intrinsic_bindless_image_store => {
                 let handle = self.get_src(&srcs[0]);
                 let dim = self.get_image_dim(intrin);
@@ -2656,14 +2889,14 @@ impl<'a> ShaderFromNir<'a> {
                 };
 
                 for i in 0..32 {
-                    if !self.fs_out_regs[i].is_none() {
+                    if self.fs_out_regs[i].is_some() {
                         info.writes_color |= 1 << i;
                     }
                 }
                 let mask_idx = (NAK_FS_OUT_SAMPLE_MASK / 4) as usize;
-                info.writes_sample_mask = !self.fs_out_regs[mask_idx].is_none();
+                info.writes_sample_mask = self.fs_out_regs[mask_idx].is_some();
                 let depth_idx = (NAK_FS_OUT_DEPTH / 4) as usize;
-                info.writes_depth = !self.fs_out_regs[depth_idx].is_none();
+                info.writes_depth = self.fs_out_regs[depth_idx].is_some();
 
                 let mut srcs = Vec::new();
                 for i in 0..8 {
@@ -3008,6 +3241,31 @@ impl<'a> ShaderFromNir<'a> {
                 });
                 self.set_dst(&intrin.def, dst);
             }
+            nir_intrinsic_load_shared_lock_nv => {
+                let size_B = intrin.def.bit_size() / 8;
+                let mem_type = MemType::from_size(size_B, false);
+
+                let (addr, offset) = self.get_io_addr_offset(&srcs[0], 24);
+                let dst = b.alloc_ssa_vec(RegFile::GPR, size_B.div_ceil(4));
+                let locked = b.alloc_ssa(RegFile::Pred);
+
+                b.push_op(OpLdSharedLock {
+                    dst: dst.clone().into(),
+                    locked: locked.into(),
+                    addr,
+                    offset,
+                    mem_type,
+                });
+                let locked_gpr = b.sel(locked.into(), 1.into(), 0.into());
+
+                // for 32-bit we have 2x32 return type,
+                // for 64-bit we need 2x64, so is_locked must be a 64-bit val.
+                // we can fill the remaining SSAValue with a copy of is_locked
+                let locked_dst = std::iter::repeat_n(locked_gpr, dst.len());
+                let nir_dst: Vec<_> =
+                    dst.iter().copied().chain(locked_dst).collect();
+                self.set_ssa(intrin.def.as_def(), nir_dst);
+            }
             nir_intrinsic_load_sysval_nv => {
                 let idx = u8::try_from(intrin.base()).unwrap();
                 debug_assert!(intrin.def.num_components == 1);
@@ -3098,7 +3356,7 @@ impl<'a> ShaderFromNir<'a> {
                 let (off, off_imm) = self.get_cbuf_addr_offset(&srcs[1]);
 
                 let cb = CBufRef {
-                    buf: CBuf::BindlessSSA(handle),
+                    buf: CBuf::BindlessSSA(handle[..].try_into().unwrap()),
                     offset: off_imm,
                 };
 
@@ -3168,9 +3426,21 @@ impl<'a> ShaderFromNir<'a> {
                 if intrin.memory_scope() != SCOPE_NONE {
                     let mem_scope = match intrin.memory_scope() {
                         SCOPE_INVOCATION | SCOPE_SUBGROUP => MemScope::CTA,
-                        SCOPE_WORKGROUP | SCOPE_QUEUE_FAMILY | SCOPE_DEVICE => {
-                            MemScope::GPU
+                        // A membar.gpu is very expensive so use .cta whenever
+                        // possible.
+                        // TODO: Figure out under which conditions we can relax
+                        //       them for global memory/images to CTA.
+                        SCOPE_WORKGROUP => {
+                            let global_modes = nir_var_image
+                                | nir_var_mem_global
+                                | nir_var_mem_ssbo;
+                            if intrin.memory_modes() & global_modes != 0 {
+                                MemScope::GPU
+                            } else {
+                                MemScope::CTA
+                            }
                         }
+                        SCOPE_QUEUE_FAMILY | SCOPE_DEVICE => MemScope::GPU,
                         _ => panic!("Unhandled memory scope"),
                     };
                     b.push_op(OpMemBar { scope: mem_scope });
@@ -3242,6 +3512,31 @@ impl<'a> ShaderFromNir<'a> {
                     },
                     c: 0x1c_03.into(),
                     op: ShflOp::Bfly,
+                });
+                self.set_dst(&intrin.def, dst.into());
+            }
+            nir_intrinsic_reduce => {
+                assert!(srcs[0].bit_size() == 32);
+                assert!(srcs[0].num_components() == 1);
+                let src = self.get_src(&srcs[0]);
+                let dst = b.alloc_ssa(RegFile::UGPR);
+
+                let op = match intrin.reduction_op() {
+                    nir_op_iand => ReduxOp::And,
+                    nir_op_ior => ReduxOp::Or,
+                    nir_op_ixor => ReduxOp::Xor,
+                    nir_op_iadd => ReduxOp::Sum,
+                    nir_op_imin => ReduxOp::Min(IntCmpType::I32),
+                    nir_op_imax => ReduxOp::Max(IntCmpType::I32),
+                    nir_op_umin => ReduxOp::Min(IntCmpType::U32),
+                    nir_op_umax => ReduxOp::Max(IntCmpType::U32),
+                    _ => panic!("Unknown reduction op"),
+                };
+
+                b.push_op(OpRedux {
+                    dst: dst.into(),
+                    src: src,
+                    op,
                 });
                 self.set_dst(&intrin.def, dst.into());
             }
@@ -3370,6 +3665,25 @@ impl<'a> ShaderFromNir<'a> {
                     access: access,
                 });
             }
+            nir_intrinsic_store_shared_unlock_nv => {
+                let data = self.get_src(&srcs[0]);
+                let size_B =
+                    (srcs[0].bit_size() / 8) * srcs[0].num_components();
+                let mem_type = MemType::from_size(size_B, false);
+
+                let (addr, offset) = self.get_io_addr_offset(&srcs[1], 24);
+                let locked = b.alloc_ssa(RegFile::Pred);
+
+                b.push_op(OpStSCheckUnlock {
+                    locked: locked.into(),
+                    addr,
+                    data,
+                    offset,
+                    mem_type,
+                });
+                let locked_gpr = b.sel(locked.into(), 1.into(), 0.into());
+                self.set_dst(intrin.def.as_def(), locked_gpr.into());
+            }
             nir_intrinsic_emit_vertex_nv | nir_intrinsic_end_primitive_nv => {
                 assert!(intrin.def.bit_size() == 32);
                 assert!(intrin.def.num_components() == 1);
@@ -3405,29 +3719,145 @@ impl<'a> ShaderFromNir<'a> {
             nir_intrinsic_vote_all
             | nir_intrinsic_vote_any
             | nir_intrinsic_vote_ieq => {
-                assert!(srcs[0].bit_size() == 1);
                 let src = self.get_src(&srcs[0]);
+                let src_bits = srcs[0].bit_size() * srcs[0].num_components();
 
                 assert!(intrin.def.bit_size() == 1);
                 let dst = b.alloc_ssa(RegFile::Pred);
 
-                b.push_op(OpVote {
-                    op: match intrin.intrinsic {
-                        nir_intrinsic_vote_all => VoteOp::All,
-                        nir_intrinsic_vote_any => VoteOp::Any,
-                        nir_intrinsic_vote_ieq => VoteOp::Eq,
-                        _ => panic!("Unknown vote intrinsic"),
-                    },
-                    ballot: Dst::None,
-                    vote: dst.into(),
-                    pred: src,
-                });
+                if src_bits == 1 {
+                    b.push_op(OpVote {
+                        op: match intrin.intrinsic {
+                            nir_intrinsic_vote_all => VoteOp::All,
+                            nir_intrinsic_vote_any => VoteOp::Any,
+                            nir_intrinsic_vote_ieq => VoteOp::Eq,
+                            _ => panic!("Unknown vote intrinsic"),
+                        },
+                        ballot: Dst::None,
+                        vote: dst.into(),
+                        pred: src,
+                    });
+                } else {
+                    assert_eq!(intrin.intrinsic, nir_intrinsic_vote_ieq);
+                    b.push_op(OpMatch {
+                        op: MatchOp::All,
+                        mask: Dst::None,
+                        pred: dst.into(),
+                        src,
+                        u64: match src_bits {
+                            32 => false,
+                            64 => true,
+                            _ => panic!("Unsupported vote_ieq bit size"),
+                        },
+                    });
+                }
                 self.set_dst(&intrin.def, dst.into());
             }
             nir_intrinsic_is_sparse_texels_resident => {
                 let src = self.get_src(&srcs[0]);
                 let dst = b.isetp(IntCmpType::I32, IntCmpOp::Ne, src, 0.into());
                 self.set_dst(&intrin.def, dst.into());
+            }
+            nir_intrinsic_cmat_load_shared_nv => {
+                let dst_bit_size = usize::from(intrin.def.bit_size());
+                let layout: glsl_matrix_layout = intrin.matrix_layout();
+                let mat_count = intrin.num_matrices();
+                let dst_num_components =
+                    usize::from(intrin.def.num_components());
+                let comps =
+                    (dst_bit_size * dst_num_components).div_ceil(32) as u8;
+                let mat_size = if layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR {
+                    LdsmSize::MT8N8
+                } else {
+                    LdsmSize::M8N8
+                };
+                let dst = b.alloc_ssa_vec(RegFile::GPR, comps);
+                let (addr, offset) = self.get_io_addr_offset(&srcs[0], 24);
+                let offset = offset + intrin.base();
+                b.push_op(OpLdsm {
+                    dst: dst.clone().into(),
+                    mat_size,
+                    mat_count,
+                    addr,
+                    offset,
+                });
+                self.set_dst(&intrin.def, dst);
+            }
+            nir_intrinsic_cmat_mov_transpose_nv => {
+                let dst = b.alloc_ssa(RegFile::GPR);
+                let src = self.get_src(&srcs[0]);
+                b.push_op(OpMovm {
+                    dst: dst.into(),
+                    src,
+                });
+                self.set_dst(&intrin.def, dst.into());
+            }
+            nir_intrinsic_cmat_muladd_nv => {
+                let flags: nak_nir_cmat_mul_add_flags =
+                    unsafe { std::mem::transmute(intrin.flags()) };
+                let cmat_a = self.get_src(&srcs[0]);
+                let cmat_b = self.get_src(&srcs[1]);
+                let cmat_c = self.get_src(&srcs[2]);
+                let dst_bit_size = intrin.def.bit_size();
+                let dst = b.alloc_ssa_vec(
+                    RegFile::GPR,
+                    (intrin.def.num_components() * intrin.def.bit_size)
+                        .div_ceil(32),
+                );
+                let dst_type = FloatType::from_bits(dst_bit_size.into());
+                match flags.cmat_type() {
+                    NAK_CMAT_TYPE_M16N8K8_FLOAT
+                    | NAK_CMAT_TYPE_M16N8K16_FLOAT => {
+                        let mat_size = match flags.cmat_type() {
+                            NAK_CMAT_TYPE_M16N8K8_FLOAT => HmmaSize::M16N8K8,
+                            NAK_CMAT_TYPE_M16N8K16_FLOAT => HmmaSize::M16N8K16,
+                            val => unreachable!("unsupported HMMA type: {val}"),
+                        };
+
+                        assert_eq!(flags.a_type(), GLSL_TYPE_FLOAT16);
+                        assert_eq!(flags.b_type(), GLSL_TYPE_FLOAT16);
+                        assert!(!flags.sat());
+                        b.push_op(OpHmma {
+                            dst: dst.clone().into(),
+                            dst_type: dst_type,
+                            src_type: FloatType::F16,
+                            mat_size: mat_size,
+                            srcs: [cmat_a, cmat_b, cmat_c],
+                        });
+                    }
+                    NAK_CMAT_TYPE_M8N8K16_INT
+                    | NAK_CMAT_TYPE_M16N8K16_INT
+                    | NAK_CMAT_TYPE_M16N8K32_INT => {
+                        let a_type = match flags.a_type() {
+                            GLSL_TYPE_UINT8 => IntType::U8,
+                            GLSL_TYPE_INT8 => IntType::I8,
+                            val => unreachable!("Invalid a_type: {val}"),
+                        };
+                        let b_type = match flags.b_type() {
+                            GLSL_TYPE_UINT8 => IntType::U8,
+                            GLSL_TYPE_INT8 => IntType::I8,
+                            val => unreachable!("Invalid b_type: {val}"),
+                        };
+
+                        let mat_size = match flags.cmat_type() {
+                            NAK_CMAT_TYPE_M8N8K16_INT => ImmaSize::M8N8K16,
+                            NAK_CMAT_TYPE_M16N8K16_INT => ImmaSize::M16N8K16,
+                            NAK_CMAT_TYPE_M16N8K32_INT => ImmaSize::M16N8K32,
+                            val => unreachable!("unsupported IMMA type: {val}"),
+                        };
+
+                        b.push_op(OpImma {
+                            dst: dst.clone().into(),
+                            mat_size,
+                            srcs: [cmat_a, cmat_b, cmat_c],
+                            src_types: [a_type, b_type],
+                            saturate: flags.sat(),
+                        });
+                    }
+                    val => unreachable!("Unknown cmat_type {val}"),
+                }
+
+                self.set_dst(&intrin.def, dst);
             }
             _ => panic!(
                 "Unsupported intrinsic instruction: {}",
@@ -3540,6 +3970,7 @@ impl<'a> ShaderFromNir<'a> {
                 None => {
                     b.push_op(OpBra {
                         target: target_label,
+                        cond: true.into(),
                     });
                 }
             }
@@ -3560,9 +3991,13 @@ impl<'a> ShaderFromNir<'a> {
             Op::Exit(OpExit {})
         } else {
             self.cfg.add_edge(nb.index, target.index);
-            Op::Bra(OpBra {
-                target: self.get_block_label(target),
-            })
+            Op::Bra(
+                OpBra {
+                    target: self.get_block_label(target),
+                    cond: true.into(),
+                }
+                .into(),
+            )
         };
         b.predicate(pred).push_op(op);
     }
@@ -3946,7 +4381,7 @@ impl<'a> ShaderFromNir<'a> {
 pub fn nak_shader_from_nir<'a>(
     nak: &nak_compiler,
     ns: &'a nir_shader,
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
 ) -> Shader<'a> {
     ShaderFromNir::new(nak, ns, sm).parse_shader()
 }

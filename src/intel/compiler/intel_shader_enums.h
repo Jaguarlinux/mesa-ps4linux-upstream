@@ -30,7 +30,61 @@ intel_sometimes_invert(enum intel_sometimes x)
    return (enum intel_sometimes)((int)INTEL_ALWAYS - (int)x);
 }
 
-#define INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_OFFSET (20)
+#define INTEL_TESS_CONFIG_INPUT_VERTICES_OFFSET   (0)
+#define INTEL_TESS_CONFIG_INPUT_VERTICES_SIZE     (5)
+#define INTEL_TESS_CONFIG_OUTPUT_VERTICES_OFFSET  (5)
+#define INTEL_TESS_CONFIG_OUTPUT_VERTICES_SIZE    (5)
+#define INTEL_TESS_CONFIG_BUILTINS_OFFSET         (10)
+#define INTEL_TESS_CONFIG_BUILTINS_SIZE           (6)
+#define INTEL_TESS_CONFIG_PER_VERTEX_SLOTS_OFFSET (16)
+#define INTEL_TESS_CONFIG_PER_VERTEX_SLOTS_SIZE   (6)
+#define INTEL_TESS_CONFIG_PER_PATCH_SLOTS_OFFSET  (22)
+#define INTEL_TESS_CONFIG_PER_PATCH_SLOTS_SIZE    (6)
+
+enum intel_tess_configs {
+   /** Tessellation inputs vertices minus 1
+    *
+    * This field actually covers 5bits.
+    */
+   INTEL_TESS_CONFIG_INPUT_VERTICES  = BITFIELD_BIT(INTEL_TESS_CONFIG_INPUT_VERTICES_OFFSET),
+
+   /** Tessellation outputs vertices minus 1
+    *
+    * This field actually covers 5bits.
+    */
+   INTEL_TESS_CONFIG_OUTPUT_VERTICES = BITFIELD_BIT(INTEL_TESS_CONFIG_OUTPUT_VERTICES_OFFSET),
+
+   /** Tessellation builtins per-vertex offset
+    *
+    * This field actually covers 5bits.
+    */
+   INTEL_TESS_CONFIG_BUILTINS      = BITFIELD_BIT(INTEL_TESS_CONFIG_BUILTINS_OFFSET),
+
+   /** Number of per vertex slots
+    *
+    * This field actually covers 6bits.
+    */
+   INTEL_TESS_PER_VERTEX_SLOTS     = BITFIELD_BIT(INTEL_TESS_CONFIG_PER_VERTEX_SLOTS_OFFSET),
+
+   /** Number of per patch slots
+    *
+    * This field actually covers 6bits.
+    */
+   INTEL_TESS_PER_PATCH_SLOTS      = BITFIELD_BIT(INTEL_TESS_CONFIG_PER_PATCH_SLOTS_OFFSET),
+
+   /** Tesselation primitive modes
+    *
+    * Only one of the following 3 bits should be set.
+    */
+   INTEL_TESS_CONFIG_QUADS           = BITFIELD_BIT(29),
+   INTEL_TESS_CONFIG_TRIANGLES       = BITFIELD_BIT(30),
+   INTEL_TESS_CONFIG_ISOLINES        = BITFIELD_BIT(31)
+};
+
+#define INTEL_MSAA_FLAG_FIRST_VUE_SLOT_OFFSET     (19)
+#define INTEL_MSAA_FLAG_FIRST_VUE_SLOT_SIZE       (6)
+#define INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_OFFSET (25)
+#define INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_SIZE   (6)
 #define INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_MESH   (32)
 
 enum intel_msaa_flags {
@@ -53,6 +107,12 @@ enum intel_msaa_flags {
    /** True if this shader has been dispatched with alpha-to-coverage */
    INTEL_MSAA_FLAG_ALPHA_TO_COVERAGE = (1 << 4),
 
+   /** True if provoking vertex is last */
+   INTEL_MSAA_FLAG_PROVOKING_VERTEX_LAST = (1 << 5),
+
+   /** True if we need to apply Wa_18019110168 remapping */
+   INTEL_MSAA_FLAG_PER_PRIMITIVE_REMAPPING = (1 << 6),
+
    /** True if this shader has been dispatched coarse
     *
     * This is intentionally chose to be bit 15 to correspond to the coarse bit
@@ -67,10 +127,16 @@ enum intel_msaa_flags {
     */
    INTEL_MSAA_FLAG_COARSE_RT_WRITES = (1 << 18),
 
+   /** First slot read in the VUE
+    *
+    * This is not a flag but a value that cover 6bits.
+    */
+   INTEL_MSAA_FLAG_FIRST_VUE_SLOT = (1 << INTEL_MSAA_FLAG_FIRST_VUE_SLOT_OFFSET),
+
    /** Index of the PrimitiveID attribute relative to the first read
     * attribute.
     *
-    * This is not a flag but a value that cover bits 20:31. Value 32 means the
+    * This is not a flag but a value that cover 6bits. Value 32 means the
     * PrimitiveID is coming from the PerPrimitive block, written by the Mesh
     * shader.
     */
@@ -246,7 +312,7 @@ struct intel_vue_map {
     * additional processing is applied before storing them in the VUE), the
     * value is -1.
     */
-   signed char varying_to_slot[VARYING_SLOT_TESS_MAX];
+   int8_t varying_to_slot[VARYING_SLOT_TESS_MAX];
 
    /**
     * Map from VUE slot to gl_varying_slot value.  For slots that do not
@@ -255,7 +321,7 @@ struct intel_vue_map {
     *
     * For slots that are not in use, the value is BRW_VARYING_SLOT_PAD.
     */
-   signed char slot_to_varying[VARYING_SLOT_TESS_MAX];
+   int8_t slot_to_varying[VARYING_SLOT_TESS_MAX];
 
    /**
     * Total number of VUE slots in use
@@ -279,6 +345,11 @@ struct intel_vue_map {
     * shader outputs and tessellation evaluation shader inputs.
     */
    int num_per_vertex_slots;
+
+   /**
+    * Location at which the builtins live.
+    */
+   int builtins_slot_offset;
 };
 
 struct intel_cs_dispatch_info {
@@ -298,6 +369,36 @@ enum intel_compute_walk_order {
    INTEL_WALK_ORDER_ZXY = 4,
    INTEL_WALK_ORDER_ZYX = 5,
 };
+
+static inline uint32_t
+intel_tess_config(uint32_t input_vertices,
+                  uint32_t output_vertices,
+                  enum intel_tess_domain tess_domain,
+                  uint32_t num_per_patch_slots,
+                  uint32_t num_per_vertex_slots,
+                  uint32_t builtins_slot_offset)
+{
+   assert(num_per_patch_slots < (1u << INTEL_TESS_CONFIG_PER_PATCH_SLOTS_SIZE));
+   assert(num_per_vertex_slots < (1u << INTEL_TESS_CONFIG_PER_VERTEX_SLOTS_SIZE));
+   assert(builtins_slot_offset < (1u << INTEL_TESS_CONFIG_BUILTINS_SIZE));
+   assert(input_vertices != 0);
+   assert((input_vertices - 1) < (1u << INTEL_TESS_CONFIG_INPUT_VERTICES_SIZE));
+   assert((output_vertices - 1) < (1u << INTEL_TESS_CONFIG_OUTPUT_VERTICES_SIZE));
+
+   const uint32_t primitive_flags =
+      tess_domain == INTEL_TESS_DOMAIN_TRI ? INTEL_TESS_CONFIG_TRIANGLES :
+      tess_domain == INTEL_TESS_DOMAIN_QUAD ? INTEL_TESS_CONFIG_QUADS :
+      INTEL_TESS_CONFIG_ISOLINES;
+
+   return
+      (((input_vertices - 1) & 0x1f) << INTEL_TESS_CONFIG_INPUT_VERTICES_OFFSET) |
+      (((output_vertices - 1) & 0x1f) << INTEL_TESS_CONFIG_OUTPUT_VERTICES_OFFSET) |
+      primitive_flags |
+      (num_per_patch_slots << INTEL_TESS_CONFIG_PER_PATCH_SLOTS_OFFSET) |
+      (num_per_vertex_slots << INTEL_TESS_CONFIG_PER_VERTEX_SLOTS_OFFSET) |
+      (builtins_slot_offset << INTEL_TESS_CONFIG_BUILTINS_OFFSET);
+
+}
 
 static inline bool
 intel_fs_is_persample(enum intel_sometimes shader_persample_dispatch,
@@ -436,7 +537,10 @@ struct intel_fs_params {
    uint32_t rasterization_samples;
    bool coarse_pixel;
    bool alpha_to_coverage;
+   bool provoking_vertex_last;
+   uint32_t first_vue_slot;
    uint32_t primitive_id_index;
+   bool per_primitive_remapping;
 };
 
 static inline enum intel_msaa_flags
@@ -468,11 +572,84 @@ intel_fs_msaa_flags(struct intel_fs_params params)
    if (params.alpha_to_coverage)
       fs_msaa_flags |= INTEL_MSAA_FLAG_ALPHA_TO_COVERAGE;
 
+   assert(params.first_vue_slot < (1 << INTEL_MSAA_FLAG_FIRST_VUE_SLOT_SIZE));
+   fs_msaa_flags |= (enum intel_msaa_flags)(
+      params.first_vue_slot << INTEL_MSAA_FLAG_FIRST_VUE_SLOT_OFFSET);
+
+   assert(params.primitive_id_index < (1u << INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_SIZE));
    fs_msaa_flags |= (enum intel_msaa_flags)(
       params.primitive_id_index << INTEL_MSAA_FLAG_PRIMITIVE_ID_INDEX_OFFSET);
 
+   if (params.provoking_vertex_last)
+      fs_msaa_flags |= INTEL_MSAA_FLAG_PROVOKING_VERTEX_LAST;
+
+   if (params.per_primitive_remapping)
+      fs_msaa_flags |= INTEL_MSAA_FLAG_PER_PRIMITIVE_REMAPPING;
+
    return fs_msaa_flags;
 }
+
+#define INTEL_MAX_EMBEDDED_SAMPLERS (4096)
+
+enum intel_shader_reloc_id {
+   INTEL_SHADER_RELOC_CONST_DATA_ADDR_LOW,
+   INTEL_SHADER_RELOC_CONST_DATA_ADDR_HIGH,
+   INTEL_SHADER_RELOC_SHADER_START_OFFSET,
+
+   INTEL_LAST_COMMON_SHADER_RELOC = INTEL_SHADER_RELOC_SHADER_START_OFFSET,
+
+   BRW_SHADER_RELOC_RESUME_SBT_ADDR_LOW = INTEL_LAST_COMMON_SHADER_RELOC + 1,
+   BRW_SHADER_RELOC_RESUME_SBT_ADDR_HIGH,
+   BRW_SHADER_RELOC_DESCRIPTORS_ADDR_HIGH,
+   BRW_SHADER_RELOC_DESCRIPTORS_BUFFER_ADDR_HIGH,
+   BRW_SHADER_RELOC_INSTRUCTION_BASE_ADDR_HIGH,
+   BRW_SHADER_RELOC_PRINTF_BUFFER_ADDR_LOW,
+   BRW_SHADER_RELOC_PRINTF_BUFFER_ADDR_HIGH,
+   BRW_SHADER_RELOC_PRINTF_BUFFER_SIZE,
+   /* Leave this entry last: */
+   BRW_SHADER_RELOC_EMBEDDED_SAMPLER_HANDLE,
+   BRW_SHADER_RELOC_LAST_EMBEDDED_SAMPLER_HANDLE =
+   BRW_SHADER_RELOC_EMBEDDED_SAMPLER_HANDLE + INTEL_MAX_EMBEDDED_SAMPLERS - 1,
+};
+
+enum intel_shader_reloc_type {
+   /** An arbitrary 32-bit value */
+   INTEL_SHADER_RELOC_TYPE_U32,
+   /** A MOV instruction with an immediate source */
+   INTEL_SHADER_RELOC_TYPE_MOV_IMM,
+};
+
+/** Represents a code relocation
+ *
+ * Relocatable constants are immediates in the code which we want to be able
+ * to replace post-compile with the actual value.
+ */
+struct intel_shader_reloc {
+   /** The 32-bit ID of the relocatable constant */
+   uint32_t id;
+
+   /** Type of this relocation */
+   enum intel_shader_reloc_type type;
+
+   /** The offset in the shader to the relocated value
+    *
+    * For MOV_IMM relocs, this is an offset to the MOV instruction.  This
+    * allows us to do some sanity checking while we update the value.
+    */
+   uint32_t offset;
+
+   /** Value to be added to the relocated value before it is written */
+   uint32_t delta;
+};
+
+/** A value to write to a relocation */
+struct intel_shader_reloc_value {
+   /** The 32-bit ID of the relocatable constant */
+   uint32_t id;
+
+   /** The value with which to replace the relocated immediate */
+   uint32_t value;
+};
 
 #ifdef __cplusplus
 } /* extern "C" */

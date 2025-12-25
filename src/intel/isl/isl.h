@@ -1558,8 +1558,16 @@ struct isl_drm_modifier_info {
    /** ISL tiling implied by this modifier */
    enum isl_tiling tiling;
 
-   /** Compression types supported by this modifier */
+   /**
+    * Whether or not this modifier supports one of the following isl_aux_usage
+    * values, depending on the hardware configuration:
+    *
+    * - ISL_AUX_USAGE_CCS_E
+    * - ISL_AUX_USAGE_FCV_CCS_E
+    */
    bool supports_render_compression;
+
+   /** Whether or not this modifier supports ISL_AUX_USAGE_MC. */
    bool supports_media_compression;
 
    /** Whether or not this modifier supports clear color */
@@ -1602,6 +1610,13 @@ struct isl_surf_init_info {
     * isl_surf_init() will fail if this is misaligned or out of bounds.
     */
    uint32_t row_pitch_B;
+
+   /**
+    * Exact value to compute :c:member:`isl_surf.array_pitch_el_rows`. Ignored
+    * if zero. isl_surf_init() will fail if this is misaligned or out of
+    * bounds.
+    */
+   uint64_t array_pitch_B;
 
    isl_surf_usage_flags_t usage;
 
@@ -1990,6 +2005,7 @@ enum isl_surf_param {
    ISL_SURF_PARAM_TILE_MODE,
    ISL_SURF_PARAM_PITCH,
    ISL_SURF_PARAM_QPITCH,
+   ISL_SURF_PARAM_FORMAT,
 };
 
 /*
@@ -2054,7 +2070,7 @@ isl_device_get_sample_counts(const struct isl_device *dev);
  */
 uint64_t
 isl_get_sampler_clear_field_offset(const struct intel_device_info *devinfo,
-                                   enum isl_format format);
+                                   enum isl_format format, bool is_depth);
 
 /**
  * :returns: The isl_format_layout for the given isl_format
@@ -2188,10 +2204,10 @@ isl_format_has_bc_compression(enum isl_format fmt)
    case ISL_TXC_HIZ:
    case ISL_TXC_MCS:
    case ISL_TXC_CCS:
-      unreachable("Should not be called on an aux surface");
+      UNREACHABLE("Should not be called on an aux surface");
    }
 
-   unreachable("bad texture compression mode");
+   UNREACHABLE("bad texture compression mode");
    return false;
 }
 
@@ -2580,6 +2596,9 @@ uint32_t
 isl_drm_modifier_get_score(const struct intel_device_info *devinfo,
                            uint64_t modifier);
 
+/* The maximum number of planes of an Intel modifier in drm_fourcc.h. */
+#define ISL_MODIFIER_MAX_PLANES 4
+
 /* Return the number of planes used by an image with the given parameters. */
 uint32_t
 isl_drm_modifier_get_plane_count(const struct intel_device_info *devinfo,
@@ -2731,6 +2750,27 @@ bool
 isl_surf_init_s(const struct isl_device *dev,
                 struct isl_surf *surf,
                 const struct isl_surf_init_info *restrict info);
+
+/* Maximum number of interleaved surfaces that can be created using
+ * isl_surf_init_interleaved_arrays
+ */
+#define ISL_SURF_MAX_INTERLEAVED_ARRAYS 3
+
+/* Initializes multiple 2D array surfaces in a layout where the array
+ * slices of the surface are interleaved. The memory ranges of the
+ * resulting surfaces overlap, however the individual slices all occupy
+ * discrete tiles and should not conflict. If the surfaces have video
+ * usage bits set, the offsets of each will also be aligned to 16x the
+ * row pitch of the first surface. All of this is done so that
+ * multi-planar YCbCr array textures can be created with individual
+ * slices that are addressable to the media engine. GFX 8+ only.
+ */
+bool
+isl_surf_init_interleaved_arrays(const struct isl_device *dev,
+                                 uint32_t total_surf,
+                                 struct isl_surf **surfs,
+                                 uint32_t *surfs_offsets,
+                                 const struct isl_surf_init_info *infos);
 
 /* Return the largest surface possible for the specified memory range. */
 void
@@ -3291,7 +3331,7 @@ isl_get_tile_dims(enum isl_tiling tiling, uint32_t cpp,
       *tile_h = 1;
       break;
    default:
-      unreachable("not reached");
+      UNREACHABLE("not reached");
    }
 }
 

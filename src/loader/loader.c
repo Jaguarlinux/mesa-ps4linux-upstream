@@ -47,6 +47,7 @@
 #include <GL/gl.h>
 #include "mesa_interface.h"
 #include "loader.h"
+#include "util/drm_is_nouveau.h"
 #include "util/libdrm.h"
 #include "util/os_file.h"
 #include "util/os_misc.h"
@@ -138,13 +139,15 @@ iris_predicate(int fd, const char *driver)
 bool
 nouveau_zink_predicate(int fd, const char *driver)
 {
-#if !defined(HAVE_NVK) || !defined(HAVE_ZINK)
-   if (!strcmp(driver, "zink"))
-      return false;
+#ifndef HAVE_LIBDRM
    return true;
 #else
+   /* Never load on nv proprietary driver */
+   if (!drm_fd_is_nouveau(fd))
+      return false;
 
    bool prefer_zink = false;
+   bool require_zink = false;
 
    /* Enable Zink by default on Turing and later GPUs
     *
@@ -161,14 +164,34 @@ nouveau_zink_predicate(int fd, const char *driver)
       if (ret == 0 && r.value >= 0x160) {
          prefer_zink = true;
       }
+      /* Nouveau GL isn't enabled on anything after Ada */
+      if (ret == 0 && r.value >= 0x1a0) {
+         require_zink = true;
+      }
    }
+   assert(!require_zink || prefer_zink);
 
    prefer_zink = debug_get_bool_option("NOUVEAU_USE_ZINK", prefer_zink);
 
-   if (prefer_zink && !strcmp(driver, "zink"))
+   bool use_zink = prefer_zink;
+   if (require_zink) {
+      /* nouveau_zink_predicate() typically gets called twice but we only want
+       * to warn once.
+       */
+      static bool warned = false;
+      if (!prefer_zink && !warned) {
+         log_(_LOADER_WARNING,
+              "NOUVEAU_USE_ZINK is ignored for Blackwell and later GPUs.\n");
+         warned = true;
+      }
+
+      use_zink = true;
+   }
+
+   if (use_zink && !strcmp(driver, "zink"))
       return true;
 
-   if (!prefer_zink && !strcmp(driver, "nouveau"))
+   if (!use_zink && !strcmp(driver, "nouveau"))
       return true;
    return false;
 #endif
@@ -427,7 +450,7 @@ static char *drm_get_id_path_tag_for_fd(int fd)
 
 bool loader_get_user_preferred_fd(int *fd_render_gpu, int *original_fd)
 {
-   const char *dri_prime = getenv("DRI_PRIME");
+   const char *dri_prime = os_get_option("DRI_PRIME");
    bool debug = debug_get_bool_option("DRI_PRIME_DEBUG", false);
    char *default_tag = NULL;
    drmDevicePtr devices[MAX_DRM_DEVICES];
@@ -583,20 +606,17 @@ bool loader_get_user_preferred_fd(int *fd_render_gpu, int *original_fd)
       log_(debug ? _LOADER_WARNING : _LOADER_INFO,
            "selected (%s)\n", devices[i]->nodes[DRM_NODE_RENDER]);
       fd = loader_open_device(devices[i]->nodes[DRM_NODE_RENDER]);
+      if (fd < 0) {
+         log_(debug ? _LOADER_WARNING : _LOADER_INFO,
+              "DRI_PRIME: failed to open '%s'\n",
+              devices[i]->nodes[DRM_NODE_RENDER]);
+      }
       break;
    }
    drmFreeDevices(devices, num_devices);
 
-   if (i == num_devices)
+   if (i == num_devices || fd < 0)
       goto err;
-
-   if (fd < 0) {
-      log_(debug ? _LOADER_WARNING : _LOADER_INFO,
-           "DRI_PRIME: failed to open '%s'\n",
-           devices[i]->nodes[DRM_NODE_RENDER]);
-
-      goto err;
-   }
 
    bool is_render_and_display_gpu_diff = !!strcmp(default_tag, prime.str);
    if (original_fd) {
@@ -750,7 +770,7 @@ loader_get_driver_for_fd(int fd)
     */
    if (__normal_user()) {
       const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
-      if (override)
+      if (override && strlen(override))
          return strdup(override);
    }
 

@@ -8,9 +8,16 @@
 
 #include "u_perfetto.h"
 #include "u_gpuvis.h"
+#include "u_sysprof.h"
 
 #include "util/detect_os.h"
 #include "util/macros.h"
+#include "util/os_time.h"
+
+struct mesa_trace_flow {
+   uint64_t id;
+   int64_t start_time;
+};
 
 #if defined(HAVE_PERFETTO)
 
@@ -93,6 +100,18 @@
 
 #endif /* HAVE_GPUVIS */
 
+#if defined(HAVE_SYSPROF)
+
+#define _MESA_SYSPROF_TRACE_BEGIN(name) util_sysprof_begin(name)
+#define _MESA_SYSPROF_TRACE_END(scope) util_sysprof_end(scope)
+
+#else
+
+#define _MESA_SYSPROF_TRACE_BEGIN(name) NULL
+#define _MESA_SYSPROF_TRACE_END(scope)
+
+#endif /* HAVE_SYSPROF */
+
 #if __has_attribute(cleanup) && __has_attribute(unused)
 
 #include <stdarg.h>
@@ -111,18 +130,34 @@
  *
  * to work.
  */
+#define _MESA_TRACE_SCOPE_NAME(name)                                         \
+   void *_MESA_TRACE_SCOPE_VAR(__LINE__)                                     \
+      __attribute__((cleanup(_mesa_trace_scope_end), unused)) =              \
+         _mesa_trace_scope_begin_name(name)
+
 #define _MESA_TRACE_SCOPE(format, ...)                                       \
-   int _MESA_TRACE_SCOPE_VAR(__LINE__)                                       \
+   void *_MESA_TRACE_SCOPE_VAR(__LINE__)                                     \
       __attribute__((cleanup(_mesa_trace_scope_end), unused)) =              \
          _mesa_trace_scope_begin(format, ##__VA_ARGS__)
 
 #define _MESA_TRACE_SCOPE_FLOW(name, id)                                     \
-   int _MESA_TRACE_SCOPE_VAR(__LINE__)                                       \
+   void *_MESA_TRACE_SCOPE_VAR(__LINE__)                                     \
       __attribute__((cleanup(_mesa_trace_scope_end), unused)) =              \
          _mesa_trace_scope_flow_begin(name, id)
 
+
+static inline void *
+_mesa_trace_scope_begin_name(const char *name)
+{
+   void *scope = NULL;
+   _MESA_TRACE_BEGIN(name);
+   _MESA_GPUVIS_TRACE_BEGIN(name);
+   scope = _MESA_SYSPROF_TRACE_BEGIN(name);
+   return scope;
+}
+
 __attribute__((format(printf, 1, 2)))
-static inline int
+static inline void *
 _mesa_trace_scope_begin(const char *format, ...)
 {
    char name[_MESA_TRACE_SCOPE_MAX_NAME_LENGTH];
@@ -134,37 +169,45 @@ _mesa_trace_scope_begin(const char *format, ...)
    va_end(args);
    assert(len < _MESA_TRACE_SCOPE_MAX_NAME_LENGTH);
 
-   _MESA_TRACE_BEGIN(name);
-   _MESA_GPUVIS_TRACE_BEGIN(name);
-   return 0;
+   return _mesa_trace_scope_begin_name(name);
 }
 
-static inline int
-_mesa_trace_scope_flow_begin(const char *name, uint64_t *id)
+static inline void *
+_mesa_trace_scope_flow_begin(const char *name,
+			     struct mesa_trace_flow *flow)
 {
-   if (*id == 0)
-      *id = util_perfetto_next_id();
-   _MESA_TRACE_FLOW_BEGIN(name, *id);
+   void *scope = NULL;
+
+   if (flow->id == 0) {
+      flow->id = util_perfetto_next_id();
+      flow->start_time = os_time_get_nano();
+   }
+
+   _MESA_TRACE_FLOW_BEGIN(name, flow->id);
    _MESA_GPUVIS_TRACE_BEGIN(name);
-   return 0;
+   scope = _MESA_SYSPROF_TRACE_BEGIN(name);
+   return scope;
 }
 
 static inline void
-_mesa_trace_scope_end(UNUSED int *scope)
+_mesa_trace_scope_end(UNUSED void **scope)
 {
    _MESA_GPUVIS_TRACE_END();
    _MESA_TRACE_END();
+   _MESA_SYSPROF_TRACE_END(scope);
 }
 
 #else
 
 #define _MESA_TRACE_SCOPE(format, ...)
+#define _MESA_TRACE_SCOPE_FLOW(func, id)
+#define _MESA_TRACE_SCOPE_NAME(name)
 
 #endif /* __has_attribute(cleanup) && __has_attribute(unused) */
 
 #define MESA_TRACE_SCOPE(format, ...) _MESA_TRACE_SCOPE(format, ##__VA_ARGS__)
 #define MESA_TRACE_SCOPE_FLOW(name, id) _MESA_TRACE_SCOPE_FLOW(name, id)
-#define MESA_TRACE_FUNC() _MESA_TRACE_SCOPE("%s", __func__)
+#define MESA_TRACE_FUNC() _MESA_TRACE_SCOPE_NAME(__func__)
 #define MESA_TRACE_FUNC_FLOW(id) _MESA_TRACE_SCOPE_FLOW(__func__, id)
 #define MESA_TRACE_SET_COUNTER(name, value) _MESA_TRACE_SET_COUNTER(name, value)
 #define MESA_TRACE_TIMESTAMP_BEGIN(name, track_id, flow_id, clock, timestamp) \
@@ -175,7 +218,12 @@ _mesa_trace_scope_end(UNUSED int *scope)
 static inline void
 util_cpu_trace_init()
 {
+#if defined(HAVE_PERFETTO)
    util_perfetto_init();
+#elif DETECT_OS_ANDROID && !defined(__cplusplus)
+   atrace_init();
+#endif /* HAVE_PERFETTO */
+
    util_gpuvis_init();
 }
 

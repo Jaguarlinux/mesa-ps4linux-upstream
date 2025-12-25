@@ -281,6 +281,10 @@ etna_resource_hw_tileable(bool use_blt, const struct pipe_resource *pres)
           util_format_get_blocksize(pres->format) == 4;
 }
 
+struct etna_resource *
+etna_resource_get_render_compatible(struct pipe_context *pctx,
+                                    struct pipe_resource *prsc);
+
 /* returns TRUE if resource TS buffer is exposed externally */
 static inline bool
 etna_resource_ext_ts(const struct etna_resource *res)

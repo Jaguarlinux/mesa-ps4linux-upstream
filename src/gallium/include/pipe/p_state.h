@@ -182,8 +182,7 @@ struct pipe_rasterizer_state
 
    /**
     * When true do not scale offset_units and use same rules for unorm and
-    * float depth buffers (D3D9). When false use GL/D3D1X behaviour.
-    * This depends on pipe_caps.polygon_offset_units_unscaled.
+    * float depth buffers.
     */
    unsigned offset_units_unscaled:1;
 
@@ -203,6 +202,8 @@ struct pipe_rasterizer_state
     * but not written by the shader count as disabled.
     */
    unsigned clip_plane_enable:PIPE_MAX_CLIP_PLANES;
+
+   unsigned representative_fragment_test:1;
 
    unsigned line_stipple_factor:8;  /**< [1..256] actually */
    unsigned line_stipple_pattern:16;
@@ -243,10 +244,10 @@ struct pipe_viewport_state
 
 struct pipe_scissor_state
 {
-   unsigned minx:16;
-   unsigned miny:16;
-   unsigned maxx:16;
-   unsigned maxy:16;
+   unsigned minx;
+   unsigned miny;
+   unsigned maxx;
+   unsigned maxy;
 };
 
 
@@ -397,6 +398,28 @@ struct pipe_stencil_ref
    uint8_t ref_value[2];
 };
 
+/**
+ * A view into a texture that can be bound to a color render target /
+ * depth stencil attachment point.
+ */
+struct pipe_surface
+{
+   struct pipe_reference reference;
+   enum pipe_format format:16;
+   /**
+    * Number of samples for the surface.  This will be 0 if rendering
+    * should use the resource's nr_samples, or another value if the resource
+    * is bound using FramebufferTexture2DMultisampleEXT.
+    */
+   unsigned nr_samples:16;
+
+   unsigned first_layer:16;
+   unsigned last_layer:16;
+   unsigned level;
+
+   struct pipe_resource *texture; /**< resource into which this is a view  */
+   struct pipe_context *context; /**< context this surface belongs to */
+};
 
 /**
  * Note that pipe_surfaces are "texture views for rendering"
@@ -406,17 +429,19 @@ struct pipe_stencil_ref
  */
 struct pipe_framebuffer_state
 {
-   uint16_t width, height;
+   uint32_t width, height;
    uint16_t layers;  /**< Number of layers  in a no-attachment framebuffer */
    uint8_t samples; /**< Number of samples in a no-attachment framebuffer */
 
    /** multiple color buffers for multiple render targets */
    uint8_t nr_cbufs;
+   /** true if pixel local storage is enabled */
+   bool pls_enabled;
    /** used for multiview */
    uint8_t viewmask;
-   struct pipe_surface *cbufs[PIPE_MAX_COLOR_BUFS];
+   struct pipe_surface cbufs[PIPE_MAX_COLOR_BUFS];
 
-   struct pipe_surface *zsbuf;      /**< Z/stencil buffer */
+   struct pipe_surface zsbuf;      /**< Z/stencil buffer */
 
    struct pipe_resource *resolve;
 };
@@ -447,41 +472,8 @@ struct pipe_sampler_state
    enum pipe_format border_color_format;      /**< only with PIPE_QUIRK_TEXTURE_BORDER_COLOR_SWIZZLE_FREEDRENO, must be last */
 };
 
-union pipe_surface_desc {
-   struct {
-      unsigned level;
-      unsigned first_layer:16;
-      unsigned last_layer:16;
-   } tex;
-   struct {
-      unsigned first_element;
-      unsigned last_element;
-   } buf;
-};
-
-/**
- * A view into a texture that can be bound to a color render target /
- * depth stencil attachment point.
- */
-struct pipe_surface
-{
-   struct pipe_reference reference;
-   enum pipe_format format:16;
-   unsigned writable:1;          /**< writable shader resource */
-   struct pipe_resource *texture; /**< resource into which this is a view  */
-   struct pipe_context *context; /**< context this surface belongs to */
-
-   /**
-    * Number of samples for the surface.  This will be 0 if rendering
-    * should use the resource's nr_samples, or another value if the resource
-    * is bound using FramebufferTexture2DMultisampleEXT.
-    */
-   unsigned nr_samples:8;
-
-   union pipe_surface_desc u;
-};
-
 struct pipe_tex2d_from_buf {
+   /* Only 32K x 32K textures are supported. */
    unsigned offset;  /**< offset in pixels */
    uint16_t row_stride; /**< size of the image row_stride in pixels */
    uint16_t width;      /**< width of image provided by application */
@@ -562,7 +554,7 @@ struct pipe_resource
    EXCLUSIVE_CACHELINE(struct pipe_reference reference);
 
    uint32_t width0; /**< Used by both buffers and textures. */
-   uint16_t height0; /* Textures: The maximum height/depth/array_size is 16k. */
+   uint32_t height0;    /* textures >= 64K are possible */
    uint16_t depth0;
    uint16_t array_size;
 
@@ -861,11 +853,9 @@ struct pipe_draw_info
    bool index_bounds_valid:1; /**< whether min_index and max_index are valid;
                                    they're always invalid if index_size == 0 */
    bool increment_draw_id:1;  /**< whether drawid increments for direct draws */
-   bool take_index_buffer_ownership:1; /**< callee inherits caller's refcount
-         (no need to reference indexbuf, but still needs to unreference it) */
    bool index_bias_varies:1;   /**< true if index_bias varies between draws */
    bool was_line_loop:1; /**< true if mesa_prim was LINE_LOOP before translation */
-   uint8_t _pad:1;
+   uint8_t _pad:2;
 
    unsigned start_instance; /**< first instance id */
    unsigned instance_count; /**< number of instances */
@@ -1006,6 +996,10 @@ struct pipe_grid_info
    unsigned draw_count;
    unsigned indirect_draw_count_offset;
    struct pipe_resource *indirect_draw_count;
+
+   /* Resources which might be indirectly accessed through global load/store operations */
+   uint32_t num_globals;
+   struct pipe_resource **globals;
 };
 
 /**
@@ -1057,6 +1051,19 @@ enum pipe_ml_operation_type {
    PIPE_ML_OPERATION_TYPE_SPLIT,
    PIPE_ML_OPERATION_TYPE_PAD,
    PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED,
+   PIPE_ML_OPERATION_TYPE_RESHAPE,
+   PIPE_ML_OPERATION_TYPE_RELU,
+   PIPE_ML_OPERATION_TYPE_ABSOLUTE,
+   PIPE_ML_OPERATION_TYPE_LOGISTIC,
+   PIPE_ML_OPERATION_TYPE_SUBTRACT,
+   PIPE_ML_OPERATION_TYPE_TRANSPOSE,
+   PIPE_ML_OPERATION_TYPE_STRIDED_SLICE,
+   PIPE_ML_OPERATION_TYPE_RESIZE,
+};
+
+enum pipe_ml_pooling_type {
+   PIPE_ML_POOLING_TYPE_AVG,
+   PIPE_ML_POOLING_TYPE_MAX,
 };
 
 /**
@@ -1122,8 +1129,17 @@ struct pipe_ml_operation
           * Whether this convolution has fused ReLU activation.
           */
          bool relu;
+
+         unsigned dilation_width_factor;
+         unsigned dilation_height_factor;
       } conv;
       struct {
+
+         /**
+          * Type of pooling operation.
+          */
+         enum pipe_ml_pooling_type type;
+
          /**
           * Stride used to access the input tensor on the x axis.
           */
@@ -1196,6 +1212,37 @@ struct pipe_ml_operation
           */
          bool relu;
       } fcon;
+
+      struct {
+         /**
+          * Dimension along which the tensors are concatenated.
+          */
+         int axis;
+      } conc;
+
+      struct {
+         /**
+          * Dimension along which the tensors are split.
+          */
+         int axis;
+      } split;
+
+      struct {
+         /**
+          * Shape of the output tensor.
+          */
+         unsigned shape[4];
+      } reshape;
+
+      struct {
+         unsigned perm[4];
+      } transpose;
+
+      struct {
+         int begin[4];
+         int end[4];
+         int strides[4];
+      } slice;
    };
 };
 
@@ -1282,6 +1329,15 @@ struct pipe_memory_info
 struct pipe_memory_object
 {
    bool dedicated;
+};
+
+/**
+ * Structure that contains information about a vm allocation
+ */
+struct pipe_vm_allocation
+{
+   uint64_t start;
+   uint64_t size;
 };
 
 #ifdef __cplusplus

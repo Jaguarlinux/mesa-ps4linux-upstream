@@ -8,6 +8,8 @@
 
 #include "util/u_debug.h"
 
+#include "amd_family.h"
+
 #if AMD_LLVM_AVAILABLE
 #if defined(_MSC_VER) && defined(restrict)
 #undef restrict
@@ -82,6 +84,7 @@ print_constant_data(FILE* output, Program* program)
    }
 }
 
+#ifndef _WIN32
 /**
  * Determines the GPU type to use for CLRXdisasm
  */
@@ -155,9 +158,11 @@ get_branch_target(char** output, Program* program, const std::vector<bool>& refe
    }
    return false;
 }
+#endif
 
 bool
-print_asm_clrx(Program* program, std::vector<uint32_t>& binary, unsigned exec_size, FILE* output)
+print_asm_clrx(Program* program, enum radeon_family family, std::vector<uint32_t>& binary,
+               unsigned exec_size, FILE* output)
 {
 #ifdef _WIN32
    return true;
@@ -168,7 +173,7 @@ print_asm_clrx(Program* program, std::vector<uint32_t>& binary, unsigned exec_si
    FILE* p;
    int fd;
 
-   const char* gpu_type = to_clrx_device_name(program->gfx_level, program->family);
+   const char* gpu_type = to_clrx_device_name(program->gfx_level, family);
 
    /* Dump the binary into a temporary file. */
    fd = mkstemp(path);
@@ -299,7 +304,8 @@ disasm_instr(amd_gfx_level gfx_level, LLVMDisasmContextRef disasm, uint32_t* bin
 }
 
 bool
-print_asm_llvm(Program* program, std::vector<uint32_t>& binary, unsigned exec_size, FILE* output)
+print_asm_llvm(Program* program, enum radeon_family family, std::vector<uint32_t>& binary,
+               unsigned exec_size, FILE* output)
 {
    std::vector<bool> referenced_blocks = get_referenced_blocks(program);
 
@@ -316,14 +322,23 @@ print_asm_llvm(Program* program, std::vector<uint32_t>& binary, unsigned exec_si
                            llvm::StringRef(block_names[block_names.size() - 1].data()), 0);
    }
 
-   const char* features = "";
+   std::string features = "";
    if (program->gfx_level >= GFX10 && program->wave_size == 64) {
-      features = "+wavefrontsize64";
+      features += "+wavefrontsize64";
    }
 
+   /* Older versions have very incomplete true16 support. */
+#if LLVM_VERSION_MAJOR >= 20
+   if (program->gfx_level >= GFX11) {
+      if (!features.empty())
+         features += ",";
+      features += "+real-true16";
+   }
+#endif
+
    LLVMDisasmContextRef disasm =
-      LLVMCreateDisasmCPUFeatures("amdgcn-mesa-mesa3d", ac_get_llvm_processor_name(program->family),
-                                  features, &symbols, 0, NULL, NULL);
+      LLVMCreateDisasmCPUFeatures("amdgcn-mesa-mesa3d", ac_get_llvm_processor_name(family),
+                                  features.c_str(), &symbols, 0, NULL, NULL);
 
    size_t pos = 0;
    bool invalid = false;
@@ -376,12 +391,12 @@ print_asm_llvm(Program* program, std::vector<uint32_t>& binary, unsigned exec_si
 } /* end namespace */
 
 bool
-check_print_asm_support(Program* program)
+check_print_asm_support(Program* program, enum radeon_family family)
 {
 #if AMD_LLVM_AVAILABLE
    if (program->gfx_level >= GFX8) {
       /* LLVM disassembler only supports GFX8+ */
-      const char* name = ac_get_llvm_processor_name(program->family);
+      const char* name = ac_get_llvm_processor_name(family);
       const char* triple = "amdgcn--";
       LLVMTargetRef target = ac_get_llvm_target(triple);
 
@@ -398,7 +413,7 @@ check_print_asm_support(Program* program)
 
 #ifndef _WIN32
    /* Check if CLRX disassembler binary is available and can disassemble the program */
-   return to_clrx_device_name(program->gfx_level, program->family) &&
+   return to_clrx_device_name(program->gfx_level, family) &&
           system("clrxdisasm --version > /dev/null 2>&1") == 0;
 #else
    return false;
@@ -407,15 +422,16 @@ check_print_asm_support(Program* program)
 
 /* Returns true on failure */
 bool
-print_asm(Program* program, std::vector<uint32_t>& binary, unsigned exec_size, FILE* output)
+print_asm(Program* program, enum radeon_family family, std::vector<uint32_t>& binary,
+          unsigned exec_size, FILE* output)
 {
 #if AMD_LLVM_AVAILABLE
    if (program->gfx_level >= GFX8) {
-      return print_asm_llvm(program, binary, exec_size, output);
+      return print_asm_llvm(program, family, binary, exec_size, output);
    }
 #endif
 
-   return print_asm_clrx(program, binary, exec_size, output);
+   return print_asm_clrx(program, family, binary, exec_size, output);
 }
 
 } // namespace aco

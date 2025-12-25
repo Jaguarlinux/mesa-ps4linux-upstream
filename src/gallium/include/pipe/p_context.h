@@ -346,11 +346,11 @@ struct pipe_context {
    /**
     * Called when a shader program is linked.
     * \param handles  Array of shader handles attached to this program.
-    *                 The size of the array is \c PIPE_SHADER_TYPES, and each
+    *                 The size of the array is \c MESA_SHADER_STAGES, and each
     *                 position contains the corresponding \c pipe_shader_state*
     *                 or \c pipe_compute_state*, or \c NULL.
     *                 E.g. You can retrieve the fragment shader handle with
-    *                      \c handles[PIPE_SHADER_FRAGMENT]
+    *                      \c handles[MESA_SHADER_FRAGMENT]
     */
    void (*link_shader)(struct pipe_context *, void** handles);
    /*@}*/
@@ -367,7 +367,7 @@ struct pipe_context {
    void * (*create_sampler_state)(struct pipe_context *,
                                   const struct pipe_sampler_state *);
    void   (*bind_sampler_states)(struct pipe_context *,
-                                 enum pipe_shader_type shader,
+                                 mesa_shader_stage shader,
                                  unsigned start_slot, unsigned num_samplers,
                                  void **samplers);
    void   (*delete_sampler_state)(struct pipe_context *, void *);
@@ -449,6 +449,9 @@ struct pipe_context {
    void (*set_min_samples)(struct pipe_context *,
                            unsigned min_samples);
 
+   /* Called to set user clip plane state.  Unused on GL drivers with
+    * !caps->clip_planes.
+    */
    void (*set_clip_state)(struct pipe_context *,
                           const struct pipe_clip_state *);
 
@@ -457,13 +460,10 @@ struct pipe_context {
     *
     * \param shader           Shader stage
     * \param index            Buffer binding slot index within a shader stage
-    * \param take_ownership   The callee takes ownership of the buffer reference.
-    *                         (the callee shouldn't increment the ref count)
     * \param buf              Constant buffer parameters
     */
    void (*set_constant_buffer)(struct pipe_context *,
-                               enum pipe_shader_type shader, uint index,
-                               bool take_ownership,
+                               mesa_shader_stage shader, uint index,
                                const struct pipe_constant_buffer *buf);
 
    /**
@@ -483,7 +483,7 @@ struct pipe_context {
     * fields if they don't want this or if they don't implement this.
     */
    void (*set_inlinable_constants)(struct pipe_context *,
-                                   enum pipe_shader_type shader,
+                                   mesa_shader_stage shader,
                                    uint num_values, uint32_t *values);
 
    void (*set_framebuffer_state)(struct pipe_context *,
@@ -535,7 +535,7 @@ struct pipe_context {
                                const struct pipe_viewport_state *);
 
    void (*set_sampler_views)(struct pipe_context *,
-                             enum pipe_shader_type shader,
+                             mesa_shader_stage shader,
                              unsigned start_slot, unsigned num_views,
                              unsigned unbind_num_trailing_slots,
                              struct pipe_sampler_view **views);
@@ -572,7 +572,7 @@ struct pipe_context {
     *                          used with loads. If unsure, set to ~0.
     */
    void (*set_shader_buffers)(struct pipe_context *,
-                              enum pipe_shader_type shader,
+                              mesa_shader_stage shader,
                               unsigned start_slot, unsigned count,
                               const struct pipe_shader_buffer *buffers,
                               unsigned writable_bitmask);
@@ -609,18 +609,13 @@ struct pipe_context {
     *                   be bound.
     */
    void (*set_shader_images)(struct pipe_context *,
-                             enum pipe_shader_type shader,
+                             mesa_shader_stage shader,
                              unsigned start_slot, unsigned count,
                              unsigned unbind_num_trailing_slots,
                              const struct pipe_image_view *images);
 
    /**
     * Bind an array of vertex buffers to the specified slots.
-    *
-    * Unlike other set functions, the caller should always increment
-    * the buffer reference counts because the driver should only copy
-    * the pipe_resource pointers. This is the same behavior as setting
-    * take_ownership = true in other functions.
     *
     * count must be equal to the maximum used vertex buffer index + 1
     * in vertex elements or 0.
@@ -689,6 +684,20 @@ struct pipe_context {
                                 struct pipe_resource *src,
                                 unsigned src_level,
                                 const struct pipe_box *src_box);
+
+   /**
+    * Perform a copy between an image and a buffer in either direction.
+    * buffer_stride=0 or buffer_layer_stride=0 means tightly packed on that axis
+    * Resources with nr_samples > 1 are not allowed.
+    */
+   void (*image_copy_buffer)(struct pipe_context *pipe,
+                             struct pipe_resource *dst,
+                             struct pipe_resource *src,
+                             unsigned buffer_offset,
+                             unsigned buffer_stride,
+                             unsigned buffer_layer_stride,
+                             unsigned level,
+                             const struct pipe_box *box);
 
    /* Optimal hardware path for blitting pixels.
     * Scaling, format conversion, up- and downsampling (resolve) are allowed.
@@ -811,13 +820,15 @@ struct pipe_context {
     * Insert commands to have GPU wait for fence to be signaled.
     */
    void (*fence_server_sync)(struct pipe_context *pipe,
-                             struct pipe_fence_handle *fence);
+                             struct pipe_fence_handle *fence,
+                             uint64_t timeline_value);
 
    /**
     * Insert commands to have the GPU signal a fence.
     */
    void (*fence_server_signal)(struct pipe_context *pipe,
-                               struct pipe_fence_handle *fence);
+                               struct pipe_fence_handle *fence,
+                               uint64_t timeline_value);
 
    /**
     * Create a view on a texture to be used by a shader stage.
@@ -946,6 +957,13 @@ struct pipe_context {
                            unsigned level, struct pipe_box *box, bool commit);
 
    /**
+    * Signal the driver that the frontend has released a resource.
+    *
+    * Following this call, the driver has full ownership of the resource.
+    */
+   void (*resource_release)(struct pipe_context *, struct pipe_resource *);
+
+   /**
     * Creates a video codec for a specific video format/profile
     */
    struct pipe_video_codec *(*create_video_codec)(struct pipe_context *context,
@@ -1020,7 +1038,6 @@ struct pipe_context {
                        const struct pipe_grid_info *info);
 
    void (*draw_mesh_tasks)(struct pipe_context *context,
-                           unsigned drawid_offset,
                            const struct pipe_grid_info *info);
    /*@}*/
 
@@ -1235,6 +1252,15 @@ struct pipe_context {
                                                      const struct pipe_video_buffer *templat,
                                                      struct winsys_handle *handle,
                                                      unsigned usage );
+
+   /**
+    * Checks whether an operation can be accelerated by this context.
+    *
+    * \param ctx         pipe context
+    * \param operation   pipe_ml_operation to be checked
+    * \return            whether the context can accelerate this operation
+    */
+    bool (*ml_operation_supported)(struct pipe_context *context, const struct pipe_ml_operation *operation);
 
    /**
     * Compiles a ML subgraph, to be executed later. The returned pipe_ml_subgraph

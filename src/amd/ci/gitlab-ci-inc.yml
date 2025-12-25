@@ -1,4 +1,4 @@
-.radeonsi-rules:
+.radeonsi-collabora-rules:
   stage: amd
   rules:
     - !reference [.test, rules]
@@ -34,7 +34,7 @@
         - src/amd/vpelib/**/*
       when: on_success
 
-.radeonsi-manual-rules:
+.radeonsi-collabora-manual-rules:
   stage: amd-nightly
   extends: .no-auto-retry
   rules:
@@ -115,14 +115,14 @@
   stage: amd
   rules:
     - !reference [.test, rules]
-    - !reference [.radeonsi-rules, rules]
+    - !reference [.radeonsi-collabora-rules, rules]
     - !reference [.radv-rules, rules]
 
 .radeonsi-vaapi-rules:
   stage: amd
   rules:
     - !reference [.test, rules]
-    - !reference [.radeonsi-rules, rules]
+    - !reference [.radeonsi-collabora-rules, rules]
     - changes: &radeon_vcn_file_list
         - src/gallium/frontends/va/**/*
         - src/gallium/targets/va/**/*
@@ -138,12 +138,24 @@
         *radeon_vcn_file_list
       when: manual
 
+.radeonsi-vaapi-fluster-rules:
+  stage: amd
+  extends:
+    - .test-fluster
+  rules:
+    - !reference [.radeonsi-vaapi-rules, rules]
+    - changes:
+        - src/amd/ci/$GPU_VERSION-fluster-fails.txt
+        - src/amd/ci/$GPU_VERSION-fluster-flakes.txt
+        - src/amd/ci/$GPU_VERSION-fluster-skips.txt
+      when: on_success
+
 .radeonsi-valve-rules:
   stage: amd
   rules:
     - !reference [.test, rules]
     - !reference [.valve-farm-rules, rules]
-    - !reference [.radeonsi-rules, rules]
+    - !reference [.radeonsi-collabora-rules, rules]
 
 .radeonsi-valve-manual-rules:
   stage: amd-nightly
@@ -202,7 +214,8 @@
     RUNNER_TAG: mesa-ci-x86-64-lava-asus-CM1400CXA-dalboz
     # Force fixed 6.6 kernel, amdgpu doesn't revcover from GPU resets on 6.13
     # https://gitlab.freedesktop.org/drm/amd/-/issues/3861
-    KERNEL_TAG: "v6.6.21-mesa-f8ea"
+    # https://gitlab.freedesktop.org/mesa/mesa/-/issues/12676
+    KERNEL_TAG: "v6.6.21-mesa-1978"
 
 # Status: https://lava.collabora.dev/scheduler/device_type/lenovo-TPad-C13-Yoga-zork
 .lava-lenovo-TPad-C13-Yoga-zork:x86_64:
@@ -218,7 +231,8 @@
     RUNNER_TAG: mesa-ci-x86-64-lava-lenovo-TPad-C13-Yoga-zork
     # Force fixed 6.6 kernel, amdgpu doesn't revcover from GPU resets on 6.13
     # https://gitlab.freedesktop.org/drm/amd/-/issues/3861
-    KERNEL_TAG: "v6.6.21-mesa-f8ea"
+    # https://gitlab.freedesktop.org/mesa/mesa/-/issues/12676
+    KERNEL_TAG: "v6.6.21-mesa-1978"
 
 # Status: https://lava.collabora.dev/scheduler/device_type/hp-x360-14a-cb0001xx-zork
 .lava-hp-x360-14a-cb0001xx-zork:x86_64:
@@ -234,7 +248,40 @@
     RUNNER_TAG: mesa-ci-x86-64-lava-hp-x360-14a-cb0001xx-zork
     # Force fixed 6.6 kernel, amdgpu doesn't revcover from GPU resets on 6.13
     # https://gitlab.freedesktop.org/drm/amd/-/issues/3861
-    KERNEL_TAG: "v6.6.21-mesa-f8ea"
+    # https://gitlab.freedesktop.org/mesa/mesa/-/issues/12676
+    KERNEL_TAG: "v6.6.21-mesa-1978"
+
+# Status: https://lava.collabora.dev/scheduler/device_type/dell-latitude-3445-7520c-skyrim
+.lava-dell-latitude-3445-7520c-skyrim:x86_64:
+  variables:
+    BOOT_METHOD: depthcharge
+    DEVICE_TYPE: dell-latitude-3445-7520c-skyrim
+    DTB: ""
+    FARM: collabora
+    FDO_CI_CONCURRENT: 8
+    HWCI_FREQ_MAX: "true"
+    HWCI_KERNEL_MODULES: amdgpu
+    KERNEL_IMAGE_TYPE: ""
+    RUNNER_TAG: mesa-ci-x86-64-lava-dell-latitude-3445-7520c-skyrim
+    VK_DRIVER: radeon
+    LAVA_FIRMWARE: amdgpu
+
+# Status: https://lava.collabora.dev/scheduler/device_type/acer-cp514-3wh-r0qs-guybrush
+.lava-acer-cp514-3wh-r0qs-guybrush:x86_64:
+  variables:
+    BOOT_METHOD: depthcharge
+    DEVICE_TYPE: acer-cp514-3wh-r0qs-guybrush
+    DTB: ""
+    FARM: collabora
+    FDO_CI_CONCURRENT: 4
+    HWCI_FREQ_MAX: "true"
+    HWCI_KERNEL_MODULES: amdgpu
+    KERNEL_IMAGE_TYPE: ""
+    RUNNER_TAG: mesa-ci-x86-64-lava-acer-cp514-3wh-r0qs-guybrush
+    VK_DRIVER: radeon
+    LAVA_FIRMWARE: amdgpu
+    # Force fixed 6.6 kernel
+    KERNEL_TAG: "v6.6.21-mesa-1978"
 
 
 ############### LAVA
@@ -242,12 +289,13 @@
 .stoney-test:x86_64:
   variables:
     FLAKES_CHANNEL: "#amd-ci"
+    LAVA_FIRMWARE: amdgpu-lava
 
 .radeonsi-stoney-test:x86_64:
   extends:
     - .stoney-test:x86_64
     - .lava-acer-R721T-grunt:x86_64
-    - .radeonsi-rules
+    - .radeonsi-collabora-rules
   variables:
     GPU_VERSION: radeonsi-stoney
     DRIVER_NAME: radeonsi
@@ -264,10 +312,11 @@
 
 .radeonsi-raven-test:x86_64:
   extends:
-    - .radeonsi-rules
+    - .radeonsi-collabora-rules
   variables:
     GPU_VERSION: radeonsi-raven
     DRIVER_NAME: radeonsi
+    LAVA_FIRMWARE: amdgpu-lava
 
 .radv-raven-test:x86_64:
   extends:
@@ -276,6 +325,7 @@
     DRIVER_NAME: radv
     GPU_VERSION: radv-raven
     VK_DRIVER: radeon
+    LAVA_FIRMWARE: amdgpu-lava
 
 .amd-raven-test:x86_64:
   extends:
@@ -284,12 +334,29 @@
     DRIVER_NAME: radeonsi
     GPU_VERSION: amd-raven
     VK_DRIVER: radeon
+    LAVA_FIRMWARE: amdgpu-lava
+
+.radv-cezanne-test:x86_64:
+  extends:
+    - .lava-acer-cp514-3wh-r0qs-guybrush:x86_64
+  variables:
+    DRIVER_NAME: radv
+    GPU_VERSION: radv-cezanne
 
 ############### CI-tron
 .ci-tron-test-amdgpu:
   variables:
-    CI_TRON_PATTERN__JOB_WARN__REGEX: '\*ERROR\* ring .* timeout'
-    CI_TRON_KERNEL__URL: https://fs.mupuf.org/linux-6.6-b2c-radv-ci # 6.6
+    CI_TRON_PATTERN__JOB_WARN__REGEX: 'ring .* timeout'
+    CI_TRON_KERNEL__URL: "https://fs.mupuf.org/radv/linux-6.17.3_w_buddy_fixes/linux-x86_64"
+    CI_TRON_INITRAMFS__DEPMOD__URL: "https://fs.mupuf.org/radv/linux-6.17.3_w_buddy_fixes/linux-x86_64.depmod.cpio.xz"
+    CI_TRON_INITRAMFS__GPU__URL: "https://fs.mupuf.org/radv/linux-6.17.3_w_buddy_fixes/linux-x86_64.gpu_amdgpu.cpio"
+    CI_TRON_INITRAMFS__GPU__FORMAT__0__ARCHIVE__KEEP__0__PATH: "(lib/(modules|firmware/amdgpu)/.*)"
+    CI_TRON_KERNEL_CMDLINE__LOAD_MODULES: 'modules_load=amdgpu'
+  tags:
+    - farm:$RUNNER_FARM_LOCATION
+    - $CI_TRON_DUT_SETUP_TAGS
+    - amdgpu:$INTEGRATED_OR_DISCRETE
+    - ci-tron:priority:$CI_TRON_JOB_PRIORITY
 
 .ci-tron-test-radv:
   extends: .ci-tron-test-amdgpu
@@ -303,6 +370,7 @@
     # the code generator.
     ACO_DEBUG: validateir,validatera
     MESA_VK_IGNORE_CONFORMANCE_WARNING: 1
+    radv_cooperative_matrix2_nv: 'true'
     # Enable ETC2 emulation on non-native platforms (RENOIR,RDNA+, GFX6-8 dGPUs)
     vk_require_etc2: 'true'
     CI_TRON__B2C_SWAP_SIZE: '16g'
@@ -312,6 +380,8 @@
     - .ci-tron-x86_64-test-vk
     - .radv-valve-rules
     - .ci-tron-test-radv
+  variables:
+    DEQP_SUITE: radv
 
 
 .tahiti-test-valve:
@@ -319,25 +389,35 @@
     FDO_CI_CONCURRENT: 24
     RUNNER_FARM_LOCATION: mupuf
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:TAHITI
+    INTEGRATED_OR_DISCRETE: discrete
+    CI_TRON_KERNEL_CMDLINE__AMDGPU_FORCE_SI_SUPPORT: amdgpu.si_support=1
+    GPU_VERSION: radv-tahiti
 
 .hawaii-test-valve:
   variables:
     FDO_CI_CONCURRENT: 24
     RUNNER_FARM_LOCATION: mupuf
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:HAWAII
+    INTEGRATED_OR_DISCRETE: discrete
+    CI_TRON_KERNEL_CMDLINE__AMDGPU_FORCE_CIK_SUPPORT: amdgpu.cik_support=1
+    GPU_VERSION: radv-hawaii
 
 .kabini-test-valve:
   variables:
     RUNNER_FARM_LOCATION: mupuf
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:KABINI
+    INTEGRATED_OR_DISCRETE: integrated
+    GPU_VERSION: radv-kabini
 
 .polaris10-test-valve:
   variables:
     FDO_CI_CONCURRENT: 16
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:POLARIS10
+    INTEGRATED_OR_DISCRETE: discrete
     # (2022-01) tsc=unstable was added in response to this message in kmsg,
     #    TSC found unstable after boot, most likely due to broken BIOS. Use 'tsc=unstable'.
     CI_TRON_KERNEL_CMDLINE__TSC_WORKAROUND: 'tsc=unstable'
+    GPU_VERSION: radv-polaris10
 
 .polaris10-test-valve-mupuf:
   extends: .polaris10-test-valve
@@ -353,12 +433,16 @@
   variables:
     RUNNER_FARM_LOCATION: keywords
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:VEGA10
+    INTEGRATED_OR_DISCRETE: discrete
+    GPU_VERSION: radv-vega10
     FDO_CI_CONCURRENT: 16
 
 .renoir-test-valve:
   variables:
     RUNNER_FARM_LOCATION: mupuf
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:RENOIR
+    INTEGRATED_OR_DISCRETE: integrated
+    GPU_VERSION: radv-renoir
     FDO_CI_CONCURRENT: 16
 
 .navi10-test-valve:
@@ -369,6 +453,8 @@
     # MSI IRQs leading to GPU hangs on amdgpu.
     CI_TRON_KERNEL_CMDLINE__APIC_WORKAROUND: 'noapic'
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:NAVI10
+    INTEGRATED_OR_DISCRETE: discrete
+    GPU_VERSION: radv-navi10
 
 .navi10-test-valve-mupuf:
   extends:
@@ -388,38 +474,38 @@
   variables:
     RUNNER_FARM_LOCATION: keywords
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:NAVI21
+    INTEGRATED_OR_DISCRETE: discrete
+    GPU_VERSION: radv-navi21
     FDO_CI_CONCURRENT: 32
 
 .vangogh-test-valve:
   variables:
     RUNNER_FARM_LOCATION: mupuf
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:VANGOGH
+    INTEGRATED_OR_DISCRETE: integrated
+    GPU_VERSION: radv-vangogh
     FDO_CI_CONCURRENT: 8
-  tags:
-    - farm:$RUNNER_FARM_LOCATION
-    - $CI_TRON_DUT_SETUP_TAGS
-    - $CI_TRON_JOB_PRIORITY_TAG
 
 .raphael-test-valve:
   variables:
     RUNNER_FARM_LOCATION: keywords
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:RAPHAEL
+    INTEGRATED_OR_DISCRETE: integrated
+    GPU_VERSION: radv-raphael
     FDO_CI_CONCURRENT: 32
 
 .navi31-test-valve:
   variables:
     RUNNER_FARM_LOCATION: keywords
     CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:NAVI31
+    INTEGRATED_OR_DISCRETE: discrete
+    GPU_VERSION: radv-navi31
     FDO_CI_CONCURRENT: 32
 
-############### Fluster tests ###############
-.radeonsi-vaapi-fluster-rules:
-  extends:
-    - .test-fluster
-  rules:
-    - !reference [.radeonsi-vaapi-rules, rules]
-    - changes:
-        - src/amd/ci/$GPU_VERSION-fluster-fails.txt
-        - src/amd/ci/$GPU_VERSION-fluster-flakes.txt
-        - src/amd/ci/$GPU_VERSION-fluster-skips.txt
-      when: on_success
+.gfx1201-test-valve:
+  variables:
+    RUNNER_FARM_LOCATION: keywords
+    CI_TRON_DUT_SETUP_TAGS: amdgpu:codename:NAVI48
+    INTEGRATED_OR_DISCRETE: discrete
+    GPU_VERSION: radv-gfx1201
+    FDO_CI_CONCURRENT: 32

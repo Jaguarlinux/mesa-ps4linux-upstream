@@ -12,6 +12,8 @@
 #include "util/build_id.h"
 #include "util/driconf.h"
 #include "util/mesa-sha1.h"
+#include "util/os_misc.h"
+#include "util/u_call_once.h"
 
 #include "vk_alloc.h"
 #include "vk_log.h"
@@ -34,7 +36,7 @@ static const struct debug_control panvk_debug_options[] = {
    {"nir", PANVK_DEBUG_NIR},
    {"trace", PANVK_DEBUG_TRACE},
    {"sync", PANVK_DEBUG_SYNC},
-   {"afbc", PANVK_DEBUG_AFBC},
+   {"noafbc", PANVK_DEBUG_NO_AFBC},
    {"linear", PANVK_DEBUG_LINEAR},
    {"dump", PANVK_DEBUG_DUMP},
    {"no_known_warn", PANVK_DEBUG_NO_KNOWN_WARN},
@@ -42,7 +44,37 @@ static const struct debug_control panvk_debug_options[] = {
    {"copy_gfx", PANVK_DEBUG_COPY_GFX},
    {"force_simultaneous", PANVK_DEBUG_FORCE_SIMULTANEOUS},
    {"implicit_others_inv", PANVK_DEBUG_IMPLICIT_OTHERS_INV},
-   {NULL, 0}};
+   {"force_blackhole", PANVK_DEBUG_FORCE_BLACKHOLE},
+   {"wsi_afbc", PANVK_DEBUG_WSI_AFBC},
+   {"no_wb_mmap", PANVK_DEBUG_NO_WB_MMAP},
+   {"no_user_mmap_sync", PANVK_DEBUG_NO_USER_MMAP_SYNC},
+   {"coherent_before_cached", PANVK_DEBUG_COHERENT_BEFORE_CACHED},
+   {NULL, 0},
+};
+
+uint64_t panvk_debug;
+
+static void
+panvk_debug_init_once(void)
+{
+   panvk_debug =
+      parse_debug_string(os_get_option("PANVK_DEBUG"), panvk_debug_options);
+}
+
+static void
+panvk_debug_init(void)
+{
+   static once_flag once = ONCE_FLAG_INIT;
+   call_once(&once, panvk_debug_init_once);
+
+   /* log per VkInstance creation */
+   if (PANVK_DEBUG(STARTUP)) {
+      char debug_string[256];
+      dump_debug_control_string(debug_string, sizeof(debug_string),
+                                panvk_debug_options, panvk_debug);
+      mesa_logi("panvk_debug: %s", debug_string);
+   }
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
@@ -154,7 +186,6 @@ static const driOptionDescription panvk_dri_options[] = {
       DRI_CONF_VK_X11_OVERRIDE_MIN_IMAGE_COUNT(0)
       DRI_CONF_VK_X11_STRICT_IMAGE_COUNT(false)
       DRI_CONF_VK_X11_ENSURE_MIN_IMAGE_COUNT(false)
-      DRI_CONF_VK_KHR_PRESENT_WAIT(false)
       DRI_CONF_VK_XWAYLAND_WAIT_READY(false)
    DRI_CONF_SECTION_END
 
@@ -167,6 +198,8 @@ static const driOptionDescription panvk_dri_options[] = {
    DRI_CONF_SECTION_MISCELLANEOUS
       DRI_CONF_PAN_COMPUTE_CORE_MASK(~0ull)
       DRI_CONF_PAN_FRAGMENT_CORE_MASK(~0ull)
+      DRI_CONF_PAN_ENABLE_VERTEX_PIPELINE_STORES_ATOMICS(false)
+      DRI_CONF_PAN_FORCE_ENABLE_SHADER_ATOMICS(false)
    DRI_CONF_SECTION_END
 };
 
@@ -180,6 +213,11 @@ panvk_init_dri_options(struct panvk_instance *instance)
 
    instance->force_vk_vendor =
       driQueryOptioni(&instance->dri_options, "force_vk_vendor");
+
+   instance->enable_vertex_pipeline_stores_atomics = driQueryOptionb(
+      &instance->dri_options, "pan_enable_vertex_pipeline_stores_atomics");
+   instance->force_enable_shader_atomics = driQueryOptionb(
+      &instance->dri_options, "pan_force_enable_shader_atomics");
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -191,6 +229,8 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    VkResult result;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
+
+   panvk_debug_init();
 
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(panvk_CreateInstance);
@@ -236,11 +276,8 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       panvk_physical_device_try_create;
    instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 
-   instance->debug_flags =
-      parse_debug_string(getenv("PANVK_DEBUG"), panvk_debug_options);
-
-   if (instance->debug_flags & PANVK_DEBUG_STARTUP)
-      vk_logi(VK_LOG_NO_OBJS(instance), "Created an instance");
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("Created an instance");
 
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 

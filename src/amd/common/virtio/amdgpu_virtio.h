@@ -12,13 +12,16 @@ struct amdvgpu_context;
 typedef struct amdvgpu_device* amdvgpu_device_handle;
 typedef struct amdvgpu_bo* amdvgpu_bo_handle;
 
+struct util_sync_provider;
+
 struct amdvgpu_bo_import_result {
    amdvgpu_bo_handle buf_handle;
    uint64_t alloc_size;
 };
 
 int amdvgpu_device_initialize(int fd, uint32_t *drm_major, uint32_t *drm_minor,
-                              amdvgpu_device_handle* dev);
+                              amdvgpu_device_handle* dev,
+                              struct util_sync_provider **p);
 int amdvgpu_device_deinitialize(amdvgpu_device_handle dev);
 int amdvgpu_bo_va_op_raw(amdvgpu_device_handle dev,
                          uint32_t res_id,
@@ -86,5 +89,7 @@ amdvgpu_cs_submit_raw2(amdvgpu_device_handle dev, uint32_t ctx_id,
 int amdvgpu_vm_reserve_vmid(amdvgpu_device_handle dev, int reserve);
 int
 amdvgpu_query_sw_info(amdvgpu_device_handle dev, enum amdgpu_sw_info info, void *value);
+
+bool amdvgpu_has_vm_always_valid(amdvgpu_device_handle dev);
 
 #endif

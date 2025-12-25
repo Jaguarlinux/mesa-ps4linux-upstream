@@ -197,7 +197,8 @@ const float rcp_values[] = {
 };
 
 
-static float rsqrtf(float x)
+/* Some versions of math.h exports rsqrtf() while others don't. */
+static float _rsqrtf(float x)
 {
    return 1.0/(float)sqrt(x);
 }
@@ -323,7 +324,7 @@ unary_tests[] = {
    {"exp", &lp_build_exp, &expf, exp2_values, ARRAY_SIZE(exp2_values), 18.0 },
    {"log", &lp_build_log_safe, &logf, log2_values, ARRAY_SIZE(log2_values), 20.0 },
    {"rcp", &lp_build_rcp, &rcpf, rcp_values, ARRAY_SIZE(rcp_values), 20.0 },
-   {"rsqrt", &lp_build_rsqrt, &rsqrtf, rsqrt_values, ARRAY_SIZE(rsqrt_values), 20.0 },
+   {"rsqrt", &lp_build_rsqrt, &_rsqrtf, rsqrt_values, ARRAY_SIZE(rsqrt_values), 20.0 },
    {"sin", &lp_build_sin, &sinf, sincos_values, ARRAY_SIZE(sincos_values), 20.0 },
    {"cos", &lp_build_cos, &cosf, sincos_values, ARRAY_SIZE(sincos_values), 20.0 },
    {"sgn", &lp_build_sgn, &sgnf, sgn_values, ARRAY_SIZE(sgn_values), 20.0 },
@@ -481,7 +482,7 @@ test_unary(unsigned verbose, FILE *fp, const struct unary_test_t *test, unsigned
          if (test->ref == &nearbyintf && length == 2 &&
              !util_get_cpu_caps()->has_neon &&
              DETECT_ARCH_S390 == false &&
-             !(util_get_cpu_caps()->has_sse4_1 && LLVM_VERSION_MAJOR >= 8) &&
+             !util_get_cpu_caps()->has_sse4_1 &&
              ref != roundf(testval)) {
             /* FIXME: The generic (non SSE) path in lp_build_iround, which is
              * always taken for length==2 regardless of native round support,

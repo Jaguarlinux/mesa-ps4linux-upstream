@@ -30,6 +30,7 @@
 #include "drm-uapi/panfrost_drm.h"
 #include "drm-uapi/panthor_drm.h"
 
+#include "util/os_misc.h"
 #include "util/os_mman.h"
 #include "util/u_math.h"
 
@@ -41,12 +42,29 @@ bool drm_shim_driver_prefers_first_render_node = true;
 static uint64_t
 pan_get_gpu_id(void)
 {
-   char *override_version = getenv("PAN_GPU_ID");
+   const char *override_version = os_get_option("PAN_GPU_ID");
 
    if (override_version)
       return strtol(override_version, NULL, 16);
 
    return PAN_GPU_ID_DEFAULT;
+}
+
+/*
+ * The gpu variant is specified as a hex value after the GPU id
+ * in PAN_GPU_ID, e.g. PAN_GPU_ID=ac04:4.
+ */
+static uint64_t
+pan_get_gpu_variant(void)
+{
+   const char *override_version = os_get_option("PAN_GPU_ID");
+
+   if (override_version) {
+      const char *sep = strchr(override_version, ':');
+      if (sep)
+         return strtol(sep+1, NULL, 16);
+   }
+   return 0;
 }
 
 static int
@@ -109,7 +127,7 @@ panfrost_ioctl_create_bo(int fd, unsigned long request, void *arg)
 
    struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
    struct shim_bo *bo = calloc(1, sizeof(*bo));
-   size_t size = ALIGN(create->size, 4096);
+   size_t size = align_uintptr(create->size, 4096);
 
    drm_shim_bo_init(bo, size);
 
@@ -168,6 +186,10 @@ panthor_ioctl_dev_query(int fd, unsigned long request, void *arg)
 
       gpu_info->gpu_id = pan_get_gpu_id() << 16;
       gpu_info->gpu_rev = 0;
+
+      /* for some reason the variant is in the bottom 8 bits of
+       * the core_features */
+      gpu_info->core_features = pan_get_gpu_variant();
 
       /* Dumped from a G610 */
       gpu_info->csf_id = 0x40a0412;
@@ -236,7 +258,7 @@ panthor_ioctl_bo_create(int fd, unsigned long request, void *arg)
 
    struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
    struct shim_bo *bo = calloc(1, sizeof(*bo));
-   size_t size = ALIGN(bo_create->size, 4096);
+   size_t size = align_uintptr(bo_create->size, 4096);
 
    drm_shim_bo_init(bo, size);
 

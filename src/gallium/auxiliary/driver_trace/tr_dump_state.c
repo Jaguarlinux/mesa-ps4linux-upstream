@@ -560,8 +560,11 @@ void trace_dump_framebuffer_state(const struct pipe_framebuffer_state *state)
    trace_dump_member(uint, state, samples);
    trace_dump_member(uint, state, layers);
    trace_dump_member(uint, state, nr_cbufs);
-   trace_dump_member_array(ptr, state, cbufs);
-   trace_dump_member(ptr, state, zsbuf);
+   trace_dump_member(bool, state, pls_enabled);
+   trace_dump_member_begin("cbufs");
+   trace_dump_array_impl(surface, state->cbufs, state->nr_cbufs, &);
+   trace_dump_member_end();
+   trace_dump_member_val(surface, state, zsbuf);
 
    trace_dump_struct_end();
 }
@@ -578,8 +581,11 @@ void trace_dump_framebuffer_state_deep(const struct pipe_framebuffer_state *stat
    trace_dump_member(uint, state, samples);
    trace_dump_member(uint, state, layers);
    trace_dump_member(uint, state, nr_cbufs);
-   trace_dump_member_array(surface, state, cbufs);
-   trace_dump_member(surface, state, zsbuf);
+   trace_dump_member(bool, state, pls_enabled);
+   trace_dump_member_begin("cbufs");
+   trace_dump_array_impl(surface, state->cbufs, state->nr_cbufs, &);
+   trace_dump_member_end();
+   trace_dump_member_val(surface, state, zsbuf);
 
    trace_dump_struct_end();
 }
@@ -677,7 +683,7 @@ void trace_dump_sampler_view_template(const struct pipe_sampler_view *state)
 
 void trace_dump_surface(const struct pipe_surface *surface)
 {
-   trace_dump_surface_template(surface, surface ? surface->texture->target : 0);
+   trace_dump_surface_template(surface, surface && surface->texture ? surface->texture->target : 0);
 }
 
 
@@ -701,26 +707,9 @@ void trace_dump_surface_template(const struct pipe_surface *state,
    trace_dump_enum(tr_util_pipe_texture_target_name(target));
    trace_dump_member_end();
 
-   trace_dump_member_begin("u");
-   trace_dump_struct_begin(""); /* anonymous */
-   if (target == PIPE_BUFFER) {
-      trace_dump_member_begin("buf");
-      trace_dump_struct_begin(""); /* anonymous */
-      trace_dump_member(uint, &state->u.buf, first_element);
-      trace_dump_member(uint, &state->u.buf, last_element);
-      trace_dump_struct_end(); /* anonymous */
-      trace_dump_member_end(); /* buf */
-   } else {
-      trace_dump_member_begin("tex");
-      trace_dump_struct_begin(""); /* anonymous */
-      trace_dump_member(uint, &state->u.tex, level);
-      trace_dump_member(uint, &state->u.tex, first_layer);
-      trace_dump_member(uint, &state->u.tex, last_layer);
-      trace_dump_struct_end(); /* anonymous */
-      trace_dump_member_end(); /* tex */
-   }
-   trace_dump_struct_end(); /* anonymous */
-   trace_dump_member_end(); /* u */
+   trace_dump_member(uint, state, level);
+   trace_dump_member(uint, state, first_layer);
+   trace_dump_member(uint, state, last_layer);
 
    trace_dump_struct_end();
 }
@@ -954,6 +943,17 @@ void trace_dump_draw_start_count(const struct pipe_draw_start_count_bias *state)
    trace_dump_struct_begin("pipe_draw_start_count_bias");
    trace_dump_member(uint, state, start);
    trace_dump_member(uint, state, count);
+   trace_dump_struct_end();
+}
+
+void trace_dump_draw_start_count_indexed(const struct pipe_draw_start_count_bias *state)
+{
+   if (!trace_dumping_enabled_locked())
+      return;
+
+   trace_dump_struct_begin("pipe_draw_start_count_bias");
+   trace_dump_member(uint, state, start);
+   trace_dump_member(uint, state, count);
    trace_dump_member(int,  state, index_bias);
    trace_dump_struct_end();
 }
@@ -1102,6 +1102,9 @@ trace_dump_query_result(unsigned query_type, unsigned index,
       trace_dump_member(uint, &result->pipeline_statistics, hs_invocations);
       trace_dump_member(uint, &result->pipeline_statistics, ds_invocations);
       trace_dump_member(uint, &result->pipeline_statistics, cs_invocations);
+      trace_dump_member(uint, &result->pipeline_statistics, ts_invocations);
+      trace_dump_member(uint, &result->pipeline_statistics, ms_invocations);
+      trace_dump_member(uint, &result->pipeline_statistics, ms_primitives);
       trace_dump_struct_end();
       break;
 
@@ -1141,6 +1144,15 @@ trace_dump_query_result(unsigned query_type, unsigned index,
       case PIPE_STAT_QUERY_CS_INVOCATIONS:
          trace_dump_member(uint, &result->pipeline_statistics, cs_invocations);
          break;
+      case PIPE_STAT_QUERY_TS_INVOCATIONS:
+         trace_dump_member(uint, &result->pipeline_statistics, ts_invocations);
+         break;
+      case PIPE_STAT_QUERY_MS_INVOCATIONS:
+         trace_dump_member(uint, &result->pipeline_statistics, ms_invocations);
+         break;
+      case PIPE_STAT_QUERY_MS_PRIMITIVES:
+         trace_dump_member(uint, &result->pipeline_statistics, ms_primitives);
+         break;
       }
       trace_dump_struct_end();
       break;
@@ -1176,6 +1188,14 @@ void trace_dump_grid_info(const struct pipe_grid_info *state)
 
    trace_dump_member(ptr, state, indirect);
    trace_dump_member(uint, state, indirect_offset);
+
+   trace_dump_member(uint, state, draw_count);
+   trace_dump_member(uint, state, indirect_draw_count_offset);
+   trace_dump_member(ptr, state, indirect_draw_count);
+
+   trace_dump_member_begin("globals");
+   trace_dump_array(ptr, state->globals, state->num_globals);
+   trace_dump_member_end();
 
    trace_dump_struct_end();
 }
@@ -1249,9 +1269,10 @@ void trace_dump_pipe_picture_desc(const struct pipe_picture_desc *picture)
    trace_dump_member_end();
    trace_dump_member(uint, picture, key_size);
    trace_dump_member(format, picture, input_format);
-   trace_dump_member(bool, picture, input_full_range);
    trace_dump_member(format, picture, output_format);
-   trace_dump_member(ptr, picture, fence);
+   trace_dump_member(ptr, picture, in_fence);
+   trace_dump_member(uint, picture, in_fence_value);
+   trace_dump_member(ptr, picture, out_fence);
    trace_dump_struct_end();
 }
 
@@ -1287,6 +1308,21 @@ void trace_dump_pipe_vpp_desc(const struct pipe_vpp_desc *process_properties)
    trace_dump_member_struct(u_rect, process_properties, dst_region);
    trace_dump_member_enum(pipe_video_vpp_orientation, process_properties, orientation);
    trace_dump_member_struct(pipe_vpp_blend, process_properties, blend);
-   trace_dump_member(ptr, process_properties, src_surface_fence);
+   trace_dump_struct_end();
+}
+
+void trace_dump_vm_allocation(struct pipe_vm_allocation *alloc)
+{
+   if (!trace_dumping_enabled_locked())
+      return;
+
+   if (!alloc) {
+      trace_dump_null();
+      return;
+   }
+
+   trace_dump_struct_begin("pipe_vma_allocation");
+   trace_dump_member(uint, alloc, start);
+   trace_dump_member(uint, alloc, size);
    trace_dump_struct_end();
 }

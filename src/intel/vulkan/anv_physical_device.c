@@ -17,13 +17,17 @@
 #include "git_sha1.h"
 
 #include "util/disk_cache.h"
+#include "util/os_misc.h"
 #include "util/mesa-sha1.h"
+#include "util/os_misc.h"
 
 #include <xf86drm.h>
 #include <fcntl.h>
 #ifdef MAJOR_IN_SYSMACROS
 #include <sys/sysmacros.h>
 #endif
+
+#include "vk_android.h"
 
 /* This is probably far to big but it reflects the max size used for messages
  * in OpenGLs KHR_debug.
@@ -142,9 +146,6 @@ static void
 get_device_extensions(const struct anv_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
-   const bool has_syncobj_wait =
-      (device->sync_syncobj_type.features & VK_SYNC_FEATURE_CPU_WAIT) != 0;
-
    const bool rt_enabled = ANV_SUPPORT_RT && device->info.has_ray_tracing;
    const bool video_decode_enabled = device->instance->debug & ANV_DEBUG_VIDEO_DECODE;
    const bool video_encode_enabled = device->instance->debug & ANV_DEBUG_VIDEO_ENCODE;
@@ -170,13 +171,14 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_driver_properties                 = true,
       .KHR_dynamic_rendering                 = true,
       .KHR_dynamic_rendering_local_read      = true,
-      .KHR_external_fence                    = has_syncobj_wait,
-      .KHR_external_fence_fd                 = has_syncobj_wait,
+      .KHR_external_fence                    = true,
+      .KHR_external_fence_fd                 = true,
       .KHR_external_memory                   = true,
       .KHR_external_memory_fd                = true,
       .KHR_external_semaphore                = true,
       .KHR_external_semaphore_fd             = true,
       .KHR_format_feature_flags2             = true,
+      .KHR_fragment_shader_barycentric       = device->info.ver >= 20,
       .KHR_fragment_shading_rate             = device->info.ver >= 11,
       .KHR_get_memory_requirements2          = true,
       .KHR_global_priority                   = device->max_context_priority >=
@@ -197,6 +199,8 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_maintenance6                      = true,
       .KHR_maintenance7                      = true,
       .KHR_maintenance8                      = true,
+      .KHR_maintenance9                      = true,
+      .KHR_maintenance10                     = true,
       .KHR_map_memory2                       = true,
       .KHR_multiview                         = true,
       .KHR_performance_query =
@@ -204,19 +208,15 @@ get_device_extensions(const struct anv_physical_device *device,
          (intel_perf_has_hold_preemption(device->perf) ||
           INTEL_DEBUG(DEBUG_NO_OACONFIG)) &&
          !(device->instance->debug & ANV_DEBUG_NO_SECONDARY_CALL),
+      .KHR_pipeline_binary                   = true,
       .KHR_pipeline_executable_properties    = true,
       .KHR_pipeline_library                  = true,
-      /* Hide these behind dri configs for now since we cannot implement it reliably on
-       * all surfaces yet. There is no surface capability query for present wait/id,
-       * but the feature is useful enough to hide behind an opt-in mechanism for now.
-       * If the instance only enables surface extensions that unconditionally support present wait,
-       * we can also expose the extension that way. */
-      .KHR_present_id =
-         driQueryOptionb(&device->instance->dri_options, "vk_khr_present_wait") ||
-         wsi_common_vk_instance_supports_present_wait(&device->instance->vk),
-      .KHR_present_wait =
-         driQueryOptionb(&device->instance->dri_options, "vk_khr_present_wait") ||
-         wsi_common_vk_instance_supports_present_wait(&device->instance->vk),
+#ifdef ANV_USE_WSI_PLATFORM
+      .KHR_present_id                        = true,
+      .KHR_present_id2                       = true,
+      .KHR_present_wait                      = true,
+      .KHR_present_wait2                     = true,
+#endif
       .KHR_push_descriptor                   = true,
       .KHR_ray_query                         = rt_enabled,
       .KHR_ray_tracing_maintenance1          = rt_enabled,
@@ -243,10 +243,12 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_shader_subgroup_rotate            = true,
       .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_shader_terminate_invocation       = true,
+      .KHR_shader_untyped_pointers           = true,
       .KHR_spirv_1_4                         = true,
       .KHR_storage_buffer_storage_class      = true,
 #ifdef ANV_USE_WSI_PLATFORM
       .KHR_swapchain                         = true,
+      .KHR_swapchain_maintenance1            = true,
       .KHR_swapchain_mutable_format          = true,
 #endif
       .KHR_synchronization2                  = true,
@@ -259,6 +261,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_video_decode_h264                 = VIDEO_CODEC_H264DEC && video_decode_enabled,
       .KHR_video_decode_h265                 = VIDEO_CODEC_H265DEC && video_decode_enabled,
       .KHR_video_decode_av1                  = device->info.ver >= 12 && VIDEO_CODEC_AV1DEC && video_decode_enabled,
+      .KHR_video_decode_vp9                  = VIDEO_CODEC_VP9DEC && video_decode_enabled,
       .KHR_video_encode_queue                = video_encode_enabled,
       .KHR_video_encode_h264                 = VIDEO_CODEC_H264ENC && video_encode_enabled,
       .KHR_video_encode_h265                 = device->info.ver >= 12 && VIDEO_CODEC_H265ENC && video_encode_enabled,
@@ -281,7 +284,11 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_calibrated_timestamps             = device->has_reg_timestamp,
       .EXT_color_write_enable                = true,
       .EXT_conditional_rendering             = true,
-      .EXT_conservative_rasterization        = true,
+      /* Skylake has broken conservative rasterization with backface culling.
+       * There is a chicken bit in 3D_CHICKEN3 to reenable the broken behavior
+       * on KBL+. So just disable crast on SKL.
+       */
+      .EXT_conservative_rasterization        = device->info.platform != INTEL_PLATFORM_SKL,
       .EXT_custom_border_color               = true,
       .EXT_depth_bias_control                = true,
       .EXT_depth_clamp_control               = true,
@@ -309,7 +316,7 @@ get_device_extensions(const struct anv_physical_device *device,
                                                VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
       .EXT_graphics_pipeline_library         = !(device->instance->debug & ANV_DEBUG_NO_GPL),
       .EXT_hdr_metadata = true,
-      .EXT_host_image_copy                   = !device->emu_astc_ldr,
+      .EXT_host_image_copy                   = true,
       .EXT_host_query_reset                  = true,
       .EXT_image_2d_view_of_3d               = true,
       /* Because of Xe2 PAT selected compression and the Vulkan spec
@@ -363,11 +370,13 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_image_atomic_int64         = true,
       .EXT_shader_module_identifier          = true,
+      .EXT_shader_object                     = true,
       .EXT_shader_replicated_composites      = true,
       .EXT_shader_stencil_export             = true,
       .EXT_shader_subgroup_ballot            = true,
       .EXT_shader_subgroup_vote              = true,
       .EXT_shader_viewport_index_layer       = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_subgroup_size_control             = true,
 #ifdef ANV_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1            = true,
@@ -381,10 +390,6 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_ycbcr_image_arrays                = true,
       .AMD_buffer_marker                     = true,
       .AMD_texture_gather_bias_lod           = device->info.ver >= 20,
-#if DETECT_OS_ANDROID
-      .ANDROID_external_memory_android_hardware_buffer = true,
-      .ANDROID_native_buffer                 = true,
-#endif
       .GOOGLE_decorate_string                = true,
       .GOOGLE_hlsl_functionality1            = true,
       .GOOGLE_user_type                      = true,
@@ -396,6 +401,12 @@ get_device_extensions(const struct anv_physical_device *device,
       .VALVE_mutable_descriptor_type         = true,
       .KHR_shader_bfloat16                   = device->info.has_bfloat16,
    };
+
+   if (vk_android_get_ugralloc() != NULL) {
+      ext->ANDROID_external_memory_android_hardware_buffer = true,
+      ext->ANDROID_native_buffer = true;
+      ext->ANDROID_external_format_resolve = true;
+   }
 }
 
 static void
@@ -446,9 +457,10 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderStorageImageExtendedFormats        = true,
       .shaderStorageImageMultisample            = false,
       /* Gfx12.5 has all the required format supported in HW for typed
-       * read/writes
+       * read/writes, on Gfx11 & Gfx12.0 we emulate for 3 formats.
        */
-      .shaderStorageImageReadWithoutFormat      = pdevice->info.verx10 >= 125,
+      .shaderStorageImageReadWithoutFormat      = pdevice->info.verx10 >= 125 ||
+                                                  pdevice->instance->emulate_read_without_format,
       .shaderStorageImageWriteWithoutFormat     = true,
       .shaderUniformBufferArrayDynamicIndexing  = true,
       .shaderSampledImageArrayDynamicIndexing   = true,
@@ -472,6 +484,7 @@ get_features(const struct anv_physical_device *pdevice,
       .sparseResidency8Samples                  = has_sparse_or_fake &&
                                                   pdevice->info.verx10 != 125,
       .sparseResidency16Samples                 = has_sparse_or_fake &&
+                                                  pdevice->info.ver < 30 &&
                                                   pdevice->info.verx10 != 125,
       .variableMultisampleRate                  = true,
       .inheritedQueries                         = true,
@@ -567,7 +580,7 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_acceleration_structure */
       .accelerationStructure = rt_enabled,
-      .accelerationStructureCaptureReplay = false, /* TODO */
+      .accelerationStructureCaptureReplay = true,
       .accelerationStructureIndirectBuild = false, /* TODO */
       .accelerationStructureHostCommands = false,
       .descriptorBindingAccelerationStructureUpdateAfterBind = rt_enabled,
@@ -837,11 +850,13 @@ get_features(const struct anv_physical_device *pdevice,
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
 
+#ifdef ANV_USE_WSI_PLATFORM
       /* VK_KHR_present_id */
-      .presentId = pdevice->vk.supported_extensions.KHR_present_id,
+      .presentId = true,
 
       /* VK_KHR_present_wait */
-      .presentWait = pdevice->vk.supported_extensions.KHR_present_wait,
+      .presentWait = true,
+#endif
 
       /* VK_EXT_vertex_input_dynamic_state */
       .vertexInputDynamicState = true,
@@ -906,7 +921,7 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderQuadControl = true,
 
 #ifdef ANV_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
 
@@ -915,6 +930,9 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_video_maintenance2 */
       .videoMaintenance2 = true,
+
+      /* VK_KHR_video_decode_vp9 */
+      .videoDecodeVP9 = true,
 
       /* VK_EXT_image_compression_control */
       .imageCompressionControl = true,
@@ -958,6 +976,36 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderBFloat16CooperativeMatrix =
          anv_device_has_bfloat16_cooperative_matrix(pdevice),
       .shaderBFloat16DotProduct = pdevice->info.has_bfloat16,
+
+      /* VK_KHR_fragment_shader_barycentric */
+      .fragmentShaderBarycentric =
+         pdevice->vk.supported_extensions.KHR_fragment_shader_barycentric,
+
+      /* VK_KHR_maintenance9 */
+      .maintenance9 = true,
+
+#ifdef ANV_USE_WSI_PLATFORM
+      /* VK_KHR_present_id2 */
+      .presentId2 = true,
+
+      /* VK_KHR_present_wait2 */
+      .presentWait2 = true,
+#endif
+
+      /* VK_KHR_shader_untyped_pointers */
+      .shaderUntypedPointers = true,
+
+      /* VK_EXT_shader_object */
+      .shaderObject = true,
+
+      /* VK_EXT_shader_uniform_buffer_unsized_array */
+      .shaderUniformBufferUnsizedArray = true,
+
+      /* VK_KHR_maintenance10 */
+      .maintenance10 = true,
+
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaries = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -966,6 +1014,9 @@ get_features(const struct anv_physical_device *pdevice,
     */
    if (app_info->engine_name && strcmp(app_info->engine_name, "idTech") == 0)
       features->depthBounds = true;
+
+   if (vk_android_get_ugralloc() != NULL)
+      features->externalFormatResolve = true;
 }
 
 #define MAX_PER_STAGE_DESCRIPTOR_UNIFORM_BUFFERS   64
@@ -1231,6 +1282,10 @@ get_properties(const struct anv_physical_device *pdevice,
 
       const struct intel_device_info *devinfo = &pdevice->info;
 
+   uint64_t page_size;
+   if (!os_get_page_size(&page_size))
+      page_size = 4096;         /* fallback */
+
    const VkDeviceSize max_heap_size = anx_get_physical_device_max_heap_size(pdevice);
 
    const uint32_t max_workgroup_size =
@@ -1246,16 +1301,6 @@ get_properties(const struct anv_physical_device *pdevice,
 
    VkSampleCountFlags sample_counts =
       isl_device_get_sample_counts(&pdevice->isl_dev);
-
-#if DETECT_OS_ANDROID
-   /* Used to fill struct VkPhysicalDevicePresentationPropertiesANDROID */
-   uint64_t front_rendering_usage = 0;
-   struct u_gralloc *gralloc = u_gralloc_create(U_GRALLOC_TYPE_AUTO);
-   if (gralloc != NULL) {
-      u_gralloc_get_front_rendering_usage(gralloc, &front_rendering_usage);
-      u_gralloc_destroy(&gralloc);
-   }
-#endif /* DETECT_OS_ANDROID */
 
    struct anv_descriptor_limits desc_limits;
    get_device_descriptor_limits(pdevice, &desc_limits);
@@ -1301,7 +1346,7 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxDescriptorSetStorageImages            = desc_limits.max_images,
       .maxDescriptorSetInputAttachments         = MAX_DESCRIPTOR_SET_INPUT_ATTACHMENTS,
       .maxVertexInputAttributes                 = MAX_VES,
-      .maxVertexInputBindings                   = MAX_VBS,
+      .maxVertexInputBindings                   = get_max_vbs(devinfo),
       /* Broadwell PRMs: Volume 2d: Command Reference: Structures:
        *
        * VERTEX_ELEMENT_STATE::Source Element Offset: [0,2047]
@@ -1318,7 +1363,7 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxTessellationControlPerVertexInputComponents = 128,
       .maxTessellationControlPerVertexOutputComponents = 128,
       .maxTessellationControlPerPatchOutputComponents = 128,
-      .maxTessellationControlTotalOutputComponents = 2048,
+      .maxTessellationControlTotalOutputComponents = 4096,
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = 128,
       .maxGeometryShaderInvocations             = 32,
@@ -1331,7 +1376,8 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxFragmentDualSrcAttachments            = 1,
       .maxFragmentCombinedOutputResources       = MAX_RTS + desc_limits.max_ssbos +
                                                   desc_limits.max_images,
-      .maxComputeSharedMemorySize               = intel_device_info_get_max_slm_size(&pdevice->info),
+      .maxComputeSharedMemorySize               = MIN2(MAX_SLM_SIZE,
+                                                       intel_device_info_get_max_slm_size(&pdevice->info)),
       .maxComputeWorkGroupCount                 = { 65535, 65535, 65535 },
       .maxComputeWorkGroupInvocations           = max_workgroup_size,
       .maxComputeWorkGroupSize = {
@@ -1350,7 +1396,7 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxViewportDimensions                    = { (1 << 14), (1 << 14) },
       .viewportBoundsRange                      = { INT16_MIN, INT16_MAX },
       .viewportSubPixelBits                     = 13, /* We take a float? */
-      .minMemoryMapAlignment                    = 4096, /* A page */
+      .minMemoryMapAlignment                    = page_size,
       /* The dataport requires texel alignment so we need to assume a worst
        * case of R32G32B32A32 which is 16 bytes.
        */
@@ -1401,7 +1447,8 @@ get_properties(const struct anv_physical_device *pdevice,
 
       /* Sparse: */
       .sparseResidencyStandard2DBlockShape = has_sparse_or_fake,
-      .sparseResidencyStandard2DMultisampleBlockShape = false,
+      .sparseResidencyStandard2DMultisampleBlockShape = has_sparse_or_fake &&
+                                                        pdevice->info.ver < 20,
       .sparseResidencyStandard3DBlockShape = has_sparse_or_fake,
       .sparseResidencyAlignedMipSize = false,
       .sparseResidencyNonResidentStrict = has_sparse_or_fake,
@@ -1428,16 +1475,21 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxGeometryCount = (1u << 24) - 1;
       props->maxInstanceCount = (1u << 24) - 1;
       props->maxPrimitiveCount = (1u << 29) - 1;
-      props->maxPerStageDescriptorAccelerationStructures = UINT16_MAX;
-      props->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = UINT16_MAX;
-      props->maxDescriptorSetAccelerationStructures = UINT16_MAX;
-      props->maxDescriptorSetUpdateAfterBindAccelerationStructures = UINT16_MAX;
+      props->maxPerStageDescriptorAccelerationStructures = desc_limits.max_resources;
+      props->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = desc_limits.max_resources;
+      props->maxDescriptorSetAccelerationStructures = desc_limits.max_resources;
+      props->maxDescriptorSetUpdateAfterBindAccelerationStructures = desc_limits.max_resources;
       props->minAccelerationStructureScratchOffsetAlignment = 64;
    }
 
    /* VK_KHR_compute_shader_derivatives */
    {
       props->meshAndTaskShaderDerivatives = pdevice->info.has_mesh_shading;
+   }
+
+   /* VK_KHR_fragment_shader_barycentric */
+   {
+      props->triStripVertexOrderIndependentOfProvokingVertex = false;
    }
 
    /* VK_KHR_fragment_shading_rate */
@@ -1452,14 +1504,16 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxFragmentSizeAspectRatio =
          pdevice->info.has_coarse_pixel_primitive_and_cb ?
          2 : 4;
-      props->maxFragmentShadingRateCoverageSamples = 4 * 4 *
-         (pdevice->info.has_coarse_pixel_primitive_and_cb ? 4 : 16);
+      props->maxFragmentShadingRateCoverageSamples =
+         devinfo->verx10 >= 125 ? 16:
+         4 * 4 * 16; /* Technically wrong, but some CTS tests fail because of the rates we
+                        report on prior platforms. Fixing all of that is a task for another day. */
       props->maxFragmentShadingRateRasterizationSamples =
       pdevice->info.has_coarse_pixel_primitive_and_cb ?
          VK_SAMPLE_COUNT_4_BIT :  VK_SAMPLE_COUNT_16_BIT;
       props->fragmentShadingRateWithShaderDepthStencilWrites = false;
       props->fragmentShadingRateWithSampleMask = true;
-      props->fragmentShadingRateWithShaderSampleMask = false;
+      props->fragmentShadingRateWithShaderSampleMask = devinfo->verx10 >= 200;
       props->fragmentShadingRateWithConservativeRasterization = true;
       props->fragmentShadingRateWithFragmentShaderInterlock = true;
       props->fragmentShadingRateWithCustomSampleLocations = true;
@@ -1479,8 +1533,8 @@ get_properties(const struct anv_physical_device *pdevice,
 
    /* VK_KHR_maintenance5 */
    {
-      props->earlyFragmentMultisampleCoverageAfterSampleCounting = false;
-      props->earlyFragmentSampleMaskTestBeforeSampleCounting = false;
+      props->earlyFragmentMultisampleCoverageAfterSampleCounting = devinfo->verx10 >= 200;
+      props->earlyFragmentSampleMaskTestBeforeSampleCounting = devinfo->verx10 >= 200;
       props->depthStencilSwizzleOneSupport = true;
       props->polygonModePointSize = true;
       props->nonStrictSinglePixelWideLinesUseParallelogram = false;
@@ -1506,10 +1560,35 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS;
    }
 
+   /* VK_KHR_maintenance9 */
+   {
+      /* Swizzling of Tile64 images is different in 2D/3D */
+      props->image2DViewOf3DSparse = false;
+      props->defaultVertexAttributeValue =
+         VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR;
+   }
+
+   /* VK_KHR_maintenance10 */
+   {
+      props->rgba4OpaqueBlackSwizzled = true;
+      props->resolveSrgbFormatAppliesTransferFunction = true;
+      props->resolveSrgbFormatSupportsTransferFunctionControl = true;
+   }
+
    /* VK_KHR_performance_query */
    {
       props->allowCommandBufferQueryCopies = false;
    }
+
+   /* VK_KHR_pipeline_binary */
+   {
+      const bool has_disk_cache = pdevice->vk.disk_cache != NULL;
+      props->pipelineBinaryInternalCache = has_disk_cache;
+      props->pipelineBinaryInternalCacheControl = has_disk_cache;
+      props->pipelineBinaryPrefersInternalCache = has_disk_cache;
+      props->pipelineBinaryPrecompiledInternalCache = has_disk_cache;
+      props->pipelineBinaryCompressedData = false;
+    }
 
    /* VK_KHR_push_descriptor */
    {
@@ -1543,7 +1622,7 @@ get_properties(const struct anv_physical_device *pdevice,
       props->robustStorageBufferAccessSizeAlignment =
          ANV_SSBO_BOUNDS_CHECK_ALIGNMENT;
       props->robustUniformBufferAccessSizeAlignment =
-         ANV_UBO_ALIGNMENT;
+         ANV_UBO_BOUNDS_CHECK_ALIGNMENT;
    }
 
    /* VK_KHR_vertex_attribute_divisor */
@@ -1606,7 +1685,11 @@ get_properties(const struct anv_physical_device *pdevice,
 
       /* Storing a 64bit address */
       props->bufferCaptureReplayDescriptorDataSize = 8;
-      props->imageCaptureReplayDescriptorDataSize = 8;
+      /* 4 64bit addresses for the worst case (multiplanar disjoint +
+       * private binding)
+       */
+      props->imageCaptureReplayDescriptorDataSize =
+         sizeof(struct anv_image_opaque_capture_data);
       /* Offset inside the reserved border color pool */
       props->samplerCaptureReplayDescriptorDataSize = 4;
 
@@ -1648,7 +1731,7 @@ get_properties(const struct anv_physical_device *pdevice,
 
    /* VK_EXT_external_memory_host */
    {
-      props->minImportedHostPointerAlignment = 4096;
+      props->minImportedHostPointerAlignment = page_size;
    }
 
    /* VK_EXT_graphics_pipeline_library */
@@ -1751,7 +1834,7 @@ get_properties(const struct anv_physical_device *pdevice,
 
    /* VK_EXT_map_memory_placed */
    {
-      props->minPlacedMemoryMapAlignment = 4096;
+      props->minPlacedMemoryMapAlignment = page_size;
    }
 
    /* VK_EXT_mesh_shader */
@@ -1817,7 +1900,7 @@ get_properties(const struct anv_physical_device *pdevice,
 
       /* NumPrim + Primitive Data List */
       const uint32_t max_indices_memory =
-         ALIGN(sizeof(uint32_t) +
+         align(sizeof(uint32_t) +
                sizeof(uint32_t) * props->maxMeshOutputVertices, 32);
 
       props->maxMeshOutputMemorySize = MIN2(max_urb_size - max_indices_memory, 32768);
@@ -1935,7 +2018,7 @@ get_properties(const struct anv_physical_device *pdevice,
    /* VK_EXT_sample_locations */
    {
       props->sampleLocationSampleCounts =
-         isl_device_get_sample_counts(&pdevice->isl_dev);
+         ~VK_SAMPLE_COUNT_1_BIT & isl_device_get_sample_counts(&pdevice->isl_dev);
 
       /* See also anv_GetPhysicalDeviceMultisamplePropertiesEXT */
       props->maxSampleLocationGridSize.width = 1;
@@ -1971,10 +2054,17 @@ get_properties(const struct anv_physical_device *pdevice,
       props->transformFeedbackDraw = true;
    }
 
-   /* VK_ANDROID_native_buffer */
 #if DETECT_OS_ANDROID
+   /* VK_ANDROID_native_buffer */
    {
-      props->sharedImage = front_rendering_usage ? VK_TRUE : VK_FALSE;
+      props->sharedImage = !!vk_android_get_front_buffer_usage();
+   }
+
+   /* VK_ANDROID_external_format_resolve */
+   {
+      props->nullColorAttachmentWithExternalFormatResolve = VK_FALSE;
+      props->externalFormatResolveChromaOffsetX = VK_CHROMA_LOCATION_MIDPOINT;
+      props->externalFormatResolveChromaOffsetY = VK_CHROMA_LOCATION_MIDPOINT;
    }
 #endif /* DETECT_OS_ANDROID */
 
@@ -1983,6 +2073,25 @@ get_properties(const struct anv_physical_device *pdevice,
    {
       /* We support 4k/64k tiling alignments on most platforms */
       props->supportedImageAlignmentMask = (1 << 12) | (1 << 16);
+   }
+
+   /* VK_EXT_shader_object */
+   {
+      memcpy(props->shaderBinaryUUID, pdevice->shader_binary_uuid, VK_UUID_SIZE);
+      /* We currently leave this to 0 because shaderBinaryUUID includes the
+       * entire git tree hash a well as all the compiler's tune knobs
+       * (INTEL_PRECISE_TRIG, INTEL_LOWER_DPAS, etc...) and the driver's
+       * workaround booleans.
+       *
+       * Supporting different binary version would mean supporting binaries
+       * from another driver version which we're really not setup to do at the
+       * moment. Any driver change in particular apply_pipeline_layout
+       * decisions (like where to find the workgroup_size value) would need to
+       * be versioned and the driver ready to deal with different ways of
+       * doing these things. Clearly a nighmare of testing across various HW
+       * generations & driver versions.
+       */
+      props->shaderBinaryVersion = 0;
    }
 }
 
@@ -2496,7 +2605,7 @@ anv_physical_device_get_parameters(struct anv_physical_device *device)
    case INTEL_KMD_TYPE_XE:
       return anv_xe_physical_device_get_parameters(device);
    default:
-      unreachable("Missing");
+      UNREACHABLE("Missing");
       return VK_ERROR_UNKNOWN;
    }
 }
@@ -2546,11 +2655,19 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
       /* If INTEL_FORCE_PROBE was used, then the user has opted-in for
        * unsupported device support. No need to print a warning message.
        */
-   } else if (devinfo.ver > 20) {
+   } else if (devinfo.ver > 30) {
       result = vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
                          "Vulkan not yet supported on %s", devinfo.name);
       goto fail_fd;
    }
+
+   /* Disable Wa_16013994831 on Gfx12.0 because we found other cases where we
+    * need to always disable preemption :
+    *    - https://gitlab.freedesktop.org/mesa/mesa/-/issues/5963
+    *    - https://gitlab.freedesktop.org/mesa/mesa/-/issues/5662
+    */
+   if (devinfo.verx10 == 120)
+      BITSET_CLEAR(devinfo.workarounds, INTEL_WA_16013994831);
 
    if (!devinfo.has_context_isolation) {
       result = vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -2628,30 +2745,13 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    device->has_cooperative_matrix =
       device->info.cooperative_matrix_configurations[0].scope != INTEL_CMAT_SCOPE_NONE;
 
-   unsigned st_idx = 0;
-
    device->sync_syncobj_type = vk_drm_syncobj_get_type(fd);
-   if (!device->has_exec_timeline)
-      device->sync_syncobj_type.features &= ~VK_SYNC_FEATURE_TIMELINE;
-   device->sync_types[st_idx++] = &device->sync_syncobj_type;
+   assert(vk_sync_type_is_drm_syncobj(&device->sync_syncobj_type));
+   assert(device->sync_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE);
+   assert(device->sync_syncobj_type.features & VK_SYNC_FEATURE_CPU_WAIT);
 
-   /* anv_bo_sync_type is only supported with i915 for now  */
-   if (device->info.kmd_type == INTEL_KMD_TYPE_I915) {
-      if (!(device->sync_syncobj_type.features & VK_SYNC_FEATURE_CPU_WAIT))
-         device->sync_types[st_idx++] = &anv_bo_sync_type;
-
-      if (!(device->sync_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE)) {
-         device->sync_timeline_type = vk_sync_timeline_get_type(&anv_bo_sync_type);
-         device->sync_types[st_idx++] = &device->sync_timeline_type.sync;
-      }
-   } else {
-      assert(vk_sync_type_is_drm_syncobj(&device->sync_syncobj_type));
-      assert(device->sync_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE);
-      assert(device->sync_syncobj_type.features & VK_SYNC_FEATURE_CPU_WAIT);
-   }
-
-   device->sync_types[st_idx++] = NULL;
-   assert(st_idx <= ARRAY_SIZE(device->sync_types));
+   device->sync_types[0] = &device->sync_syncobj_type;
+   device->sync_types[1] = NULL;
    device->vk.supported_sync_types = device->sync_types;
 
    device->vk.pipeline_cache_import_ops = anv_cache_import_ops;
@@ -2683,7 +2783,7 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
          else
             device->sparse_type = ANV_SPARSE_TYPE_VM_BIND;
       } else {
-         if (device->info.ver >= 12 && device->has_exec_timeline)
+         if (device->info.ver >= 12)
             device->sparse_type = ANV_SPARSE_TYPE_TRTT;
       }
    }
@@ -2718,6 +2818,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    if (result != VK_SUCCESS)
       goto fail_compiler;
 
+   os_get_page_size(&device->page_size);
+
    anv_physical_device_init_va_ranges(device);
 
    anv_physical_device_init_disk_cache(device);
@@ -2740,6 +2842,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    anv_physical_device_init_queue_families(device);
 
    anv_physical_device_init_perf(device, fd);
+
+   anv_shader_init_uuid(device);
 
    /* Gather major/minor before WSI. */
    struct stat st;
@@ -2778,6 +2882,7 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    anv_measure_device_init(device);
 
    anv_genX(&device->info, init_physical_device_state)(device);
+   anv_genX(&device->info, init_instructions)(device);
 
    *out = &device->vk;
 
@@ -2903,7 +3008,8 @@ void anv_GetPhysicalDeviceQueueFamilyProperties2(
                   (VkQueueFamilyVideoPropertiesKHR *)ext;
                if (queue_family->queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
                   prop->videoCodecOperations = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR |
-                                               VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
+                                               VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR |
+                                               VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
                   if (pdevice->info.ver >= 12)
                      prop->videoCodecOperations |= VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
                }
@@ -2914,6 +3020,17 @@ void anv_GetPhysicalDeviceQueueFamilyProperties2(
                }
                break;
             }
+
+            case VK_STRUCTURE_TYPE_QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR: {
+               VkQueueFamilyOwnershipTransferPropertiesKHR *prop =
+                  (VkQueueFamilyOwnershipTransferPropertiesKHR *)ext;
+               if (pdevice->info.ver >= 20)
+                  prop->optimalImageTransferToQueueFamilies = BITSET_MASK(pdevice->queue.family_count);
+               else
+                  prop->optimalImageTransferToQueueFamilies = 0;
+               break;
+            }
+
             default:
                vk_debug_ignored_stype(ext->sType);
             }
@@ -3047,8 +3164,11 @@ void anv_GetPhysicalDeviceMultisamplePropertiesEXT(
    assert(pMultisampleProperties->sType ==
           VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT);
 
+   VkSampleCountFlags sample_counts =
+      ~VK_SAMPLE_COUNT_1_BIT & isl_device_get_sample_counts(&physical_device->isl_dev);
+
    VkExtent2D grid_size;
-   if (samples & isl_device_get_sample_counts(&physical_device->isl_dev)) {
+   if (samples & sample_counts) {
       grid_size.width = 1;
       grid_size.height = 1;
    } else {
@@ -3142,7 +3262,7 @@ convert_component_type(enum intel_cooperative_matrix_component_type t)
    case INTEL_CMAT_UINT8:    return VK_COMPONENT_TYPE_UINT8_KHR;
    case INTEL_CMAT_BFLOAT16: return VK_COMPONENT_TYPE_BFLOAT16_KHR;
    }
-   unreachable("invalid cooperative matrix component type in configuration");
+   UNREACHABLE("invalid cooperative matrix component type in configuration");
 }
 
 static VkScopeKHR
@@ -3151,7 +3271,7 @@ convert_scope(enum intel_cmat_scope scope)
    switch (scope) {
    case INTEL_CMAT_SCOPE_SUBGROUP: return VK_SCOPE_SUBGROUP_KHR;
    default:
-      unreachable("invalid cooperative matrix scope in configuration");
+      UNREACHABLE("invalid cooperative matrix scope in configuration");
    }
 }
 

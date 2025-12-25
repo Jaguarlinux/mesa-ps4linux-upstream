@@ -265,6 +265,9 @@ protected:
       es_tess_coord,
       es_primitive_id,
       es_helper_invocation,
+      es_base_instance,
+      es_base_vertex,
+      es_draw_id,
       es_last
    };
 
@@ -377,7 +380,6 @@ private:
       void visit(FetchInstr *instr) override { (void)instr; }
       void visit(Block *instr) override { (void)instr; }
       void visit(ControlFlowInstr *instr) override { (void)instr; }
-      void visit(IfInstr *instr) override { (void)instr; }
       void visit(StreamOutInstr *instr) override { (void)instr; }
       void visit(MemRingOutInstr *instr) override { (void)instr; }
       void visit(EmitVertexInstr *instr) override { (void)instr; }
@@ -385,6 +387,7 @@ private:
       void visit(LDSAtomicInstr *instr) override { (void)instr; }
       void visit(LDSReadInstr *instr) override { (void)instr; }
 
+      void visit(IfInstr *instr) override;
       void visit(AluInstr *instr) override;
       void visit(ScratchIOInstr *instr) override;
       void visit(GDSInstr *instr) override;

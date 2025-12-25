@@ -1,14 +1,14 @@
 %YAML 1.2
 ---
 traces-db:
-  download-url: "http://caching-proxy/cache/?uri=https://s3.freedesktop.org/mesa-tracie-private/"
+  download-url: "https://s3.freedesktop.org/mesa-tracie-private/"
 
 traces:
   AmnesiaTDD/Amnesia-f700-v2.trace:
     gl-zink-anv-adl:
-      checksum: c0a3a735ce4dcc394af8bef0289ba8b1
+      checksum: 3bb7b70d76d084acc367f78aeac2bff1
     gl-zink-anv-tgl:
-      checksum: c0a3a735ce4dcc394af8bef0289ba8b1
+      checksum: 3bb7b70d76d084acc367f78aeac2bff1
 
   Anna/Anna-f692-v2.trace:
     gl-zink-anv-adl:
@@ -187,18 +187,24 @@ traces:
   ksp/KSP-trim--f4800-v20201203-v2.trace:
     gl-zink-anv-adl:
       label: [skip, flakes]
-      checksum: 28b08ee598387fdc58b6e0e92261e1d3
+      checksum: 35397140d1fe2cc92146a4e3474df08b
       text: "has caused ../src/gallium/drivers/zink/zink_context.c:4127: zink_wait_on_batch: Assertion `batch_id' failed."
     gl-zink-anv-tgl:
-      checksum: 28b08ee598387fdc58b6e0e92261e1d3
+      checksum: 35397140d1fe2cc92146a4e3474df08b
+
+  minecraft/minecraft-loading.trace:
+    gl-zink-anv-adl:
+      checksum: 31e922dc761aeffd6674b78706228f79
+    gl-zink-anv-tgl:
+      checksum: 31e922dc761aeffd6674b78706228f79
 
   overcooked2/Overcooked2-trim--f3301-v20201203-v2.trace:
     gl-zink-anv-adl:
       label: [skip, flakes]
-      checksum: 2d342febd76eb2b33e0496e5ed57e124
+      checksum: 5007fd6184cccf9d5d009aeefbdbea90
       text: "looks good but checksum keeps changing"
     gl-zink-anv-tgl:
-      checksum: 2d342febd76eb2b33e0496e5ed57e124
+      checksum: 6e3323f5cf728a0101fc028e17054874
 
   plague-inc-evolved/PlagueIncEvolved-trim--f1200-v20201203-v2.trace:
     gl-zink-anv-adl:

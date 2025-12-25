@@ -84,12 +84,12 @@ vn_descriptor_type(VkDescriptorType type)
       break;
    }
 
-   unreachable("bad VkDescriptorType");
+   UNREACHABLE("bad VkDescriptorType");
 }
 
 /* descriptor set layout commands */
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_GetDescriptorSetLayoutSupport(
    VkDevice device,
    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -193,7 +193,7 @@ vn_descriptor_set_layout_init(
                                         create_info, NULL, &layout_handle);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateDescriptorSetLayout(
    VkDevice device,
    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -257,7 +257,7 @@ vn_CreateDescriptorSetLayout(
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyDescriptorSetLayout(VkDevice device,
                               VkDescriptorSetLayout descriptorSetLayout,
                               const VkAllocationCallbacks *pAllocator)
@@ -274,7 +274,7 @@ vn_DestroyDescriptorSetLayout(VkDevice device,
 
 /* descriptor pool commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateDescriptorPool(VkDevice device,
                         const VkDescriptorPoolCreateInfo *pCreateInfo,
                         const VkAllocationCallbacks *pAllocator,
@@ -398,7 +398,7 @@ vn_CreateDescriptorPool(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyDescriptorPool(VkDevice device,
                          VkDescriptorPool descriptorPool,
                          const VkAllocationCallbacks *pAllocator)
@@ -447,7 +447,7 @@ vn_get_mutable_state(const struct vn_descriptor_pool *pool,
       if (BITSET_EQUAL(shared_types, binding->mutable_descriptor_types))
          return mutable_state;
    }
-   unreachable("bad mutable descriptor binding");
+   UNREACHABLE("bad mutable descriptor binding");
 }
 
 static inline void
@@ -574,7 +574,7 @@ vn_descriptor_pool_reset_descriptors(struct vn_descriptor_pool *pool)
       pool->mutable_states[i].used = 0;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_ResetDescriptorPool(VkDevice device,
                        VkDescriptorPool descriptorPool,
                        VkDescriptorPoolResetFlags flags)
@@ -608,7 +608,7 @@ vn_ResetDescriptorPool(VkDevice device,
 
 /* descriptor set commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_AllocateDescriptorSets(VkDevice device,
                           const VkDescriptorSetAllocateInfo *pAllocateInfo,
                           VkDescriptorSet *pDescriptorSets)
@@ -753,7 +753,7 @@ fail:
    return vn_error(dev->instance, result);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_FreeDescriptorSets(VkDevice device,
                       VkDescriptorPool descriptorPool,
                       uint32_t descriptorSetCount,
@@ -886,7 +886,7 @@ vn_descriptor_set_get_writes(uint32_t write_count,
    return local->writes;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_UpdateDescriptorSets(VkDevice device,
                         uint32_t descriptorWriteCount,
                         const VkWriteDescriptorSet *pDescriptorWrites,
@@ -953,13 +953,13 @@ vn_descriptor_update_template_init(
       case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
          break;
       default:
-         unreachable("unhandled descriptor type");
+         UNREACHABLE("unhandled descriptor type");
          break;
       }
    }
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateDescriptorUpdateTemplate(
    VkDevice device,
    const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
@@ -999,7 +999,7 @@ vn_CreateDescriptorUpdateTemplate(
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyDescriptorUpdateTemplate(
    VkDevice device,
    VkDescriptorUpdateTemplate descriptorUpdateTemplate,
@@ -1120,7 +1120,7 @@ vn_descriptor_set_fill_update_with_template(
       case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
          break;
       default:
-         unreachable("unhandled descriptor type");
+         UNREACHABLE("unhandled descriptor type");
          break;
       }
       update->writes[i] = (VkWriteDescriptorSet){
@@ -1138,7 +1138,7 @@ vn_descriptor_set_fill_update_with_template(
    }
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_UpdateDescriptorSetWithTemplate(
    VkDevice device,
    VkDescriptorSet descriptorSet,

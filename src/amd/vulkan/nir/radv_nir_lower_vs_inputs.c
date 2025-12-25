@@ -196,6 +196,11 @@ lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin, lower_vs_inputs
    const unsigned bit_size = intrin->def.bit_size;
    const unsigned dest_num_components = intrin->def.num_components;
 
+   if (!(s->gfx_state->vi.attributes_valid & (1 << location))) {
+      /* Return early for unassigned attribute reads. */
+      return nir_imm_zero(b, intrin->def.num_components, intrin->def.bit_size);
+   }
+
    /* Convert the component offset to bit_size units.
     * (Intrinsic component offset is in 32-bit units.)
     *
@@ -222,14 +227,15 @@ lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin, lower_vs_inputs
    const uint32_t attrib_stride = s->gfx_state->vi.vertex_attribute_strides[location];
    const enum pipe_format attrib_format = s->gfx_state->vi.vertex_attribute_formats[location];
    const struct util_format_description *f = util_format_description(attrib_format);
-   const struct ac_vtx_format_info *vtx_info =
-      ac_get_vtx_format_info(s->gpu_info->gfx_level, s->gpu_info->family, attrib_format);
+   const struct ac_vtx_format_info *vtx_info = ac_get_vtx_format_info(
+      s->gpu_info->gfx_level, s->gpu_info->cu_info.has_vtx_format_alpha_adjust_bug, attrib_format);
    const unsigned binding_index = s->info->vs.use_per_attribute_vb_descs ? location : attrib_binding;
-   const unsigned desc_index = util_bitcount(s->info->vs.vb_desc_usage_mask & u_bit_consecutive(0, binding_index));
+   const unsigned desc_index = util_bitcount(s->info->vs.vb_desc_usage_mask & BITFIELD_MASK(binding_index));
 
    nir_def *vertex_buffers_arg = ac_nir_load_arg(b, &s->args->ac, s->args->ac.vertex_buffers);
    nir_def *vertex_buffers = nir_pack_64_2x32_split(b, vertex_buffers_arg, nir_imm_int(b, s->gpu_info->address32_hi));
-   nir_def *descriptor = nir_load_smem_amd(b, 4, vertex_buffers, nir_imm_int(b, desc_index * 16));
+   nir_def *descriptor =
+      ac_nir_load_smem(b, 4, vertex_buffers, nir_imm_int(b, desc_index * 16), 4, ACCESS_CAN_SPECULATE);
    nir_def *base_index = calc_vs_input_index(b, location, s);
    nir_def *zero = nir_imm_int(b, 0);
 
@@ -319,13 +325,14 @@ lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin, lower_vs_inputs
        * Typed loads can cause GPU hangs when used with improper alignment.
        */
       if (can_use_untyped_load(f, bit_size)) {
-         loads[num_loads++] = nir_load_buffer_amd(b, channels, bit_size, descriptor, zero, zero, index,
-                                                  .base = const_off, .memory_modes = nir_var_shader_in,
-                                                  .align_mul = align_mul, .align_offset = align_offset);
+         loads[num_loads++] = nir_load_buffer_amd(
+            b, channels, bit_size, descriptor, zero, zero, index, .base = const_off, .memory_modes = nir_var_shader_in,
+            .align_mul = align_mul, .align_offset = align_offset, .access = ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
       } else {
          loads[num_loads++] = nir_load_typed_buffer_amd(
             b, channels, bit_size, descriptor, zero, zero, index, .base = const_off, .format = fetch_format,
-            .align_mul = align_mul, .align_offset = align_offset, .memory_modes = nir_var_shader_in);
+            .align_mul = align_mul, .align_offset = align_offset, .memory_modes = nir_var_shader_in,
+            .access = ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE);
       }
    }
 
@@ -442,23 +449,29 @@ opt_vs_input_to_const(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
    const unsigned bit_size = intrin->def.bit_size;
    const unsigned component = var->data.location_frac >> (bit_size == 64 ? 1 : 0);
 
-   const enum pipe_format attrib_format = gfx_state->vi.vertex_attribute_formats[location];
-   const struct util_format_description *f = util_format_description(attrib_format);
-
    b->cursor = nir_after_instr(&intrin->instr);
 
    nir_def *res = &intrin->def;
-   for (unsigned i = 0; i < intrin->def.num_components; i++) {
-      const unsigned c = i + component;
-      if (f->swizzle[c] >= f->nr_channels) {
-         /* Handle input loads that are larger than their format. */
-         nir_def *channel = oob_input_load_value(b, c, bit_size, !is_integer);
-         res = nir_vector_insert_imm(b, res, channel, i);
+
+   if (gfx_state->vi.attributes_valid & (1 << location)) {
+      const enum pipe_format attrib_format = gfx_state->vi.vertex_attribute_formats[location];
+      const struct util_format_description *f = util_format_description(attrib_format);
+
+      for (unsigned i = 0; i < intrin->def.num_components; i++) {
+         const unsigned c = i + component;
+         if (f->swizzle[c] >= f->nr_channels) {
+            /* Handle input loads that are larger than their format. */
+            nir_def *channel = oob_input_load_value(b, c, bit_size, !is_integer);
+            res = nir_vector_insert_imm(b, res, channel, i);
+         }
       }
+   } else {
+      /* Use (0,0,0,0) for unassigned attribute reads. */
+      res = nir_imm_zero(b, intrin->def.num_components, intrin->def.bit_size);
    }
 
    if (res != &intrin->def) {
-      nir_def_rewrite_uses_after(&intrin->def, res, res->parent_instr);
+      nir_def_rewrite_uses_after(&intrin->def, res);
       return true;
    } else {
       return false;

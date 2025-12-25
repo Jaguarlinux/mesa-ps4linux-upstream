@@ -17,6 +17,7 @@
 #include "panvk_blend.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_device.h"
+#include "panvk_meta.h"
 #include "panvk_shader.h"
 
 struct panvk_blend_shader_key {
@@ -85,8 +86,9 @@ get_blend_shader(struct panvk_device *dev,
             nir_metadata_control_flow, NULL);
 
    /* Compile the NIR shader */
-   struct panfrost_compile_inputs inputs = {
-      .gpu_id = pdev->kmod.props.gpu_prod_id,
+   struct pan_compile_inputs inputs = {
+      .gpu_id = pdev->kmod.dev->props.gpu_id,
+      .gpu_variant = pdev->kmod.dev->props.gpu_variant,
       .is_blend = true,
       .blend = {
          .nr_samples = key.info.nr_samples,
@@ -96,7 +98,8 @@ get_blend_shader(struct panvk_device *dev,
       },
    };
 
-   pan_shader_preprocess(nir, inputs.gpu_id);
+   pan_preprocess_nir(nir, inputs.gpu_id);
+   pan_postprocess_nir(nir, inputs.gpu_id);
 
    enum pipe_format rt_formats[8] = {0};
    rt_formats[rt] = key.info.format;
@@ -152,7 +155,7 @@ emit_blend_desc(const struct pan_shader_info *fs_info, uint64_t fs_code,
          cfg.internal.mode = MALI_BLEND_MODE_SHADER;
          cfg.internal.shader.pc = (uint32_t)blend_shader;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
          uint32_t ret_offset = fs_info->bifrost.blend[blend_idx].return_offset;
 
          /* If ret_offset is zero, we assume the BLEND is a terminal
@@ -176,7 +179,7 @@ emit_blend_desc(const struct pan_shader_info *fs_info, uint64_t fs_code,
           */
          cfg.internal.fixed_function.num_comps = 4;
          cfg.internal.fixed_function.conversion.memory_format =
-            GENX(panfrost_dithered_format_from_pipe_format)(rt->format, false);
+            GENX(pan_dithered_format_from_pipe_format)(rt->format, false);
 
 #if PAN_ARCH >= 7
          if (cfg.internal.mode == MALI_BLEND_MODE_FIXED_FUNCTION &&
@@ -192,15 +195,14 @@ emit_blend_desc(const struct pan_shader_info *fs_info, uint64_t fs_code,
 
          cfg.internal.fixed_function.rt = rt_idx;
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
+         nir_alu_type type = fs_info->bifrost.blend[blend_idx].type;
          if (fs_info->fs.untyped_color_outputs) {
-            nir_alu_type type = fs_info->bifrost.blend[blend_idx].type;
-
             cfg.internal.fixed_function.conversion.register_format =
                GENX(pan_fixup_blend_type)(type, rt->format);
          } else {
             cfg.internal.fixed_function.conversion.register_format =
-               fs_info->bifrost.blend[blend_idx].format;
+               pan_blend_type_from_nir(type);
          }
 
          if (!opaque) {
@@ -240,11 +242,9 @@ blend_needs_shader(const struct pan_blend_state *state, unsigned rt_idx,
 {
    const struct pan_blend_rt_state *rt = &state->rts[rt_idx];
 
-   /* LogicOp requires a blend shader, unless it's a NOOP, in which case we just
-    * disable blending.
-    */
+   /* LogicOp requires a blend shader */
    if (state->logicop_enable)
-      return state->logicop_func != PIPE_LOGICOP_NOOP;
+      return true;
 
    /* alpha-to-one always requires a blend shader */
    if (state->alpha_to_one)
@@ -257,7 +257,7 @@ blend_needs_shader(const struct pan_blend_state *state, unsigned rt_idx,
       return false;
 
    /* Not all formats can be blended by fixed-function hardware */
-   if (!GENX(panfrost_blendable_format_from_pipe_format)(rt->format)->internal)
+   if (!GENX(pan_blendable_format_from_pipe_format)(rt->format)->internal)
       return true;
 
    unsigned constant_mask = pan_blend_constant_mask(rt->equation);
@@ -302,9 +302,10 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
       &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_color_blend_state *cb = &dyns->cb;
    const struct vk_color_attachment_location_state *cal = &dyns->cal;
-   const struct panvk_shader *fs = cmdbuf->state.gfx.fs.shader;
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(cmdbuf->state.gfx.fs.shader);
    const struct pan_shader_info *fs_info = fs ? &fs->info : NULL;
-   uint64_t fs_code = panvk_shader_get_dev_addr(fs);
+   uint64_t fs_code = panvk_shader_variant_get_dev_addr(fs);
    const struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
    const VkFormat *color_attachment_formats = render->color_attachments.fmts;
    const uint8_t *color_attachment_samples = render->color_attachments.samples;
@@ -357,11 +358,6 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
          continue;
       }
 
-      if (bs.logicop_enable && bs.logicop_func == PIPE_LOGICOP_NOOP) {
-         rt->equation.color_mask = 0;
-         continue;
-      }
-
       if (color_attachment_formats[i] == VK_FORMAT_UNDEFINED) {
          rt->equation.color_mask = 0;
          continue;
@@ -373,6 +369,14 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
       }
 
       rt->format = vk_format_to_pipe_format(color_attachment_formats[i]);
+
+      /* Disable blending for LOGICOP_NOOP unless the format is float/srgb */
+      if (bs.logicop_enable && bs.logicop_func == PIPE_LOGICOP_NOOP &&
+          !(util_format_is_float(rt->format) ||
+            util_format_is_srgb(rt->format))) {
+         rt->equation.color_mask = 0;
+         continue;
+      }
 
       rt->nr_samples = color_attachment_samples[i];
       rt->equation.blend_enable = cb->attachments[i].blend_enable;

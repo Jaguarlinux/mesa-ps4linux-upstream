@@ -21,7 +21,6 @@ idep_si_tracepoints = declare_dependency(
 
 files_libradeonsi = files(
   'driinfo_radeonsi.h',
-  'gfx10_shader_ngg.c',
   'gfx11_query.c',
   'si_barrier.c',
   'si_blit.c',
@@ -47,6 +46,7 @@ files_libradeonsi = files(
   'si_public.h',
   'si_query.c',
   'si_query.h',
+  'si_mesh_shader.c',
   'si_nir_clamp_shadow_comparison_value.c',
   'si_nir_kill_outputs.c',
   'si_nir_lower_abi.c',
@@ -62,6 +62,7 @@ files_libradeonsi = files(
   'si_shader.h',
   'si_shader_aco.c',
   'si_shader_args.c',
+  'si_shader_binary.c',
   'si_shader_info.c',
   'si_shader_info.h',
   'si_shader_internal.h',
@@ -154,6 +155,11 @@ if with_amdgpu_virtio
   libradeonsi_cflags += ['-DHAVE_AMDGPU_VIRTIO']
 endif
 
+radeonsi_build_id = get_option('radeonsi-build-id')
+if radeonsi_build_id != ''
+  libradeonsi_cflags += '-DRADEONSI_BUILD_ID_OVERRIDE="' + radeonsi_build_id + '"'
+endif
+
 libradeonsi = static_library(
   'radeonsi',
   [files_libradeonsi, sid_tables_h],
@@ -166,7 +172,7 @@ libradeonsi = static_library(
 driver_radeonsi = declare_dependency(
   compile_args : ['-DGALLIUM_RADEONSI'] + libradeonsi_cflags,
   link_with : radeonsi_gfx_libs + [
-    libradeonsi, libradeonwinsys, libamdgpuwinsys, libamd_common, libamd_common_llvm, libvpe, libgm
+    libradeonsi, libradeonwinsys, libamdgpuwinsys, libamd_common, libamd_common_llvm, libvpe, libgm, liblanczos
   ],
   dependencies : idep_nir,
 )

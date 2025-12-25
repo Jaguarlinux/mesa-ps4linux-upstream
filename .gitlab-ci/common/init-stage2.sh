@@ -108,9 +108,6 @@ export PATH=/usr/local/bin:$PATH
 # Store Mesa's disk cache under /tmp, rather than sending it out over NFS.
 export XDG_CACHE_HOME=/tmp
 
-# Make sure Python can find all our imports
-export PYTHONPATH=$(python3 -c "import sys;print(\":\".join(sys.path))")
-
 # If we need to specify a driver, it means several drivers could pick up this gpu;
 # ensure that the other driver can't accidentally be used
 if [ -n "$MESA_LOADER_DRIVER_OVERRIDE" ]; then
@@ -166,6 +163,11 @@ fi
 ARCH=$(uname -m)
 export VK_DRIVER_FILES="/install/share/vulkan/icd.d/${VK_DRIVER}_icd.$ARCH.json"
 
+if [ -n "$HWCI_START_WESTON" ] && [ -n "$HWCI_START_XORG" ]; then
+  echo "Please drop HWCI_START_XORG and instead use Weston XWayland for testing."
+  exit 1
+fi
+
 # If we want Xorg to be running for the test, then we start it up before the
 # HWCI_TEST_SCRIPT because we need to use xinit to start X (otherwise
 # without using -displayfd you can race with Xorg's startup), but xinit will eat
@@ -187,22 +189,8 @@ if [ -n "$HWCI_START_XORG" ]; then
 fi
 
 if [ -n "$HWCI_START_WESTON" ]; then
-  WESTON_X11_SOCK="/tmp/.X11-unix/X0"
-  if [ -n "$HWCI_START_XORG" ]; then
-    echo "Please consider dropping HWCI_START_XORG and instead using Weston XWayland for testing."
-    WESTON_X11_SOCK="/tmp/.X11-unix/X1"
-  fi
-  export WAYLAND_DISPLAY=wayland-0
-
-  # Display server is Weston Xwayland when HWCI_START_XORG is not set or Xorg when it's
-  export DISPLAY=:0
-  mkdir -p /tmp/.X11-unix
-
-  env \
-    weston -Bheadless-backend.so --use-gl -Swayland-0 --xwayland --idle-time=0 &
+  . /install/common/weston.sh --renderer=gl
   BACKGROUND_PIDS="$! $BACKGROUND_PIDS"
-
-  while [ ! -S "$WESTON_X11_SOCK" ]; do sleep 1; done
 fi
 
 set +x
@@ -229,10 +217,6 @@ if [ -n "$S3_RESULTS_UPLOAD" ]; then
   ci-fairy s3cp --token-file "${S3_JWT_FILE}" results.tar.zst https://"$S3_RESULTS_UPLOAD"/results.tar.zst
 fi
 
-# We still need to echo the hwci: mesa message, as some scripts rely on it, such
-# as the python ones inside the bare-metal folder
-[ ${EXIT_CODE} -eq 0 ] && RESULT=pass || RESULT=fail
-
 set +x
 section_end post_test_cleanup
 
@@ -240,6 +224,6 @@ section_end post_test_cleanup
 # the result of our run, so try really hard to get it out rather than losing
 # the run. The device gets shut down right at this point, and a630 seems to
 # enjoy corrupting the last line of serial output before shutdown.
-for _ in $(seq 0 3); do echo "hwci: mesa: $RESULT, exit_code: $EXIT_CODE"; sleep 1; echo; done
+for _ in $(seq 0 3); do echo "hwci: mesa: exit_code: $EXIT_CODE"; sleep 1; echo; done
 
 exit $EXIT_CODE

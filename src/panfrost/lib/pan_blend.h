@@ -31,8 +31,6 @@
 #include "util/blend.h"
 #include "util/format/u_format.h"
 
-#include "panfrost/util/pan_ir.h"
-
 struct MALI_BLEND_EQUATION;
 
 struct pan_blend_equation {
@@ -139,7 +137,7 @@ uint64_t GENX(pan_blend_get_internal_desc)(enum pipe_format fmt, unsigned rt,
 
 bool GENX(pan_inline_rt_conversion)(nir_shader *s, enum pipe_format *formats);
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 enum mali_register_file_format
    GENX(pan_fixup_blend_type)(nir_alu_type T_size, enum pipe_format format);
 #endif

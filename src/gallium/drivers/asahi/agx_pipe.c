@@ -106,7 +106,7 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
 
    agx_msg(
       "%s%s %dx%dx%d %dL %d/%dM %dS M:%llx %s%s %s%s S:0x%llx LS:0x%llx CS:0x%llx "
-      "Base=0x%llx Size=0x%llx Meta=0x%llx/0x%llx (%s) %s%s%s%s%s%sfd:%d(%d) B:%x @ %p\n",
+      "Base=0x%llx Size=0x%llx Meta=0x%llx/0x%llx (%s) %s%s%s%s%s%sfd:%d(%d) B:%x H:%x/%x @ %p\n",
       msg ?: "", util_format_short_name(res->base.format), res->base.width0,
       res->base.height0, res->base.depth0, res->base.array_size,
       res->base.last_level, res->layout.levels, res->layout.sample_count_sa,
@@ -128,7 +128,7 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
       res->bo->flags & AGX_BO_WRITEBACK ? "WB " : "",
       res->bo->flags & AGX_BO_SHAREABLE ? "SA " : "",
       res->bo->flags & AGX_BO_READONLY ? "RO " : "", res->bo->prime_fd, ino,
-      res->base.bind, res);
+      res->base.bind, res->bo->handle, res->bo->uapi_handle, res);
 }
 
 static void
@@ -181,7 +181,7 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
     */
    if (rsc->modifier == DRM_FORMAT_MOD_LINEAR && (whandle->stride % 16) != 0) {
       FREE(rsc);
-      return false;
+      return NULL;
    }
 
    prsc = &rsc->base;
@@ -191,7 +191,11 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
    pipe_reference_init(&prsc->reference, 1);
    prsc->screen = pscreen;
 
-   prsc->bind |= PIPE_BIND_SHARED;
+   /* Set PIPE_BIND_SCANOUT for lazy on-demand creation of renderonly
+    * scanout resource if agx_resource_get_handle is called for
+    * WINSYS_HANDLE_TYPE_KMS on a kms-ro screen.
+    */
+   prsc->bind |= PIPE_BIND_SHARED | PIPE_BIND_SCANOUT;
 
    rsc->bo = agx_bo_import(dev, whandle->handle);
    /* Sometimes an import can fail e.g. on an invalid buffer fd, out of
@@ -206,12 +210,12 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
 
    if (rsc->layout.tiling == AIL_TILING_LINEAR) {
       rsc->layout.linear_stride_B = whandle->stride;
-   } else if (whandle->stride != ail_get_wsi_stride_B(&rsc->layout, 0)) {
+      rsc->layout.level_offsets_B[0] = whandle->offset;
+   } else if (whandle->stride != ail_get_wsi_stride_B(&rsc->layout, 0) ||
+              whandle->offset != 0) {
       FREE(rsc);
       return NULL;
    }
-
-   assert(whandle->offset == 0);
 
    ail_make_miptree(&rsc->layout);
 
@@ -260,6 +264,9 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
       rsrc_debug(rsrc, "Get handle: %p (KMS)\n", rsrc);
 
+      /* BO must be considered shared at this point. */
+      agx_bo_make_shared(dev, rsrc->bo);
+
       handle->handle = rsrc->bo->handle;
    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
       int fd = agx_bo_export(dev, rsrc->bo);
@@ -294,7 +301,8 @@ agx_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
                        enum pipe_resource_param param, unsigned usage,
                        uint64_t *value)
 {
-   struct agx_resource *rsrc = (struct agx_resource *)prsc;
+   struct agx_resource *rsrc =
+      (struct agx_resource *)util_resource_at_index(prsc, plane);
 
    switch (param) {
    case PIPE_RESOURCE_PARAM_STRIDE:
@@ -921,7 +929,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
     * compression in software. In some cases, we could use this path for
     * twiddled too, but we don't have a use case for that yet.
     */
-   bool staging_blit = ail_is_level_compressed(&rsrc->layout, level);
+   bool staging_blit = ail_is_level_logically_compressed(&rsrc->layout, level);
 
    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
 
@@ -1089,7 +1097,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
 
       /* Clear colour must be clamped to properly handle signed ints. */
       union pipe_color_union clamped =
-         util_clamp_color(batch->key.cbufs[rt]->format, color);
+         util_clamp_color(batch->key.cbufs[rt].format, color);
 
       batch->uploaded_clear_color[rt] = agx_pool_upload_aligned(
          &batch->pool, clamped.f, sizeof(clamped.f), 16);
@@ -1199,13 +1207,6 @@ agx_flush_resource(struct pipe_context *pctx, struct pipe_resource *pres)
    }
 }
 
-static bool
-is_aligned(unsigned x, unsigned pot_alignment)
-{
-   assert(util_is_power_of_two_nonzero(pot_alignment));
-   return (x & (pot_alignment - 1)) == 0;
-}
-
 static unsigned
 build_timestamp_offset(struct agx_batch *batch, unsigned offset)
 {
@@ -1241,16 +1242,16 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    c->isp_bgobjvals = 0x300;
 
    struct agx_resource *zres = NULL, *sres = NULL;
-   struct pipe_surface *zsbuf = framebuffer->zsbuf;
+   struct pipe_surface *zsbuf = &framebuffer->zsbuf;
 
-   if (framebuffer->zsbuf) {
+   if (framebuffer->zsbuf.texture) {
       agx_pack(&c->isp_zls_pixels, CR_ISP_ZLS_PIXELS, cfg) {
          cfg.x = c->width_px;
          cfg.y = c->height_px;
       }
    }
 
-   if (zsbuf) {
+   if (zsbuf->texture) {
       struct agx_resource *zsres = agx_resource(zsbuf->texture);
       const struct util_format_description *desc =
          util_format_description(zsres->layout.format);
@@ -1268,8 +1269,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       if (zsres->separate_stencil)
          sres = zsres->separate_stencil;
 
-      unsigned level = zsbuf->u.tex.level;
-      unsigned first_layer = zsbuf->u.tex.first_layer;
+      unsigned level = zsbuf->level;
+      unsigned first_layer = zsbuf->first_layer;
 
       if (zres) {
          c->depth.base = agx_map_texture_gpu(zres, first_layer) +
@@ -1277,7 +1278,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          /* Main stride in pages */
          assert((zres->layout.depth_px == 1 ||
-                 is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                 util_is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
                 "Page aligned Z layers");
 
          unsigned stride_pages = zres->layout.layer_stride_B / AIL_PAGESIZE;
@@ -1285,13 +1286,13 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          if (zres->layout.compressed) {
             c->depth.comp_base =
-               agx_map_texture_gpu(zres, 0) + zres->layout.metadata_offset_B +
+               agx_map_gpu(zres) + zres->layout.metadata_offset_B +
                (first_layer * zres->layout.compression_layer_stride_B) +
                zres->layout.level_offsets_compressed_B[level];
 
             /* Meta stride in cache lines */
-            assert(is_aligned(zres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
+            assert(util_is_aligned(zres->layout.compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
                    "Cacheline aligned Z meta layers");
             unsigned stride_lines =
                zres->layout.compression_layer_stride_B / AIL_CACHELINE;
@@ -1315,20 +1316,20 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          /* Main stride in pages */
          assert((sres->layout.depth_px == 1 ||
-                 is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                 util_is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
                 "Page aligned S layers");
          unsigned stride_pages = sres->layout.layer_stride_B / AIL_PAGESIZE;
          c->stencil.stride = ((stride_pages - 1) << 14) | 1;
 
          if (sres->layout.compressed) {
             c->stencil.comp_base =
-               agx_map_texture_gpu(sres, 0) + sres->layout.metadata_offset_B +
+               agx_map_gpu(sres) + sres->layout.metadata_offset_B +
                (first_layer * sres->layout.compression_layer_stride_B) +
                sres->layout.level_offsets_compressed_B[level];
 
             /* Meta stride in cache lines */
-            assert(is_aligned(sres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
+            assert(util_is_aligned(sres->layout.compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
                    "Cacheline aligned S meta layers");
             unsigned stride_lines =
                sres->layout.compression_layer_stride_B / AIL_CACHELINE;
@@ -1571,10 +1572,10 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
       agx_tilebuffer_spills(&batch->tilebuffer_layout);
 
    for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
-      struct pipe_surface *surf = batch->key.cbufs[i];
+      const struct pipe_surface *surf = &batch->key.cbufs[i];
 
       clear_pipeline_textures |=
-         surf && surf->texture && !(batch->clear & (PIPE_CLEAR_COLOR0 << i));
+         surf->texture && !(batch->clear & (PIPE_CLEAR_COLOR0 << i));
    }
 
    /* Scissor and depth bias arrays are staged to dynamic arrays on the CPU. At
@@ -1694,13 +1695,13 @@ agx_invalidate_resource(struct pipe_context *pctx,
    struct agx_batch *batch = agx_get_batch(ctx);
 
    /* Handle the glInvalidateFramebuffer case */
-   if (batch->key.zsbuf && batch->key.zsbuf->texture == resource)
+   if (batch->key.zsbuf.texture == resource)
       batch->resolve &= ~PIPE_CLEAR_DEPTHSTENCIL;
 
    for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
-      struct pipe_surface *surf = batch->key.cbufs[i];
+      const struct pipe_surface *surf = &batch->key.cbufs[i];
 
-      if (surf && surf->texture == resource)
+      if (surf->texture == resource)
          batch->resolve &= ~(PIPE_CLEAR_COLOR0 << i);
    }
 }
@@ -1748,6 +1749,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
     */
 
    ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
+   ctx->virt_ring_idx = priority + 1;
 
    pctx->destroy = agx_destroy_context;
    pctx->flush = agx_flush;
@@ -1861,7 +1863,7 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
 {
    bool is_no16 = agx_device(pscreen)->debug & AGX_DBG_NO16;
 
-   for (unsigned i = 0; i <= PIPE_SHADER_COMPUTE; i++) {
+   for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++) {
       struct pipe_shader_caps *caps =
          (struct pipe_shader_caps *)&pscreen->shader_caps[i];
 
@@ -1870,14 +1872,14 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
 
       caps->max_control_flow_depth = 1024;
 
-      caps->max_inputs = i == PIPE_SHADER_VERTEX ? 16 : 32;
+      caps->max_inputs = i == MESA_SHADER_VERTEX ? 16 : 32;
 
       /* For vertex, the spec min/max is 16. We need more to handle dmat3
        * correctly, though. The full 32 is undesirable since it would require
        * shenanigans to handle.
        */
-      caps->max_outputs = i == PIPE_SHADER_FRAGMENT ? 8
-                          : i == PIPE_SHADER_VERTEX ? 24
+      caps->max_outputs = i == MESA_SHADER_FRAGMENT ? 8
+                          : i == MESA_SHADER_VERTEX ? 24
                                                     : 32;
 
       caps->max_temps = 256; /* GL_MAX_PROGRAM_TEMPORARIES_ARB */
@@ -1898,6 +1900,7 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
       /* This cap is broken, see 9a38dab2d18 ("zink: disable
        * pipe_shader_caps.fp16_const_buffers") */
       caps->fp16_const_buffers = false;
+      caps->glsl_16bit_load_dst = true;
 
       /* TODO: Enable when fully baked */
       if (strcmp(util_get_process_name(), "blender") == 0)
@@ -1950,8 +1953,8 @@ agx_init_compute_caps(struct pipe_screen *pscreen)
    caps->max_compute_units = agx_get_num_cores(dev);
 
    caps->subgroup_sizes = 32;
-
-   caps->max_variable_threads_per_block = 1024; // TODO
+   caps->max_variable_threads_per_block = 1024;
+   caps->max_subgroups = caps->max_variable_threads_per_block / 32;
 }
 
 static void
@@ -1962,6 +1965,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    u_init_pipe_screen_caps(pscreen, 1);
 
    caps->clip_halfz = true;
+   caps->prefer_real_buffer_in_constbuf0 = true;
    caps->npot_textures = true;
    caps->shader_stencil_export = true;
    caps->mixed_color_depth_bits = true;
@@ -1994,6 +1998,12 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    /* Timer resolution is the length of a single tick in nanos */
    caps->timer_resolution = agx_gpu_timestamp_to_ns(agx_device(pscreen), 1);
+
+   caps->shader_subgroup_size = 32;
+   caps->shader_subgroup_supported_stages = BITFIELD_MASK(MESA_SHADER_STAGES);
+   caps->shader_subgroup_supported_features =
+      BITFIELD_MASK(PIPE_SHADER_SUBGROUP_NUM_FEATURES);
+   caps->shader_subgroup_quad_all_stages = true;
 
    caps->sampler_view_target = true;
    caps->texture_swizzle = true;
@@ -2292,13 +2302,6 @@ agx_destroy_screen(struct pipe_screen *pscreen)
    ralloc_free(screen);
 }
 
-static const void *
-agx_get_compiler_options(struct pipe_screen *pscreen, enum pipe_shader_ir ir,
-                         enum pipe_shader_type shader)
-{
-   return &agx_nir_options;
-}
-
 static void
 agx_resource_set_stencil(struct pipe_resource *prsrc,
                          struct pipe_resource *stencil)
@@ -2431,9 +2434,11 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->fence_reference = agx_fence_reference;
    screen->fence_finish = agx_fence_finish;
    screen->fence_get_fd = agx_fence_get_fd;
-   screen->get_compiler_options = agx_get_compiler_options;
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
    screen->get_cl_cts_version = agx_get_cl_cts_version;
+
+   for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
+      screen->nir_options[i] = &agx_nir_options;
 
    screen->resource_create = u_transfer_helper_resource_create;
    screen->resource_destroy = u_transfer_helper_resource_destroy;

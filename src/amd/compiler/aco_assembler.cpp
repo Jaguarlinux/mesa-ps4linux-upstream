@@ -63,9 +63,13 @@ unsigned
 get_mimg_nsa_dwords(const Instruction* instr)
 {
    unsigned addr_dwords = instr->operands.size() - 3;
-   for (unsigned i = 1; i < addr_dwords; i++) {
-      if (instr->operands[3 + i].physReg() !=
-          instr->operands[3 + (i - 1)].physReg().advance(instr->operands[3 + (i - 1)].bytes()))
+   for (unsigned i = 3; i < instr->operands.size(); i++) {
+      if (instr->operands[i].isVectorAligned())
+         addr_dwords--;
+   }
+   for (unsigned i = 4; i < instr->operands.size(); i++) {
+      if (instr->operands[i].physReg() !=
+          instr->operands[i - 1].physReg().advance(instr->operands[i - 1].bytes()))
          return DIV_ROUND_UP(addr_dwords - 1, 4);
    }
    return 0;
@@ -401,7 +405,7 @@ emit_vintrp_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Inst
       } else if (ctx.gfx_level >= GFX10) {
          encoding = (0b110101 << 26);
       } else {
-         unreachable("Unknown gfx_level.");
+         UNREACHABLE("Unknown gfx_level.");
       }
 
       unsigned opsel = instr->opcode == aco_opcode::v_interp_p2_hi_f16 ? 0x8 : 0;
@@ -509,11 +513,17 @@ emit_ds_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instruct
    out.push_back(encoding);
    encoding = 0;
    if (!instr->definitions.empty())
-      encoding |= reg(ctx, instr->definitions[0], 8) << 24;
-   for (unsigned i = 0; i < MIN2(instr->operands.size(), 3); i++) {
-      const Operand& op = instr->operands[i];
+      encoding |= reg(ctx, instr->definitions.back(), 8) << 24;
+   unsigned op_idx = 0;
+   for (unsigned vector_idx = 0; op_idx < MIN2(instr->operands.size(), 3); vector_idx++) {
+      assert(vector_idx < 3);
+
+      const Operand& op = instr->operands[op_idx];
       if (op.physReg() != m0 && !op.isUndefined())
-         encoding |= reg(ctx, op, 8) << (8 * i);
+         encoding |= reg(ctx, op, 8) << (8 * vector_idx);
+      while (instr->operands[op_idx].isVectorAligned())
+         ++op_idx;
+      ++op_idx;
    }
    out.push_back(encoding);
 }
@@ -545,10 +555,7 @@ emit_mubuf_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instr
    bool dlc = mubuf.cache.value & ac_dlc;
 
    uint32_t encoding = (0b111000 << 26);
-   if (ctx.gfx_level >= GFX11 && mubuf.lds) /* GFX11 has separate opcodes for LDS loads */
-      opcode = opcode == 0 ? 0x32 : (opcode + 0x1d);
-   else
-      encoding |= (mubuf.lds ? 1 : 0) << 16;
+   encoding |= (mubuf.lds ? 1 : 0) << 16;
    encoding |= opcode << 18;
    encoding |= (glc ? 1 : 0) << 14;
    if (ctx.gfx_level <= GFX10_3)
@@ -802,8 +809,12 @@ emit_mimg_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
    if (nsa_dwords) {
       out.resize(out.size() + nsa_dwords);
       std::vector<uint32_t>::iterator nsa = std::prev(out.end(), nsa_dwords);
-      for (unsigned i = 0; i < instr->operands.size() - 4u; i++)
-         nsa[i / 4] |= reg(ctx, instr->operands[4 + i], 8) << (i % 4 * 8);
+      for (unsigned i = 4, k = 0; i < instr->operands.size(); i++) {
+         if (instr->operands[i - 1].isVectorAligned())
+            continue;
+         nsa[k / 4] |= reg(ctx, instr->operands[i], 8) << (k % 4 * 8);
+         k++;
+      }
    }
 }
 
@@ -830,8 +841,11 @@ emit_mimg_instruction_gfx12(asm_context& ctx, std::vector<uint32_t>& out, const 
    out.push_back(encoding);
 
    uint8_t vaddr[5] = {0, 0, 0, 0, 0};
-   for (unsigned i = 3; i < instr->operands.size(); i++)
-      vaddr[i - 3] = reg(ctx, instr->operands[i], 8);
+   for (unsigned i = 3, k = 0; i < instr->operands.size(); i++) {
+      if (instr->operands[i - 1].isVectorAligned())
+         continue;
+      vaddr[k++] = reg(ctx, instr->operands[i], 8);
+   }
    int num_vaddr = instr->operands.size() - 3;
    for (int i = 0; i < (int)MIN2(instr->operands.back().size() - 1, ARRAY_SIZE(vaddr) - num_vaddr); i++)
       vaddr[num_vaddr + i] = reg(ctx, instr->operands.back(), 8) + i + 1;
@@ -985,6 +999,14 @@ emit_exp_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instruc
    encoding |= exp.done ? 0b1 << 11 : 0;
    encoding |= exp.dest << 4;
    encoding |= exp.enabled_mask;
+
+   /* GFX6 (except OLAND and HAINAN) has a bug that it only looks at the X
+    * writemask component.
+    */
+   if (ctx.program->dev.has_gfx6_mrt_export_bug && exp.enabled_mask && exp.dest <= V_008DFC_SQ_EXP_MRTZ) {
+      encoding |= 0x1;
+   }
+
    out.push_back(encoding);
    encoding = reg(ctx, exp.operands[0], 8);
    encoding |= reg(ctx, exp.operands[1], 8) << 8;
@@ -1068,7 +1090,7 @@ emit_vop3_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
    } else if (ctx.gfx_level >= GFX10) {
       encoding = (0b110101 << 26);
    } else {
-      unreachable("Unknown gfx_level.");
+      UNREACHABLE("Unknown gfx_level.");
    }
 
    if (ctx.gfx_level <= GFX7) {
@@ -1119,7 +1141,7 @@ emit_vop3p_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instr
    } else if (ctx.gfx_level >= GFX10) {
       encoding = (0b110011 << 26);
    } else {
-      unreachable("Unknown gfx_level.");
+      UNREACHABLE("Unknown gfx_level.");
    }
 
    encoding |= opcode << 16;
@@ -1236,7 +1258,7 @@ emit_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* inst
    } else if (instr->opcode == aco_opcode::p_debug_info) {
       assert(instr->operands[0].isConstant());
       uint32_t index = instr->operands[0].constantValue();
-      ctx.program->debug_info[index].offset = (out.size() - 1) * 4;
+      ctx.program->debug_info[index].offset = out.size() * 4;
       return;
    }
 
@@ -1366,7 +1388,7 @@ emit_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* inst
    case Format::PSEUDO:
    case Format::PSEUDO_BARRIER:
       if (instr->opcode != aco_opcode::p_unit_test)
-         unreachable("Pseudo instructions should be lowered before assembly.");
+         UNREACHABLE("Pseudo instructions should be lowered before assembly.");
       break;
    default:
       if (instr->isDPP16()) {
@@ -1382,7 +1404,7 @@ emit_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* inst
       } else if (instr->isSDWA()) {
          emit_sdwa_instruction(ctx, out, instr);
       } else {
-         unreachable("unimplemented instruction format");
+         UNREACHABLE("unimplemented instruction format");
       }
       break;
    }
@@ -1816,6 +1838,7 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
 
    program->config->scratch_bytes_per_wave =
       align(program->config->scratch_bytes_per_wave, program->dev.scratch_alloc_granule);
+   program->config->wgp_mode = program->wgp_mode;
 
    return exec_size;
 }

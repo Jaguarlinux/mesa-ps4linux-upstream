@@ -26,15 +26,16 @@
 #include "util/blend.h"
 
 #ifdef PAN_ARCH
-#include "pan_shader.h"
+#include "pan_texture.h"
 #endif
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_conversion_builder.h"
 #include "compiler/nir/nir_lower_blend.h"
+#include "compiler/pan_compiler.h"
+#include "compiler/pan_nir.h"
 #include "util/format/u_format.h"
-#include "pan_texture.h"
 
 #ifndef PAN_ARCH
 
@@ -170,15 +171,15 @@ to_c_factor(enum pipe_blendfactor factor)
       return MALI_BLEND_OPERAND_C_CONSTANT;
 
    default:
-      unreachable("Unsupported blend factor");
+      UNREACHABLE("Unsupported blend factor");
    }
 }
 
 static void
-to_panfrost_function(enum pipe_blend_func blend_func,
-                     enum pipe_blendfactor src_factor,
-                     enum pipe_blendfactor dest_factor, bool is_alpha,
-                     struct MALI_BLEND_FUNCTION *function)
+to_mali_function(enum pipe_blend_func blend_func,
+                 enum pipe_blendfactor src_factor,
+                 enum pipe_blendfactor dest_factor, bool is_alpha,
+                 struct MALI_BLEND_FUNCTION *function)
 {
    assert(can_fixed_function_equation(blend_func, src_factor, dest_factor,
                                       is_alpha, true));
@@ -242,7 +243,7 @@ to_panfrost_function(enum pipe_blend_func blend_func,
          function->b = MALI_BLEND_OPERAND_B_SRC_MINUS_DEST;
          break;
       default:
-         unreachable("Invalid blend function");
+         UNREACHABLE("Invalid blend function");
       }
    } else if (is_2srcdest(blend_func, src_factor, dest_factor, is_alpha)) {
       /* src*dest + dest*src = 2*src*dest = 0 + dest*(2*src) */
@@ -271,7 +272,7 @@ to_panfrost_function(enum pipe_blend_func blend_func,
          function->negate_a = true;
          break;
       default:
-         unreachable("Invalid blend function\n");
+         UNREACHABLE("Invalid blend function\n");
       }
    }
 }
@@ -407,6 +408,12 @@ is_dest_factor(enum pipe_blendfactor factor, bool alpha)
           (factor == PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE && !alpha);
 }
 
+static inline bool
+is_min_max(enum pipe_blend_func func)
+{
+   return func == PIPE_BLEND_MIN || func == PIPE_BLEND_MAX;
+}
+
 /* Determines if a blend equation reads back the destination. This can occur by
  * explicitly referencing the destination in the blend equation, or by using a
  * partial writemask. */
@@ -420,7 +427,8 @@ pan_blend_reads_dest(const struct pan_blend_equation equation)
    if (!equation.blend_enable)
       return false;
 
-   return is_dest_factor(equation.rgb_src_factor, false) ||
+   return is_min_max(equation.rgb_func) || is_min_max(equation.alpha_func) ||
+          is_dest_factor(equation.rgb_src_factor, false) ||
           is_dest_factor(equation.alpha_src_factor, true) ||
           equation.rgb_dst_factor != PIPE_BLENDFACTOR_ZERO ||
           equation.alpha_dst_factor != PIPE_BLENDFACTOR_ZERO;
@@ -446,10 +454,10 @@ pan_blend_to_fixed_function_equation(const struct pan_blend_equation equation,
    }
 
    /* Compile the fixed-function blend */
-   to_panfrost_function(equation.rgb_func, equation.rgb_src_factor,
-                        equation.rgb_dst_factor, false, &out->rgb);
-   to_panfrost_function(equation.alpha_func, equation.alpha_src_factor,
-                        equation.alpha_dst_factor, true, &out->alpha);
+   to_mali_function(equation.rgb_func, equation.rgb_src_factor,
+                    equation.rgb_dst_factor, false, &out->rgb);
+   to_mali_function(equation.alpha_func, equation.alpha_src_factor,
+                    equation.alpha_dst_factor, true, &out->alpha);
 
    out->color_mask = equation.color_mask;
 }
@@ -485,7 +493,7 @@ pan_blend_type_from_nir(nir_alu_type nir_type)
    case nir_type_uint16:
       return MALI_REGISTER_FILE_FORMAT_U16;
    default:
-      unreachable("Unsupported blend shader type for NIR alu type");
+      UNREACHABLE("Unsupported blend shader type for NIR alu type");
       return 0;
    }
 }
@@ -529,7 +537,7 @@ logicop_str(enum pipe_logicop logicop)
    case PIPE_LOGICOP_SET:
       return "set";
    default:
-      unreachable("Invalid logicop\n");
+      UNREACHABLE("Invalid logicop\n");
    }
 }
 
@@ -610,7 +618,7 @@ GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
    get_equation_str(rt_state, equation_str, sizeof(equation_str));
 
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, pan_shader_get_compiler_options(PAN_ARCH),
+      MESA_SHADER_FRAGMENT, pan_get_nir_shader_compiler_options(PAN_ARCH),
       "pan_blend(rt=%d,fmt=%s,nr_samples=%d,%s=%s)", rt,
       util_format_name(rt_state->format), rt_state->nr_samples,
       state->logicop_enable ? "logicop" : "equation",
@@ -655,7 +663,6 @@ GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
       options.rt[rt].alpha.dst_factor = rt_state->equation.alpha_dst_factor;
    }
 
-   nir_def *pixel = nir_load_barycentric_pixel(&b, 32, .interp_mode = 1);
    nir_def *zero = nir_imm_int(&b, 0);
 
    for (unsigned i = 0; i < 2; ++i) {
@@ -666,8 +673,8 @@ GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
       src_type = nir_alu_type_get_base_type(nir_type) |
                  nir_alu_type_get_type_size(src_type);
 
-      nir_def *src = nir_load_interpolated_input(
-         &b, 4, nir_alu_type_get_type_size(src_type), pixel, zero,
+      nir_def *src = nir_load_input(
+         &b, 4, nir_alu_type_get_type_size(src_type), zero,
          .io_semantics.location = i ? VARYING_SLOT_VAR0 : VARYING_SLOT_COL0,
          .io_semantics.num_slots = 1, .base = i, .dest_type = src_type);
 
@@ -703,6 +710,32 @@ GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
 }
 
 #if PAN_ARCH >= 6
+
+#if PAN_ARCH < 9
+static enum mali_register_file_format
+get_register_format(nir_alu_type T)
+{
+   switch (T) {
+   case nir_type_float16:
+      return MALI_REGISTER_FILE_FORMAT_F16;
+   case nir_type_float32:
+      return MALI_REGISTER_FILE_FORMAT_F32;
+   case nir_type_int8:
+   case nir_type_int16:
+      return MALI_REGISTER_FILE_FORMAT_I16;
+   case nir_type_int32:
+      return MALI_REGISTER_FILE_FORMAT_I32;
+   case nir_type_uint8:
+   case nir_type_uint16:
+      return MALI_REGISTER_FILE_FORMAT_U16;
+   case nir_type_uint32:
+      return MALI_REGISTER_FILE_FORMAT_U32;
+   default:
+      UNREACHABLE("Invalid format");
+   }
+}
+#endif
+
 uint64_t
 GENX(pan_blend_get_internal_desc)(enum pipe_format fmt, unsigned rt,
                                   unsigned force_size, bool dithered)
@@ -715,44 +748,17 @@ GENX(pan_blend_get_internal_desc)(enum pipe_format fmt, unsigned rt,
       cfg.fixed_function.num_comps = desc->nr_channels;
       cfg.fixed_function.rt = rt;
 
+#if PAN_ARCH < 9
       nir_alu_type T = pan_unpacked_type_for_format(desc);
 
       if (force_size)
          T = nir_alu_type_get_base_type(T) | force_size;
 
-      switch (T) {
-      case nir_type_float16:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_F16;
-         break;
-      case nir_type_float32:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_F32;
-         break;
-      case nir_type_int8:
-      case nir_type_int16:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_I16;
-         break;
-      case nir_type_int32:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_I32;
-         break;
-      case nir_type_uint8:
-      case nir_type_uint16:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_U16;
-         break;
-      case nir_type_uint32:
-         cfg.fixed_function.conversion.register_format =
-            MALI_REGISTER_FILE_FORMAT_U32;
-         break;
-      default:
-         unreachable("Invalid format");
-      }
+      cfg.fixed_function.conversion.register_format = get_register_format(T);
+#endif
 
       cfg.fixed_function.conversion.memory_format =
-         GENX(panfrost_dithered_format_from_pipe_format)(fmt, dithered);
+         GENX(pan_dithered_format_from_pipe_format)(fmt, dithered);
    }
 
    return res.opaque[0] | ((uint64_t)res.opaque[1] << 32);
@@ -782,7 +788,7 @@ GENX(pan_inline_rt_conversion)(nir_shader *s, enum pipe_format *formats)
                                      nir_metadata_control_flow, formats);
 }
 
-#if PAN_ARCH <= 7
+#if PAN_ARCH < 9
 enum mali_register_file_format
 GENX(pan_fixup_blend_type)(nir_alu_type T_size, enum pipe_format format)
 {

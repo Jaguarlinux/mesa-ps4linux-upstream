@@ -12,6 +12,7 @@
 #include <fstream>
 #include <string>
 
+#include "GfxStreamVulkanMapper.h"
 #include "VirtGpuKumquat.h"
 #include "util/log.h"
 
@@ -79,10 +80,6 @@ VirtGpuKumquatDevice::VirtGpuKumquatDevice(enum VirtGpuCapset capset, int32_t de
         case kCapsetGfxStreamVulkan:
             get_caps.size = sizeof(struct vulkanCapset);
             get_caps.addr = (unsigned long long)&mCaps.vulkanCapset;
-            break;
-        case kCapsetGfxStreamMagma:
-            get_caps.size = sizeof(struct magmaCapset);
-            get_caps.addr = (unsigned long long)&mCaps.magmaCapset;
             break;
         case kCapsetGfxStreamGles:
             get_caps.size = sizeof(struct glesCapset);

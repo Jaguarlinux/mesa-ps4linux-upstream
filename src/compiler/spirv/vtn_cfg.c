@@ -113,6 +113,8 @@ function_parameter_decoration_cb(struct vtn_builder *b, struct vtn_value *val,
          case SpvFunctionParameterAttributeSext:
          case SpvFunctionParameterAttributeZext:
          case SpvFunctionParameterAttributeSret:
+         case SpvFunctionParameterAttributeNoCapture:
+         case SpvFunctionParameterAttributeNoWrite:
             break;
 
          case SpvFunctionParameterAttributeByVal:
@@ -402,7 +404,7 @@ vtn_cfg_handle_prepass_instruction(struct vtn_builder *b, SpvOp opcode,
       struct vtn_ssa_value *ssa = vtn_create_ssa_value(b, type->type);
       struct vtn_value *val = vtn_untyped_value(b, w[2]);
 
-      b->func->nir_func->params[b->func_param_idx].name = val->name;
+      b->func->nir_func->params[b->func_param_idx].name = ralloc_strdup(b->shader, val->name);
 
       vtn_foreach_decoration(b, val, function_parameter_decoration_cb, &arg_info);
       vtn_ssa_value_load_function_param(b, ssa, type, &arg_info, &b->func_param_idx);
@@ -520,7 +522,7 @@ vtn_parse_switch(struct vtn_builder *b,
       if (is_default) {
          cse->is_default = true;
       } else {
-         util_dynarray_append(&cse->values, uint64_t, literal);
+         util_dynarray_append(&cse->values, literal);
       }
 
       is_default = false;
@@ -568,7 +570,7 @@ vtn_handle_phis_first_pass(struct vtn_builder *b, SpvOp opcode,
       nir_local_variable_create(b->nb.impl, type->type, "phi");
 
    struct vtn_value *phi_val = vtn_untyped_value(b, w[2]);
-   if (vtn_value_is_relaxed_precision(b, phi_val))
+   if (vtn_has_decoration(b, phi_val, SpvDecorationRelaxedPrecision))
       phi_var->data.precision = GLSL_PRECISION_MEDIUM;
 
    _mesa_hash_table_insert(b->phi_table, w, phi_var);
@@ -786,7 +788,7 @@ vtn_function_emit(struct vtn_builder *b, struct vtn_function *func,
                            vtn_handle_phi_second_pass);
 
    if (func->nir_func->impl->structured)
-      nir_copy_prop_impl(impl);
+      nir_opt_copy_prop_impl(impl);
    nir_rematerialize_derefs_in_use_blocks_impl(impl);
 
    /*

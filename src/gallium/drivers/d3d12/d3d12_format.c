@@ -452,6 +452,9 @@ d3d12_get_resource_srv_format(enum pipe_format f, enum pipe_texture_target targe
       return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
    case PIPE_FORMAT_X32_S8X24_UINT:
       return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      // Since there is a DXGI format for this, but it doesn't support sampling, this is a special case
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
    case PIPE_FORMAT_A8_UNORM:
       if (target == PIPE_BUFFER)
          return DXGI_FORMAT_R8_UNORM; /* A8_UNORM is not supported for buffer SRV */
@@ -638,7 +641,7 @@ d3d12_convert_pipe_video_profile_to_dxgi_format(enum pipe_video_profile profile)
          return DXGI_FORMAT_Y210;
       default:
       {
-         unreachable("Unsupported pipe video profile");
+         UNREACHABLE("Unsupported pipe video profile");
       } break;
    }
 }

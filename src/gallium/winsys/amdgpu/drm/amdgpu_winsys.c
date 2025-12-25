@@ -36,8 +36,10 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
                            const struct pipe_screen_config *config,
                            int fd)
 {
-   if (ac_query_gpu_info(fd, aws->dev, &aws->info, false) != AC_QUERY_GPU_INFO_SUCCESS)
+   if (ac_query_gpu_info(fd, aws->dev, &aws->info, false) != AC_QUERY_GPU_INFO_SUCCESS) {
+      fprintf(stderr, "amdgpu: ac_query_gpu_info failed.\n");
       goto fail;
+   }
 
    aws->addrlib = ac_addrlib_create(&aws->info, &aws->info.max_alignment);
    if (!aws->addrlib) {
@@ -62,7 +64,7 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
 
    /* TODO: Enable this once the kernel handles it efficiently. */
    if (!aws->info.userq_ip_mask)
-      aws->info.has_local_buffers = false;
+      aws->info.has_vm_always_valid = false;
 
    return true;
 
@@ -101,9 +103,10 @@ static void do_winsys_deinit(struct amdgpu_winsys *aws)
    simple_mtx_destroy(&aws->bo_export_table_lock);
 
    ac_addrlib_destroy(aws->addrlib);
+   ac_drm_cs_destroy_syncobj(aws->dev, aws->vm_timeline_syncobj);
    ac_drm_device_deinitialize(aws->dev);
-   ac_drm_cs_destroy_syncobj(aws->fd, aws->vm_timeline_syncobj);
    simple_mtx_destroy(&aws->bo_fence_lock);
+   simple_mtx_destroy(&aws->stats_lock);
 
    FREE(aws);
 }
@@ -324,7 +327,7 @@ radeon_to_amdgpu_pstate(enum radeon_ctx_pstate pstate)
    case RADEON_CTX_PSTATE_PEAK:
       return AMDGPU_CTX_STABLE_PSTATE_PEAK;
    default:
-      unreachable("Invalid pstate");
+      UNREACHABLE("Invalid pstate");
    }
 }
 
@@ -456,7 +459,7 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
       aws->info.drm_major = drm_major;
       aws->info.drm_minor = drm_minor;
 
-      if (ac_drm_cs_create_syncobj(aws->fd, &aws->vm_timeline_syncobj))
+      if (ac_drm_cs_create_syncobj2(aws->dev, 0, &aws->vm_timeline_syncobj))
          goto fail_alloc;
       simple_mtx_init(&aws->vm_ioctl_lock, mtx_plain);
 
@@ -507,6 +510,7 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
       (void) simple_mtx_init(&aws->global_bo_list_lock, mtx_plain);
 #endif
       (void) simple_mtx_init(&aws->bo_fence_lock, mtx_plain);
+      (void) simple_mtx_init(&aws->stats_lock, mtx_plain);
       (void) simple_mtx_init(&aws->bo_export_table_lock, mtx_plain);
 
       if (!util_queue_init(&aws->cs_queue, "cs", 8, 1,
@@ -547,6 +551,7 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
 
    amdgpu_bo_init_functions(sws);
    amdgpu_cs_init_functions(sws);
+   amdgpu_userq_init_functions(sws);
    amdgpu_surface_init_functions(sws);
 
    simple_mtx_lock(&aws->sws_list_lock);

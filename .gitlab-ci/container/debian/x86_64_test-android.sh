@@ -31,6 +31,8 @@ EPHEMERAL=(
 
 DEPS=(
     aapt
+    cuttlefish-base
+    cuttlefish-user
     iproute2
 )
 apt-get install -y --no-remove --no-install-recommends \
@@ -41,6 +43,25 @@ apt-get install -y --no-remove --no-install-recommends \
 . .gitlab-ci/container/container_pre_build.sh
 
 section_end debian_setup
+
+############### Downloading Android tools
+
+section_start android-tools "Downloading Android tools"
+
+mkdir /android-tools
+pushd /android-tools
+
+curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
+  -o eglinfo "https://${S3_HOST}/${S3_ANDROID_BUCKET}/mesa/mesa/${DATA_STORAGE_PATH}/eglinfo-android-x86_64"
+chmod +x eglinfo
+
+curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
+  -o vulkaninfo "https://${S3_HOST}/${S3_ANDROID_BUCKET}/mesa/mesa/${DATA_STORAGE_PATH}/vulkaninfo-android-x86_64"
+chmod +x vulkaninfo
+
+popd
+
+section_end android-tools
 
 ############### Downloading NDK for native builds for the guest ...
 
@@ -65,7 +86,7 @@ DEBIAN_ARCH=amd64 \
 
 export ANDROID_NDK_HOME=/$ndk
 export RUST_TARGET=x86_64-linux-android
-. .gitlab-ci/container/build-rust.sh
+. .gitlab-ci/container/build-rust.sh test
 . .gitlab-ci/container/build-deqp-runner.sh
 
 # Properly uninstall rustup including cargo and init scripts on shells
@@ -80,67 +101,41 @@ EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DAND
 
 DEQP_API=GLES \
 DEQP_TARGET="android" \
-EXTRA_CMAKE_ARGS="-DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
+EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_ANDROID_EXE_LOGCAT=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
 . .gitlab-ci/container/build-deqp.sh
 
 DEQP_API=VK \
 DEQP_TARGET="android" \
-EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
+EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_ANDROID_EXE_LOGCAT=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
 . .gitlab-ci/container/build-deqp.sh
 
 rm -rf /VK-GL-CTS
 
 ############### Downloading Cuttlefish resources ...
 
-section_start cuttlefish "Downloading, building and installing Cuttlefish"
-
-CUTTLEFISH_PROJECT_PATH=ao2/aosp-manifest
-CUTTLEFISH_BUILD_VERSION_TAGS=mesa-venus
-CUTTLEFISH_BUILD_NUMBER=20250215.001
+section_start cuttlefish "Downloading and setting up Cuttlefish"
 
 mkdir /cuttlefish
 pushd /cuttlefish
 
 curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -o aosp_cf_x86_64_only_phone-img-$CUTTLEFISH_BUILD_NUMBER.zip "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${CUTTLEFISH_PROJECT_PATH}/aosp-${CUTTLEFISH_BUILD_VERSION_TAGS}.${CUTTLEFISH_BUILD_NUMBER}/aosp_cf_x86_64_only_phone-img-$CUTTLEFISH_BUILD_NUMBER.zip"
+  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${CUTTLEFISH_PROJECT_PATH}/aosp-${CUTTLEFISH_BUILD_VERSION_TAGS}.${CUTTLEFISH_BUILD_NUMBER}/aosp_cf_x86_64_only_phone-img-${CUTTLEFISH_BUILD_NUMBER}.tar.zst"
 
-unzip aosp_cf_x86_64_only_phone-img-$CUTTLEFISH_BUILD_NUMBER.zip
-rm aosp_cf_x86_64_only_phone-img-$CUTTLEFISH_BUILD_NUMBER.zip
+tar --zstd -xvf aosp_cf_x86_64_only_phone-img-"$CUTTLEFISH_BUILD_NUMBER".tar.zst
+rm aosp_cf_x86_64_only_phone-img-"$CUTTLEFISH_BUILD_NUMBER".tar.zst
 ls -lhS ./*
 
 curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -o cvd-host_package.tar.gz "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${CUTTLEFISH_PROJECT_PATH}/aosp-${CUTTLEFISH_BUILD_VERSION_TAGS}.${CUTTLEFISH_BUILD_NUMBER}/cvd-host_package.tar.gz"
-tar -xzvf cvd-host_package.tar.gz
-rm cvd-host_package.tar.gz
-
-AOSP_KERNEL_PROJECT_PATH=ao2/aosp-kernel-manifest
-AOSP_KERNEL_BUILD_VERSION_TAGS=common-android14-6.1-venus
-AOSP_KERNEL_BUILD_NUMBER=20241107.001
+  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${CUTTLEFISH_PROJECT_PATH}/aosp-${CUTTLEFISH_BUILD_VERSION_TAGS}.${CUTTLEFISH_BUILD_NUMBER}/cvd-host_package-x86_64.tar.zst"
+tar --zst -xvf cvd-host_package-x86_64.tar.zst
+rm cvd-host_package-x86_64.tar.zst
 
 curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -o bzImage "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/bzImage"
+  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/bzImage"
 curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -o initramfs.img "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/initramfs.img"
+  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/initramfs.img"
 
 popd
-
-############### Building and installing Debian package ...
-
-ANDROID_CUTTLEFISH_VERSION=v1.0.1
-
-mkdir android-cuttlefish
-pushd android-cuttlefish
-git init
-git remote add origin https://github.com/google/android-cuttlefish.git
-git fetch --depth 1 origin "$ANDROID_CUTTLEFISH_VERSION"
-git checkout FETCH_HEAD
-
-./tools/buildutils/build_packages.sh
-
-apt-get install -y --allow-downgrades ./cuttlefish-base_*.deb ./cuttlefish-user_*.deb
-
-popd
-rm -rf android-cuttlefish
 
 addgroup --system kvm
 usermod -a -G kvm,cvdnetwork root
@@ -149,23 +144,7 @@ section_end cuttlefish
 
 ############### Downloading Android CTS
 
-section_start android-cts "Downloading Android CTS"
-
-ANDROID_CTS_VERSION="${ANDROID_VERSION}_r1"
-ANDROID_CTS_DEVICE_ARCH="x86"
-
-curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -o "android-cts-${ANDROID_CTS_VERSION}-linux_x86-${ANDROID_CTS_DEVICE_ARCH}.zip" \
-  "https://dl.google.com/dl/android/cts/android-cts-${ANDROID_CTS_VERSION}-linux_x86-${ANDROID_CTS_DEVICE_ARCH}.zip"
-unzip -q -d / "android-cts-${ANDROID_CTS_VERSION}-linux_x86-${ANDROID_CTS_DEVICE_ARCH}.zip"
-rm "android-cts-${ANDROID_CTS_VERSION}-linux_x86-${ANDROID_CTS_DEVICE_ARCH}.zip"
-
-# Keep only the interesting tests to save space
-# shellcheck disable=SC2086 # we want word splitting
-ANDROID_CTS_MODULES_KEEP_EXPRESSION=$(printf "%s|" $ANDROID_CTS_MODULES | sed -e 's/|$//g')
-find /android-cts/testcases/ -mindepth 1 -type d | grep -v -E "$ANDROID_CTS_MODULES_KEEP_EXPRESSION" | xargs rm -rf
-
-section_end android-cts
+. .gitlab-ci/container/build-android-cts.sh
 
 ############### Uninstall the build software
 

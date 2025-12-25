@@ -180,6 +180,9 @@ i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
       placed_addr -= offset;
    }
 
+   /* The Kernel uAPI doesn't allow us to map with an offset. To work around,
+    * overallocate and then unmap the unneeded region
+    */
    void *ptr = mmap(placed_addr, offset + size,
                     PROT_READ | PROT_WRITE,
                     (placed_addr != NULL ? MAP_FIXED : 0) | MAP_SHARED,
@@ -187,10 +190,12 @@ i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
    if (ptr == MAP_FAILED)
       return ptr;
 
+   void *ret = ptr + offset;
+
    if (offset != 0)
       munmap(ptr, offset);
 
-   return ptr + offset;
+   return ret;
 }
 
 static void *
@@ -221,7 +226,7 @@ mmap_calc_flags(struct anv_device *device, struct anv_bo *bo)
       flags = I915_MMAP_WC;
       break;
    case INTEL_DEVICE_INFO_MMAP_MODE_UC:
-      unreachable("Missing");
+      UNREACHABLE("Missing");
    default:
       /* no flags == WB */
       flags = 0;
@@ -280,16 +285,13 @@ static uint32_t
 i915_bo_alloc_flags_to_bo_flags(struct anv_device *device,
                                 enum anv_bo_alloc_flags alloc_flags)
 {
-   struct anv_physical_device *pdevice = device->physical;
-
    uint64_t bo_flags = EXEC_OBJECT_PINNED;
 
    if (!(alloc_flags & ANV_BO_ALLOC_32BIT_ADDRESS))
       bo_flags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
 
-   if (((alloc_flags & ANV_BO_ALLOC_CAPTURE) ||
-        INTEL_DEBUG(DEBUG_CAPTURE_ALL)) &&
-       pdevice->has_exec_capture)
+   if ((alloc_flags & ANV_BO_ALLOC_CAPTURE) ||
+        INTEL_DEBUG(DEBUG_CAPTURE_ALL))
       bo_flags |= EXEC_OBJECT_CAPTURE;
 
    if (alloc_flags & ANV_BO_ALLOC_IMPLICIT_WRITE) {
@@ -297,7 +299,7 @@ i915_bo_alloc_flags_to_bo_flags(struct anv_device *device,
       bo_flags |= EXEC_OBJECT_WRITE;
    }
 
-   if (!(alloc_flags & ANV_BO_ALLOC_IMPLICIT_SYNC) && pdevice->has_exec_async)
+   if (!(alloc_flags & ANV_BO_ALLOC_IMPLICIT_SYNC))
       bo_flags |= EXEC_OBJECT_ASYNC;
 
    return bo_flags;

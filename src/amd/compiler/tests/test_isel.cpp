@@ -23,14 +23,14 @@ BEGIN_TEST(isel.interp.simple)
       layout(location = 0) in vec4 in_color;
       layout(location = 0) out vec4 out_color;
       void main() {
-         //>> v1: %b_tmp = v_interp_p1_f32 %bx, %pm:m0 attr0.z
-         //! v1: %b = v_interp_p2_f32 %by, %pm:m0, (kill)%b_tmp attr0.z
-         //! v1: %a_tmp = v_interp_p1_f32 %bx, %pm:m0 attr0.w
+         //>> v1: %a_tmp = v_interp_p1_f32 %bx, %pm:m0 attr0.w
          //! v1: %a = v_interp_p2_f32 %by, %pm:m0, (kill)%a_tmp attr0.w
          //! v1: %r_tmp = v_interp_p1_f32 %bx, %pm:m0 attr0.x
          //! v1: %r = v_interp_p2_f32 %by, %pm:m0, (kill)%r_tmp attr0.x
-         //! v1: %g_tmp = v_interp_p1_f32 (kill)%bx, %pm:m0 attr0.y
-         //! v1: %g = v_interp_p2_f32 (kill)%by, (kill)%pm:m0, (kill)%g_tmp attr0.y
+         //! v1: %g_tmp = v_interp_p1_f32 %bx, %pm:m0 attr0.y
+         //! v1: %g = v_interp_p2_f32 %by, %pm:m0, (kill)%g_tmp attr0.y
+         //! v1: %b_tmp = v_interp_p1_f32 (kill)%bx, %pm:m0 attr0.z
+         //! v1: %b = v_interp_p2_f32 (kill)%by, (kill)%pm:m0, (kill)%b_tmp attr0.z
          //! exp (kill)%r, (kill)%g, (kill)%b, (kill)%a mrt0
          out_color = in_color;
       }
@@ -53,7 +53,7 @@ BEGIN_TEST(isel.compute.simple)
          };
          void main() {
             //>> v1: %data = p_parallelcopy 42
-            //! buffer_store_dword (kill)%_, v1: undef, 0, (kill)%data disable_wqm storage:buffer
+            //! buffer_store_dword (kill)%_, v1: undef, 0, (kill)%data storage:buffer
             res = 42;
          }
       );
@@ -174,13 +174,9 @@ BEGIN_TEST(isel.discard_early_exit.mrtz)
 
    /* On GFX11, the discard early exit must use mrtz if the shader exports only depth. */
    //>> exp mrtz v#_, off, off, off done    ; $_ $_
-   //! s_nop 0                              ; $_
-   //! s_sendmsg sendmsg(MSG_DEALLOC_VGPRS) ; $_
    //! s_endpgm                             ; $_
    //! BB1:
    //! exp mrtz off, off, off, off done     ; $_ $_
-   //! s_nop 0                              ; $_
-   //! s_sendmsg sendmsg(MSG_DEALLOC_VGPRS) ; $_
    //! s_endpgm                             ; $_
 
    PipelineBuilder pbld(get_vk_device(GFX11));
@@ -203,13 +199,9 @@ BEGIN_TEST(isel.discard_early_exit.mrt0)
 
    /* On GFX11, the discard early exit must use mrt0 if the shader exports color. */
    //>> exp mrt0 v#x, v#x, v#x, v#x done    ; $_ $_
-   //! s_nop 0                              ; $_
-   //! s_sendmsg sendmsg(MSG_DEALLOC_VGPRS) ; $_
    //! s_endpgm                             ; $_
    //! BB1:
    //! exp mrt0 off, off, off, off done     ; $_ $_
-   //! s_nop 0                              ; $_
-   //! s_sendmsg sendmsg(MSG_DEALLOC_VGPRS) ; $_
    //! s_endpgm                             ; $_
 
    PipelineBuilder pbld(get_vk_device(GFX11));
@@ -266,8 +258,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.uniform_break)
       phi[1] = nir_phi_instr_create(nb->shader);
       nir_def_init(&phi[0]->instr, &phi[0]->def, 1, 32);
       nir_def_init(&phi[1]->instr, &phi[1]->def, 1, 32);
-      nir_phi_instr_add_src(phi[0], init0->parent_instr->block, init0);
-      nir_phi_instr_add_src(phi[1], init1->parent_instr->block, init1);
+      nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
+      nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
 
       nir_push_if(nb, nir_unit_test_uniform_amd(nb, 1, 1, .base=4));
       {
@@ -337,8 +329,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.divergent_break)
       phi[1] = nir_phi_instr_create(nb->shader);
       nir_def_init(&phi[0]->instr, &phi[0]->def, 1, 32);
       nir_def_init(&phi[1]->instr, &phi[1]->def, 1, 32);
-      nir_phi_instr_add_src(phi[0], init0->parent_instr->block, init0);
-      nir_phi_instr_add_src(phi[1], init1->parent_instr->block, init1);
+      nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
+      nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
 
       nir_push_if(nb, nir_unit_test_divergent_amd(nb, 1, 1, .base=4));
       {
@@ -487,8 +479,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.mixed_break)
       phi[1] = nir_phi_instr_create(nb->shader);
       nir_def_init(&phi[0]->instr, &phi[0]->def, 1, 32);
       nir_def_init(&phi[1]->instr, &phi[1]->def, 1, 32);
-      nir_phi_instr_add_src(phi[0], init0->parent_instr->block, init0);
-      nir_phi_instr_add_src(phi[1], init1->parent_instr->block, init1);
+      nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
+      nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
 
       nir_push_if(nb, nir_unit_test_uniform_amd(nb, 1, 1, .base=4));
       {
@@ -586,8 +578,8 @@ BEGIN_TEST(isel.cf.unreachable_continue.nested_mixed_break)
       phi[1] = nir_phi_instr_create(nb->shader);
       nir_def_init(&phi[0]->instr, &phi[0]->def, 1, 32);
       nir_def_init(&phi[1]->instr, &phi[1]->def, 1, 32);
-      nir_phi_instr_add_src(phi[0], init0->parent_instr->block, init0);
-      nir_phi_instr_add_src(phi[1], init1->parent_instr->block, init1);
+      nir_phi_instr_add_src(phi[0], nir_def_block(init0), init0);
+      nir_phi_instr_add_src(phi[1], nir_def_block(init1), init1);
 
       nir_push_if(nb, nir_unit_test_uniform_amd(nb, 1, 1, .base=4));
       {
@@ -822,7 +814,7 @@ BEGIN_TEST(isel.cf.hidden_continue)
       //! s1: %2 = p_linear_phi %init, %cont, %phi
       phi = nir_phi_instr_create(nb->shader);
       nir_def_init(&phi->instr, &phi->def, 1, 32);
-      nir_phi_instr_add_src(phi, init->parent_instr->block, init);
+      nir_phi_instr_add_src(phi, nir_def_block(init), init);
 
       nir_push_if(nb, nir_unit_test_divergent_amd(nb, 1, 1, .base = 4));
       {
@@ -831,7 +823,7 @@ BEGIN_TEST(isel.cf.hidden_continue)
          //! p_logical_start
          //! s1: %cont = p_unit_test 1
          nir_def* cont = nir_unit_test_uniform_amd(nb, 1, 32, .base = 1);
-         nir_phi_instr_add_src(phi, cont->parent_instr->block, cont);
+         nir_phi_instr_add_src(phi, nir_def_block(cont), cont);
          nir_jump(nb, nir_jump_continue);
       }
       nir_pop_if(nb, NULL);

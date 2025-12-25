@@ -40,16 +40,11 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 {
    VkFormatFeatureFlags2 features = 0;
 
-   /* Conformance fails with these optional formats. Just drop them for now.
-    * TODO: Investigate later if we have a use case.
+   /* This optional format needs hacks for opaque black, so hide for
+    * performance. We might specially enable this for Proton / behind a driconf.
     */
-   switch (vk_format) {
-   case VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR:
-   case VK_FORMAT_A8_UNORM_KHR:
+   if (vk_format == VK_FORMAT_A8_UNORM_KHR)
       return 0;
-   default:
-      break;
-   }
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
    if (p_format == PIPE_FORMAT_NONE)
@@ -59,26 +54,11 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    if (!util_is_power_of_two_nonzero(util_format_get_blocksize(p_format)))
       return 0;
 
-   if (util_format_is_compressed(p_format)) {
-      /* Linear block-compressed images are all sorts of problematic, not sure
-       * if AGX even supports them. Don't try.
-       */
-      if (tiling != VK_IMAGE_TILING_OPTIMAL)
-         return 0;
-
-      /* XXX: Conformance fails, e.g.:
-       * dEQP-VK.pipeline.monolithic.sampler.view_type.2d.format.etc2_r8g8b8a1_unorm_block.mipmap.linear.lod.select_bias_3_7
-       *
-       * I suspect ail bug with mipmapping of compressed :-/
-       */
-      switch (util_format_description(p_format)->layout) {
-      case UTIL_FORMAT_LAYOUT_ETC:
-      case UTIL_FORMAT_LAYOUT_ASTC:
-         return 0;
-      default:
-         break;
-      }
-   }
+   /* Linear block-compressed images are all sorts of problematic, not sure
+    * if AGX even supports them. Don't try.
+    */
+   if (util_format_is_compressed(p_format) && tiling != VK_IMAGE_TILING_OPTIMAL)
+      return 0;
 
    if (ail_pixel_format[p_format].texturable) {
       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
@@ -97,17 +77,10 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    }
 
    if (ail_pixel_format[p_format].renderable) {
-      /* For now, disable snorm rendering due to nir_lower_blend bugs.
-       *
-       * TODO: revisit.
-       */
-      if (!util_format_is_snorm(p_format)) {
-         features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
-         features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
-      }
-
-      features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
-      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+      features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                  VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+                  VK_FORMAT_FEATURE_2_BLIT_DST_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
    }
@@ -463,7 +436,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       maxArraySize = 1;
       break;
    default:
-      unreachable("Invalid image type");
+      UNREACHABLE("Invalid image type");
    }
    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
       maxArraySize = 1;
@@ -526,7 +499,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          tiling_has_explicit_layout = false;
          break;
       default:
-         unreachable("Unsupported VkImageTiling");
+         UNREACHABLE("Unsupported VkImageTiling");
       }
 
       switch (external_info->handleType) {
@@ -748,7 +721,7 @@ hk_map_tiling(struct hk_device *dev, const VkImageCreateInfo *info,
       return ail_drm_modifier_to_tiling(modifier);
 
    default:
-      unreachable("invalid tiling");
+      UNREACHABLE("invalid tiling");
    }
 }
 
@@ -767,7 +740,7 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return ail_is_drm_modifier_compressed(modifier);
 
    default:
-      unreachable("invalid tiling");
+      UNREACHABLE("invalid tiling");
    }
 }
 
@@ -1011,18 +984,9 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    struct hk_image *image;
    VkResult result;
 
-#ifdef HK_USE_WSI_PLATFORM
-   /* Ignore swapchain creation info on Android. Since we don't have an
-    * implementation in Mesa, we're guaranteed to access an Android object
-    * incorrectly.
-    */
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
-      return wsi_common_create_swapchain_image(
-         &pdev->wsi_device, pCreateInfo, swapchain_info->swapchain, pImage);
-   }
-#endif
+   if (wsi_common_is_swapchain_image(pCreateInfo))
+      return wsi_common_create_swapchain_image(&pdev->wsi_device, pCreateInfo,
+                                               pImage);
 
    image = vk_zalloc2(&dev->vk.alloc, pAllocator, sizeof(*image), 8,
                       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -1364,7 +1328,7 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
                              *offset_B,
                              plane->nil.pte_kind);
 #endif
-      unreachable("todo");
+      UNREACHABLE("todo");
    } else {
       plane->addr = mem->bo->va->addr + *offset_B;
       plane->map = agx_bo_map(mem->bo) + *offset_B;
@@ -1386,28 +1350,17 @@ hk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
       /* Ignore this struct on Android, we cannot access swapchain structures
        * there. */
 #ifdef HK_USE_WSI_PLATFORM
-      const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
-         vk_find_struct_const(pBindInfos[i].pNext,
-                              BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
-
-      if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
-         VkImage _wsi_image = wsi_common_get_image(swapchain_info->swapchain,
-                                                   swapchain_info->imageIndex);
-         VK_FROM_HANDLE(hk_image, wsi_img, _wsi_image);
-
-         assert(image->plane_count == 1);
-         assert(wsi_img->plane_count == 1);
-
-         struct hk_image_plane *plane = &image->planes[0];
-         struct hk_image_plane *swapchain_plane = &wsi_img->planes[0];
-
-         /* Copy memory binding information from swapchain image to the current
-          * image's plane. */
-         plane->addr = swapchain_plane->addr;
-         continue;
+      if (!mem) {
+         const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
+            vk_find_struct_const(pBindInfos[i].pNext,
+                                 BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+         assert(swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE);
+         mem = hk_device_memory_from_handle(wsi_common_get_memory(
+            swapchain_info->swapchain, swapchain_info->imageIndex));
       }
 #endif
 
+      assert(mem);
       uint64_t offset_B = pBindInfos[i].memoryOffset;
       if (image->disjoint) {
          const VkBindImagePlaneMemoryInfo *plane_info = vk_find_struct_const(
@@ -1462,6 +1415,13 @@ hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
    uint32_t src_height = info->memoryImageHeight ?: extent.height;
 
    uint32_t blocksize_B = util_format_get_blocksize(layout->format);
+
+   /* Align width and height to block */
+   src_width =
+      DIV_ROUND_UP(src_width, util_format_get_blockwidth(layout->format));
+   src_height =
+      DIV_ROUND_UP(src_height, util_format_get_blockheight(layout->format));
+
    uint32_t src_pitch = src_width * blocksize_B;
 
    unsigned start_layer = (dst_image->vk.image_type == VK_IMAGE_TYPE_3D)
@@ -1534,6 +1494,13 @@ hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
 #endif
 
    uint32_t blocksize_B = util_format_get_blocksize(layout->format);
+
+   /* Align width and height to block */
+   dst_width =
+      DIV_ROUND_UP(dst_width, util_format_get_blockwidth(layout->format));
+   dst_height =
+      DIV_ROUND_UP(dst_height, util_format_get_blockheight(layout->format));
+
    uint32_t dst_pitch = dst_width * blocksize_B;
 
    unsigned start_layer = (src_image->vk.image_type == VK_IMAGE_TYPE_3D)
@@ -1669,7 +1636,7 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
                    extent.width * src_block_B);
          }
       } else if (!src_tiled) {
-         unreachable("todo");
+         UNREACHABLE("todo");
 #if 0
          fdl6_memcpy_linear_to_tiled(
             dst_offset.x, dst_offset.y, extent.width, extent.height, dst,
@@ -1678,7 +1645,7 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
             &device->physical_device->ubwc_config);
 #endif
       } else if (!dst_tiled) {
-         unreachable("todo");
+         UNREACHABLE("todo");
 #if 0
          fdl6_memcpy_tiled_to_linear(
             src_offset.x, src_offset.y, extent.width, extent.height,
@@ -1687,11 +1654,6 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
             &device->physical_device->ubwc_config);
 #endif
       } else {
-         /* Work tile-by-tile, holding the unswizzled tile in a temporary
-          * buffer.
-          */
-         char temp_tile[16384];
-
          unsigned src_level = info->srcSubresource.mipLevel;
          unsigned dst_level = info->dstSubresource.mipLevel;
          uint32_t block_width = src_layout->tilesize_el[src_level].width_el;
@@ -1705,6 +1667,12 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
          }
 
          uint32_t temp_pitch = block_width * src_block_B;
+         size_t temp_tile_size = temp_pitch * (src_offset.y + extent.height);
+
+         /* Work tile-by-tile, holding the unswizzled tile in a temporary
+          * buffer.
+          */
+         char *temp_tile = malloc(temp_tile_size);
 
          for (unsigned by = src_offset.y / block_height;
               by * block_height < src_offset.y + extent.height; by++) {
@@ -1721,14 +1689,14 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
                   MIN2((bx + 1) * block_width, src_offset.x + extent.width) -
                   src_x_start;
 
-               assert(height * temp_pitch <= ARRAY_SIZE(temp_tile));
-
                ail_detile((void *)src, temp_tile, src_layout, src_level,
                           temp_pitch, src_x_start, src_y_start, width, height);
                ail_tile(dst, temp_tile, dst_layout, dst_level, temp_pitch,
                         dst_x_start, dst_y_start, width, height);
             }
          }
+
+         free(temp_tile);
       }
    }
 }

@@ -7,12 +7,12 @@ subdir('android_stub')
 subdir('util')
 
 inc_mesa = include_directories('mesa')
-inc_mapi = include_directories('mapi')
 inc_src = include_directories('.')
 inc_gallium = include_directories('gallium/include')
 inc_gallium_aux = include_directories('gallium/auxiliary')
 inc_amd_common = include_directories('amd/common', 'amd/common/nir')
 inc_tool = include_directories('tool')
+inc_virtio = include_directories('virtio')
 inc_virtio_gpu = include_directories('virtio/virtio-gpu')
 inc_frontends = include_directories('gallium/frontends')
 pps_datasources = []
@@ -20,7 +20,7 @@ pps_includes = []
 
 inc_llvmpipe = include_directories('gallium/drivers/llvmpipe')
 
-if with_llvm
+if dep_llvm.found()
   inc_amd_common_llvm = include_directories('amd/llvm')
 else
   inc_amd_common_llvm = []
@@ -46,21 +46,23 @@ if cc.get_argument_syntax() == 'msvc'
 else
   idep_getopt = null_dep
 endif
-subdir('x11')
+if with_platform_x11
+  subdir('x11')
+endif
 if with_gallium_or_lvp or with_gbm or with_platform_wayland
   subdir('loader')
 endif
-if with_gallium
-  subdir('mapi')
-endif
 subdir('compiler')
+if with_poly
+  subdir('poly')
+endif
 if with_tools.contains('drm-shim')
   subdir('drm-shim')
 endif
 if with_imgui
   subdir('imgui')
 endif
-if with_platform_wayland
+if with_wayland_bind_display
   subdir('egl/wayland/wayland-drm')
 endif
 if with_any_vk or with_gallium_zink
@@ -69,8 +71,11 @@ endif
 if with_any_intel
   subdir('intel')
 endif
-if system_has_kms_drm or with_gallium_virgl
-  subdir('virtio')
+if with_virtio_vk
+  subdir('virtio/vulkan')
+endif
+if with_vdrm
+  subdir('virtio/vdrm')
 endif
 if with_gallium_radeonsi or with_amd_vk or with_gallium_r300 or with_gallium_r600
   subdir('amd')
@@ -84,15 +89,12 @@ endif
 if with_gallium_freedreno or with_freedreno_vk or with_tools.contains('freedreno')
   subdir('freedreno')
 endif
-if with_imagination_vk
+if with_imagination_vk or with_tools.contains('imagination')
   subdir('imagination')
 endif
 if with_gallium_panfrost or with_gallium_lima or with_panfrost_vk or with_tools.contains('panfrost')
   subdir('panfrost')
 endif
-#if with_gallium_virgl or with_virtio_vk
-#  subdir('virtio')
-#endif
 if with_microsoft_clc or with_gallium_d3d12 or with_spirv_to_dxil or with_microsoft_vk
   subdir('microsoft')
 endif
@@ -100,10 +102,20 @@ if with_any_nouveau
   subdir('nouveau')
 endif
 if with_gfxstream_vk
+  dep_virtgpu_kumquat_ffi = null_dep
+  if with_virtgpu_kumquat
+    subdir('util/rust')
+    subdir('virtio/protocols')
+    subdir('virtio/virtgpu_kumquat')
+    subdir('virtio/virtgpu_kumquat_ffi')
+  endif
   subdir('gfxstream')
 endif
 if with_gallium_asahi or with_asahi_vk or with_tools.contains('asahi')
   subdir('asahi')
+endif
+if with_kosmickrisp_vk
+  subdir('kosmickrisp')
 endif
 if with_gallium
   subdir('mesa')
@@ -114,10 +126,10 @@ endif
 # These require libgallium (shared_glapi_lib)
 if with_gallium and (with_glx != 'disabled' or with_egl)
   if with_gles1 and not with_glvnd
-    subdir('mapi/es1api')
+    subdir('mesa/glapi/es1api')
   endif
   if with_gles2 and not with_glvnd
-    subdir('mapi/es2api')
+    subdir('mesa/glapi/es2api')
   endif
   if with_tests
     subdir('mesa/main/tests')

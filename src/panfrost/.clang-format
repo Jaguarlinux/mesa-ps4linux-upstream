@@ -2,7 +2,7 @@
 BasedOnStyle: InheritParentConfig
 DisableFormat: false
 
-AlignConsecutiveBitFields: true
+AlignConsecutiveBitFields: Consecutive
 ColumnLimit: 80
 BreakStringLiterals: false
 SpaceBeforeParens: ControlStatementsExceptControlMacros
@@ -43,13 +43,17 @@ ForEachMacros: [
   'cs_emit',
   'cs_exception_handler_def',
   'cs_if',
+  'cs_iter_sb_update',
+  'cs_iter_sb_update_case',
   'cs_match',
+  'cs_single_link_list_for_each_from',
   'cs_update_compute_ctx',
   'cs_update_frag_ctx',
   'cs_update_progress_seqno',
   'cs_update_vt_ctx',
   'cs_while',
   'foreach_batch',
+  'foreach_list_typed',
   'list_for_each_entry_safe',
   'mir_foreach_block',
   'mir_foreach_block_from',
@@ -67,6 +71,10 @@ ForEachMacros: [
   'mir_foreach_predecessor',
   'mir_foreach_successor',
   'mir_foreach_src',
+  'nir_foreach_function_impl',
+  'nir_foreach_instr',
+  'nir_foreach_phi_src',
+  'nir_foreach_use',
   'nir_foreach_variable_with_modes',
   'nir_foreach_shader_in_variable',
   'nodearray_dense_foreach',
@@ -79,5 +87,13 @@ ForEachMacros: [
   'pan_section_pack',
   'pan_unpack',
   'panvk_cs_reg_upd_ctx',
+  'panvk_priv_mem_readback',
+  'panvk_priv_mem_readback_array',
+  'panvk_priv_mem_rwm',
+  'panvk_priv_mem_rwm_array',
+  'panvk_priv_mem_write',
+  'panvk_priv_mem_write_array',
+  'panvk_priv_mem_write_desc',
+  'panvk_shader_foreach_variant',
   'u_foreach_bit',
 ]

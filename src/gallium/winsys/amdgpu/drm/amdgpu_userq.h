@@ -32,7 +32,13 @@ extern "C" {
    userq->next_wptr = __next_wptr; \
 } while (0)
 
+#define amdgpu_pkt_get_ptr_skip_dw() \
+   (__ring_ptr + (__next_wptr++ & AMDGPU_USERQ_RING_SIZE_DW_MASK))
+
+#define amdgpu_pkt_get_next_wptr() __next_wptr
+
 struct amdgpu_winsys;
+struct amdgpu_screen_winsys;
 
 struct amdgpu_userq_gfx_data {
    struct pb_buffer_lean *csa_bo;
@@ -67,11 +73,21 @@ struct amdgpu_userq {
     * (this avoids writing multiple times to the door bell for the same
     * submission) */
    uint64_t next_wptr;
-   struct pb_buffer_lean *rptr_bo;
+   struct pb_buffer_lean *vram_bo;
+   uint64_t rptr_va;
 
    struct pb_buffer_lean *doorbell_bo;
    uint64_t *doorbell_bo_map;
 
+   /* In case of gfx11.5 shadow register address has to be initialized using LOAD_* packet.
+    * Also for every new ib/job submission, the shadowed registers has to be loaded using LOAD_*
+    * packets.
+    */
+   struct pb_buffer_lean *f32_shadowing_ib_bo;
+   uint32_t f32_shadowing_ib_pm4_dw;
+   bool f32_is_shadowing_ib_initialized;
+   struct pb_buffer_lean *cs_preamble_ib_bo;
+   bool is_cs_preamble_ib_sent;
    uint32_t userq_handle;
    enum amd_ip_type ip_type;
    simple_mtx_t lock;
@@ -86,9 +102,12 @@ struct amdgpu_userq {
 };
 
 bool
-amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type);
+amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type,
+                  unsigned queue_index);
 void
 amdgpu_userq_deinit(struct amdgpu_winsys *aws, struct amdgpu_userq *userq);
+
+void amdgpu_userq_init_functions(struct amdgpu_screen_winsys *sws);
 
 #ifdef __cplusplus
 }

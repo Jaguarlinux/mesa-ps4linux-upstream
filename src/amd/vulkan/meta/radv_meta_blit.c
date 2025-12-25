@@ -6,8 +6,8 @@
 
 #include "nir/radv_meta_nir.h"
 #include "radv_meta.h"
+#include "radv_sampler.h"
 #include "vk_command_pool.h"
-#include "vk_common_entrypoints.h"
 
 static enum glsl_sampler_dim
 translate_sampler_dim(VkImageType type)
@@ -20,7 +20,7 @@ translate_sampler_dim(VkImageType type)
    case VK_IMAGE_TYPE_3D:
       return GLSL_SAMPLER_DIM_3D;
    default:
-      unreachable("Unhandled image type");
+      UNREACHABLE("Unhandled image type");
    }
 }
 
@@ -99,7 +99,7 @@ get_pipeline(struct radv_device *device, const struct radv_image_view *src_iview
       fs = radv_meta_nir_build_blit_copy_fragment_shader_stencil(device, tex_dim);
       break;
    default:
-      unreachable("Unhandled aspect");
+      UNREACHABLE("Unhandled aspect");
    }
 
    VkGraphicsPipelineCreateInfo pipeline_create_info = {
@@ -219,7 +219,7 @@ get_pipeline(struct radv_device *device, const struct radv_image_view *src_iview
       render.stencil_attachment_format = VK_FORMAT_S8_UINT;
       break;
    default:
-      unreachable("Unhandled aspect");
+      UNREACHABLE("Unhandled aspect");
    }
 
    result = vk_meta_create_graphics_pipeline(&device->vk, &device->meta_state.device, &pipeline_create_info, &render,
@@ -260,8 +260,16 @@ meta_emit_blit(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *src_i
       src_offset_1[1] / (float)src_height, src_offset_0[2] / (float)src_depth,
    };
 
-   vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 20,
-                              vertex_push_constants);
+   const VkPushConstantsInfoKHR pc_info = {
+      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+      .layout = layout,
+      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+      .offset = 0,
+      .size = sizeof(vertex_push_constants),
+      .pValues = vertex_push_constants,
+   };
+
+   radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
 
    radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -278,7 +286,7 @@ meta_emit_blit(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *src_i
 
    VkRenderingInfo rendering_info = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .flags = VK_RENDERING_INPUT_ATTACHMENT_NO_CONCURRENT_WRITES_BIT_MESA,
+      .flags = VK_RENDERING_LOCAL_READ_CONCURRENT_ACCESS_CONTROL_BIT_KHR,
       .renderArea =
          {
             .offset = {0, 0},
@@ -328,7 +336,11 @@ meta_emit_blit(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *src_i
 
    radv_CmdDraw(radv_cmd_buffer_to_handle(cmd_buffer), 3, 1, 0, 0);
 
-   radv_CmdEndRendering(radv_cmd_buffer_to_handle(cmd_buffer));
+   const VkRenderingEndInfoKHR end_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
+   };
+
+   radv_CmdEndRendering2KHR(radv_cmd_buffer_to_handle(cmd_buffer), &end_info);
 }
 
 static bool
@@ -359,7 +371,7 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
    const VkImageSubresourceLayers *src_res = &region->srcSubresource;
    const VkImageSubresourceLayers *dst_res = &region->dstSubresource;
    struct radv_meta_saved_state saved_state;
-   VkSampler sampler;
+   struct radv_sampler sampler;
 
    /* From the Vulkan 1.0 spec:
     *
@@ -369,16 +381,15 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
    assert(src_image->vk.samples == 1);
    assert(dst_image->vk.samples == 1);
 
-   radv_CreateSampler(radv_device_to_handle(device),
-                      &(VkSamplerCreateInfo){
-                         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-                         .magFilter = filter,
-                         .minFilter = filter,
-                         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                         .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                      },
-                      &cmd_buffer->vk.pool->alloc, &sampler);
+   radv_sampler_init(device, &sampler,
+                     &(VkSamplerCreateInfo){
+                        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                        .magFilter = filter,
+                        .minFilter = filter,
+                        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                     });
 
    radv_meta_save(&saved_state, cmd_buffer,
                   RADV_META_SAVE_GRAPHICS_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS);
@@ -477,9 +488,17 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
       /* 3D images have just 1 layer */
       const uint32_t src_array_slice = src_image->vk.image_type == VK_IMAGE_TYPE_3D ? 0 : src_start + i;
 
+      const VkImageViewUsageCreateInfo dst_iview_usage_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = vk_format_is_color(dst_image->vk.format) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                                           : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+      };
+
       radv_image_view_init(&dst_iview, device,
                            &(VkImageViewCreateInfo){
                               .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                              .pNext = &dst_iview_usage_info,
+                              .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                               .image = radv_image_to_handle(dst_image),
                               .viewType = radv_meta_get_view_type(dst_image),
                               .format = dst_image->vk.format,
@@ -490,9 +509,17 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
                                                    .layerCount = 1},
                            },
                            NULL);
+
+      const VkImageViewUsageCreateInfo src_iview_usage_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+
       radv_image_view_init(&src_iview, device,
                            &(VkImageViewCreateInfo){
                               .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                              .pNext = &src_iview_usage_info,
+                              .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                               .image = radv_image_to_handle(src_image),
                               .viewType = radv_meta_get_view_type(src_image),
                               .format = src_image->vk.format,
@@ -504,7 +531,7 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
                            },
                            NULL);
       meta_emit_blit(cmd_buffer, &src_iview, src_image_layout, src_offset_0, src_offset_1, &dst_iview, dst_image_layout,
-                     dst_box, sampler);
+                     dst_box, radv_sampler_to_handle(&sampler));
 
       radv_image_view_finish(&dst_iview);
       radv_image_view_finish(&src_iview);
@@ -512,7 +539,7 @@ blit_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkI
 
    radv_meta_restore(&saved_state, cmd_buffer);
 
-   radv_DestroySampler(radv_device_to_handle(device), sampler, &cmd_buffer->vk.pool->alloc);
+   radv_sampler_finish(device, &sampler);
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -33,12 +33,10 @@ get_hw_clear_color(struct v3dv_device *device,
                    const VkClearColorValue *color,
                    VkFormat fb_format,
                    VkFormat image_format,
-                   uint32_t internal_type,
-                   uint32_t internal_bpp,
+                   const struct v3dv_format_plane *format,
+                   uint32_t internal_size,
                    uint32_t *hw_color)
 {
-   const uint32_t internal_size = 4 << internal_bpp;
-
    /* If the image format doesn't match the framebuffer format, then we are
     * trying to clear an unsupported tlb format using a compatible
     * format for the framebuffer. In this case, we want to make sure that
@@ -46,7 +44,7 @@ get_hw_clear_color(struct v3dv_device *device,
     * not the compatible format.
     */
    if (fb_format == image_format) {
-      v3d_X((&device->devinfo), get_hw_clear_color)(color, internal_type, internal_size,
+      v3d_X((&device->devinfo), get_hw_clear_color)(color, format,
                                          hw_color);
    } else {
       union util_color uc;
@@ -82,10 +80,15 @@ clear_image_tlb(struct v3dv_cmd_buffer *cmd_buffer,
       (fb_format, range->aspectMask,
        &internal_type, &internal_bpp);
 
+   const uint32_t internal_size = 4 << internal_bpp;
+
+   const struct v3dv_format *format =
+      v3d_X((&cmd_buffer->device->devinfo), get_format)(fb_format);
+
    union v3dv_clear_value hw_clear_value = { 0 };
    if (range->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
       get_hw_clear_color(cmd_buffer->device, &clear_value->color, fb_format,
-                         image->vk.format, internal_type, internal_bpp,
+                         image->vk.format, &format->planes[0], internal_size,
                          &hw_clear_value.color[0]);
    } else {
       assert((range->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) ||
@@ -173,7 +176,7 @@ v3dv_CmdClearColorImage(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < rangeCount; i++) {
       if (clear_image_tlb(cmd_buffer, image, &clear_value, &pRanges[i]))
          continue;
-      unreachable("Unsupported color clear.");
+      UNREACHABLE("Unsupported color clear.");
    }
 
    cmd_buffer->state.is_transfer = false;
@@ -199,7 +202,7 @@ v3dv_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < rangeCount; i++) {
       if (clear_image_tlb(cmd_buffer, image, &clear_value, &pRanges[i]))
          continue;
-      unreachable("Unsupported depth/stencil clear.");
+      UNREACHABLE("Unsupported depth/stencil clear.");
    }
 
    cmd_buffer->state.is_transfer = false;
@@ -282,10 +285,10 @@ v3dv_meta_clear_init(struct v3dv_device *device)
 {
    if (device->instance->meta_cache_enabled) {
       device->meta.color_clear.cache =
-         _mesa_hash_table_create(NULL, u64_hash, u64_compare);
+         _mesa_hash_table_create(NULL, _mesa_hash_u64, _mesa_key_u64_equal);
 
       device->meta.depth_clear.cache =
-         _mesa_hash_table_create(NULL, u64_hash, u64_compare);
+         _mesa_hash_table_create(NULL, _mesa_hash_u64, _mesa_key_u64_equal);
    }
 
    create_color_clear_pipeline_layout(device,
@@ -355,9 +358,8 @@ get_clear_rect_gs(const nir_shader_compiler_options *options,
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, options,
                                                   "meta clear gs");
    nir_shader *nir = b.shader;
-   nir->info.inputs_read = 1ull << VARYING_SLOT_POS;
-   nir->info.outputs_written = (1ull << VARYING_SLOT_POS) |
-                               (1ull << VARYING_SLOT_LAYER);
+   nir->info.inputs_read = VARYING_BIT_POS;
+   nir->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_LAYER;
    nir->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
    nir->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
    nir->info.gs.vertices_in = 3;

@@ -412,7 +412,6 @@ job_compute_frame_tiling(struct v3dv_job *job,
    tiling->draw_tiles_y = DIV_ROUND_UP(height, tiling->tile_height);
 
    /* Size up our supertiles until we get under the limit */
-   const uint32_t max_supertiles = 256;
    tiling->supertile_width = 1;
    tiling->supertile_height = 1;
    for (;;) {
@@ -422,8 +421,16 @@ job_compute_frame_tiling(struct v3dv_job *job,
          DIV_ROUND_UP(tiling->draw_tiles_y, tiling->supertile_height);
       const uint32_t num_supertiles = tiling->frame_width_in_supertiles *
                                       tiling->frame_height_in_supertiles;
-      if (num_supertiles < max_supertiles)
+
+      /* While the hardware allows up to V3D_MAX_SUPERTILES, it doesn't allow
+       * 1xV3D_MAX_SUPERTILES or V3D_MAX_SUPERTILESx1 frame configurations; in
+       * these cases we need to increase the supertile size.
+       */
+      if (tiling->frame_width_in_supertiles < V3D_MAX_SUPERTILES &&
+          tiling->frame_height_in_supertiles < V3D_MAX_SUPERTILES &&
+          num_supertiles <= V3D_MAX_SUPERTILES) {
          break;
+      }
 
       if (tiling->supertile_width < tiling->supertile_height)
          tiling->supertile_width++;
@@ -1231,13 +1238,11 @@ cmd_buffer_state_set_attachment_clear_color(struct v3dv_cmd_buffer *cmd_buffer,
    v3d_X((&cmd_buffer->device->devinfo), get_internal_type_bpp_for_output_format)
       (format->planes[0].rt_type, &internal_type, &internal_bpp);
 
-   uint32_t internal_size = 4 << internal_bpp;
-
    struct v3dv_cmd_buffer_attachment_state *attachment_state =
       &cmd_buffer->state.attachments[attachment_idx];
 
    v3d_X((&cmd_buffer->device->devinfo), get_hw_clear_color)
-      (color, internal_type, internal_size, &attachment_state->clear_value.color[0]);
+      (color, &format->planes[0], &attachment_state->clear_value.color[0]);
 
    attachment_state->vk_clear_value.color = *color;
 }
@@ -1278,20 +1283,24 @@ cmd_buffer_state_set_clear_values(struct v3dv_cmd_buffer *cmd_buffer,
       const struct v3dv_render_pass_attachment *attachment =
          &pass->attachments[i];
 
-      if (attachment->desc.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
-         continue;
-
       VkImageAspectFlags aspects = vk_format_aspects(attachment->desc.format);
       if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
-         cmd_buffer_state_set_attachment_clear_color(cmd_buffer, i,
-                                                     &values[i].color);
-      } else if (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
-                            VK_IMAGE_ASPECT_STENCIL_BIT)) {
-         cmd_buffer_state_set_attachment_clear_depth_stencil(
-            cmd_buffer, i,
-            aspects & VK_IMAGE_ASPECT_DEPTH_BIT,
-            aspects & VK_IMAGE_ASPECT_STENCIL_BIT,
-            &values[i].depthStencil);
+         if (attachment->desc.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            cmd_buffer_state_set_attachment_clear_color(cmd_buffer, i,
+                                                        &values[i].color);
+         }
+      } else {
+         bool clear_depth = aspects & VK_IMAGE_ASPECT_DEPTH_BIT &&
+            attachment->desc.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+         bool clear_stencil = aspects & VK_IMAGE_ASPECT_STENCIL_BIT &&
+            attachment->desc.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+         if (clear_depth || clear_stencil) {
+            cmd_buffer_state_set_attachment_clear_depth_stencil(
+               cmd_buffer, i,
+               clear_depth,
+               clear_stencil,
+               &values[i].depthStencil);
+         }
       }
    }
 }
@@ -1781,9 +1790,14 @@ cmd_buffer_subpass_create_job(struct v3dv_cmd_buffer *cmd_buffer,
          layers = util_last_bit(subpass->view_mask);
       }
 
+      uint32_t width =
+         state->render_area.offset.x + state->render_area.extent.width;
+      uint32_t height =
+         state->render_area.offset.y + state->render_area.extent.height;
+
       v3dv_job_start_frame(job,
-                           framebuffer->width,
-                           framebuffer->height,
+                           width,
+                           height,
                            layers,
                            true, false,
                            subpass->color_count,
@@ -3704,7 +3718,8 @@ handle_sample_from_linear_image(struct v3dv_cmd_buffer *cmd_buffer,
       } else {
          VkImageViewCreateInfo view_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .flags = view->vk.create_flags,
+            .flags = view->vk.create_flags |
+                     VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
             .image = tiled_image,
             .viewType = view->vk.view_type,
             .format = view->vk.format,
@@ -3988,7 +4003,7 @@ v3dv_cmd_buffer_begin_query(struct v3dv_cmd_buffer *cmd_buffer,
       break;
    }
    default:
-      unreachable("Unsupported query type");
+      UNREACHABLE("Unsupported query type");
    }
 }
 
@@ -4126,7 +4141,7 @@ void v3dv_cmd_buffer_end_query(struct v3dv_cmd_buffer *cmd_buffer,
       v3dv_cmd_buffer_end_performance_query(cmd_buffer, pool, query);
       break;
    default:
-      unreachable("Unsupported query type");
+      UNREACHABLE("Unsupported query type");
    }
 }
 
@@ -4307,7 +4322,7 @@ cmd_buffer_create_csd_job(struct v3dv_cmd_buffer *cmd_buffer,
    uint32_t wgs_per_sg =
       v3d_csd_choose_workgroups_per_supergroup(
          &cmd_buffer->device->devinfo,
-         cs_variant->prog_data.cs->has_subgroups,
+         cs_variant->prog_data.cs->can_use_supergroups,
          cs_variant->prog_data.cs->base.has_control_barrier,
          cs_variant->prog_data.cs->base.threads,
          num_wgs, wg_size);
