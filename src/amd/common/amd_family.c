@@ -88,7 +88,11 @@ enum amd_gfx_level ac_get_gfx_level(enum radeon_family family)
       return GFX8;
    if (family >= CHIP_BONAIRE)
       return GFX7;
-
+   if (family >= CHIP_LIVERPOOL)
+      return GFX7;
+   if (family >= CHIP_GLADIUS)
+      return GFX7;
+   
    return GFX6;
 }
 
