@@ -578,8 +578,8 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          identify_chip2(SPOOKY, KAVERI);
          identify_chip2(STARSHA, LIVERPOOL);
          identify_chip2(STARSHP, GLADIUS);
-         //FIXME this is broken
-         //identify_chip2(KALINDI, KABINI);
+         //ShouldBefix in the latest dev build of mesa?
+         identify_chip2(KALINDI, KABINI);
          identify_chip2(GODAVARI, KABINI);
          break;
       case FAMILY_VI:
